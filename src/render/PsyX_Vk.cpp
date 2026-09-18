@@ -2264,7 +2264,6 @@ void PsyX_Vk_GameDestroyTexture(int texture)
 
 void PsyX_Vk_GameEndFrame(void)
 {
-	eprintinfo("PSXTRACE GameEndFrame draws=%d verts=%u\n", g_vk.psx.drawCount, g_vk.psx.vertexCount);
 	if (!g_vk.initialised || !g_vk.psx.ready)
 		return;
 
@@ -2336,7 +2335,11 @@ static void RecordPsxDraws(void)
 
 		VkRect2D scissor;
 		scissor.offset.x = draw->scissorEnable ? draw->scissor[0] : 0;
-		scissor.offset.y = draw->scissorEnable ? draw->scissor[1] : 0;
+		// GR_SetupClipMode hands over the same bottom-left rectangle glScissor
+		// receives, so map it to Vulkan's top-left origin like the viewport.
+		scissor.offset.y = draw->scissorEnable
+			? (int)g_vk.height - (draw->scissor[1] + draw->scissor[3])
+			: 0;
 		scissor.extent.width = (uint32_t)(draw->scissorEnable ? draw->scissor[2] : g_vk.width);
 		scissor.extent.height = (uint32_t)(draw->scissorEnable ? draw->scissor[3] : g_vk.height);
 		vkCmdSetScissor(g_vk.commandBuffer, 0, 1, &scissor);
