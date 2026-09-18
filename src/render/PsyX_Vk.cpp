@@ -26,6 +26,7 @@
 #include <SDL.h>
 #include <SDL_vulkan.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <math.h>
 #include <new>
@@ -247,6 +248,7 @@ typedef struct
 	uint32_t vertexCount;
 	int frame;			// g_vk.psx.frameIndex at queue time
 	int offscreen;			// queued while GR_SetOffscreenState(enable=1)
+	int stencilMode;		// 1 = PSX mask-bit set, 0 = mask-bit test
 } VkPsxDraw;
 
 // One GR_SetOffscreenState(enable=1 .. enable=0) run: the PSX draws render into
@@ -280,6 +282,12 @@ typedef struct
 	VkDescriptorSetLayout setLayout;
 	VkPipelineLayout layout;
 	VkPipeline pipelines[PSYX_VK_PSX_BLEND_COUNT];
+	// Mask-bit variants: the PSX primitive flag (drawPrimMode / DrawPrim) both
+	// writes the stencil mask (enable=1) and, for every other draw, only passes
+	// where the mask is clear (enable=0). Stencil state is baked into the
+	// pipeline, so each blend mode needs a second pipeline for the set case.
+	VkPipeline pipelinesStencilWrite[PSYX_VK_PSX_BLEND_COUNT];
+	int stencilSupported;		// main depth attachment carries an stencil aspect
 	VkPipeline pipelineNoDepth;
 	VkDescriptorSet set;
 
@@ -352,6 +360,8 @@ typedef struct
 	int stDepth;
 	int stBilinear;
 	int stStencilMode;
+	int lastDraws;			// draws recorded for the last on-screen frame
+	int lastStencilDraws;		// of those, the mask-bit (stencil write) draws
 	int stScissorEnable;
 	int stScissor[4];
 	int stViewport[4];
@@ -399,6 +409,7 @@ static struct
 	VkImage depthImage;
 	VkDeviceMemory depthMemory;
 	VkImageView depthView;
+	VkFormat depthStencilFormat;	// main pass depth attachment (stencil-capable when possible)
 
 	VkRenderPass mainRenderPass;
 	VkRenderPass shadowRenderPass;
@@ -455,13 +466,17 @@ static int g_supported = -1;
 
 // PsyCross logging is only wired up once the game has started, so the Vulkan
 // initialisation stages also go to a small side log for developer runs.
-static void VkStage(const char* stage)
+static void VkStage(const char* stage, ...)
 {
 	FILE* file = fopen("psyx_vk.log", "a");
 	if (!file)
 		return;
 
-	fprintf(file, "%s\n", stage);
+	va_list args;
+	va_start(args, stage);
+	vfprintf(file, stage, args);
+	va_end(args);
+	fprintf(file, "\n");
 	fclose(file);
 }
 
@@ -896,6 +911,49 @@ static int QuerySwapchainFormat(void)
 	return 1;
 }
 
+// Picks the main-pass depth attachment. D24_UNORM_S8_UINT is preferred because
+// the emulated PSX GPU needs stencil for the primitive mask bit
+// (GR_SetStencilMode); D32_SFLOAT is the fallback when the driver refuses a
+// combined format, in which case the mask bit degrades to a no-op.
+static VkFormat PickDepthStencilFormat(int* stencilSupported)
+{
+	VkFormat best = VK_FORMAT_UNDEFINED;
+	const VkFormat candidates[] =
+	{
+		VK_FORMAT_D24_UNORM_S8_UINT,
+		VK_FORMAT_D32_SFLOAT_S8_UINT,
+		VK_FORMAT_D16_UNORM_S8_UINT,
+	};
+
+	for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++)
+	{
+		VkFormatProperties properties;
+		vkGetPhysicalDeviceFormatProperties(g_vk.physicalDevice, candidates[i], &properties);
+		if ((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0)
+		{
+			best = candidates[i];
+			break;
+		}
+	}
+
+	if (best != VK_FORMAT_UNDEFINED)
+	{
+		*stencilSupported = 1;
+		return best;
+	}
+
+	VkFormatProperties properties;
+	vkGetPhysicalDeviceFormatProperties(g_vk.physicalDevice, VK_FORMAT_D32_SFLOAT, &properties);
+	if ((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0)
+	{
+		*stencilSupported = 0;
+		return VK_FORMAT_D32_SFLOAT;
+	}
+
+	*stencilSupported = 0;
+	return VK_FORMAT_D16_UNORM;
+}
+
 static int CreateSwapchain(void)
 {
 	VkSurfaceCapabilitiesKHR capabilities;
@@ -967,14 +1025,15 @@ static int CreateSwapchain(void)
 			return 0;
 	}
 
-	// Depth buffer, shared by every framebuffer (single frame in flight).
-	VkFormat depthFormat = VK_FORMAT_D32_SFLOAT;
-	VkFormatProperties formatProperties;
-	vkGetPhysicalDeviceFormatProperties(g_vk.physicalDevice, depthFormat, &formatProperties);
-	if ((formatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) == 0)
-		depthFormat = VK_FORMAT_D24_UNORM_S8_UINT;
+	// Depth buffer, shared by every framebuffer (single frame in flight). The
+	// format was fixed by CreateRenderPasses; recompute only if unset.
+	VkFormat depthFormat = g_vk.depthStencilFormat;
+	if (depthFormat == VK_FORMAT_UNDEFINED)
+		depthFormat = PickDepthStencilFormat(&g_vk.psx.stencilSupported);
+	g_vk.depthStencilFormat = depthFormat;
 
-	VkImageAspectFlags depthAspect = (depthFormat == VK_FORMAT_D24_UNORM_S8_UINT)
+	VkImageAspectFlags depthAspect = (depthFormat == VK_FORMAT_D24_UNORM_S8_UINT ||
+		depthFormat == VK_FORMAT_D32_SFLOAT_S8_UINT || depthFormat == VK_FORMAT_D16_UNORM_S8_UINT)
 		? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
 		: VK_IMAGE_ASPECT_DEPTH_BIT;
 
@@ -1344,17 +1403,16 @@ static int CreateRenderPasses(void)
 	attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 	attachments[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
-	VkFormat depthFormat = VK_FORMAT_D32_SFLOAT;
-	VkFormatProperties formatProperties;
-	vkGetPhysicalDeviceFormatProperties(g_vk.physicalDevice, depthFormat, &formatProperties);
-	if ((formatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) == 0)
-		depthFormat = VK_FORMAT_D24_UNORM_S8_UINT;
+	VkFormat depthFormat = PickDepthStencilFormat(&g_vk.psx.stencilSupported);
+	g_vk.depthStencilFormat = depthFormat;
 
 	attachments[1].format = depthFormat;
 	attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
 	attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
 	attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-	attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	// The PSX mask bit lives in this attachment's stencil aspect; it is cleared
+	// every frame so the mask never leaks between frames.
+	attachments[1].stencilLoadOp = (g_vk.psx.stencilSupported) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
 	attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
 	attachments[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 	attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -1398,6 +1456,8 @@ static int CreateRenderPasses(void)
 	if (!VkOk(vkCreateRenderPass(g_vk.device, &renderPass, NULL, &g_vk.mainRenderPass), "vkCreateRenderPass(main)"))
 		return 0;
 
+	VkStage("main pass depth-stencil format %d stencil=%d", (int)depthFormat, g_vk.psx.stencilSupported);
+
 	// Shadow pass: depth only, sampled afterwards.
 	VkAttachmentDescription shadowAttachment;
 	memset(&shadowAttachment, 0, sizeof(shadowAttachment));
@@ -1413,6 +1473,7 @@ static int CreateRenderPasses(void)
 	// D32 only exists when the device supports it; otherwise use the first
 	// supported depth format. The shadow map always uses its own image, so the
 	// format can differ from the swapchain depth buffer.
+	VkFormatProperties formatProperties;
 	vkGetPhysicalDeviceFormatProperties(g_vk.physicalDevice, VK_FORMAT_D32_SFLOAT, &formatProperties);
 	if ((formatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) == 0)
 	{
@@ -1483,7 +1544,7 @@ static void BuildRG8Lut(unsigned char* lut)
 	}
 }
 
-static int CreatePsxPipeline(int blendMode, int depthEnable, VkRenderPass renderPass, VkPipeline* pipeline)
+static int CreatePsxPipeline(int blendMode, int depthEnable, int stencilMode, VkRenderPass renderPass, VkPipeline* pipeline)
 {
 	VkShaderModule vertex = CreateShaderModuleFromSpirv(psx_vert_spv, psx_vert_spv_size);
 	VkShaderModule fragment = CreateShaderModuleFromSpirv(psx_frag_spv, psx_frag_spv_size);
@@ -1553,6 +1614,37 @@ static int CreatePsxPipeline(int blendMode, int depthEnable, VkRenderPass render
 	depthStencil.depthTestEnable = depthEnable ? VK_TRUE : VK_FALSE;
 	depthStencil.depthWriteEnable = depthEnable ? VK_TRUE : VK_FALSE;
 	depthStencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+	// PSX mask bit, mirroring GR_SetStencilMode's GL state. Stencil bit 4 is the
+	// PSX mask (GL's 0x10). The mask-set draw always passes and writes the bit;
+	// every other draw only passes where the bit is clear. The offscreen pass has
+	// no depth-stencil attachment, so stencil stays disabled there.
+	if (stencilMode >= 0 && g_vk.psx.stencilSupported)
+	{
+		depthStencil.stencilTestEnable = VK_TRUE;
+
+		VkStencilOpState& front = depthStencil.front;
+		VkStencilOpState& back = depthStencil.back;
+		front.compareMask = 0x10;
+		front.writeMask = 0x10;
+		front.reference = 1;
+		if (stencilMode)
+		{
+			front.compareOp = VK_COMPARE_OP_ALWAYS;
+			front.passOp = VK_STENCIL_OP_REPLACE;
+			front.failOp = VK_STENCIL_OP_REPLACE;
+			front.depthFailOp = VK_STENCIL_OP_REPLACE;
+		}
+		else
+		{
+			front.compareMask = 0xFF;
+			front.compareOp = VK_COMPARE_OP_NOT_EQUAL;
+			front.passOp = VK_STENCIL_OP_REPLACE;
+			front.failOp = VK_STENCIL_OP_KEEP;
+			front.depthFailOp = VK_STENCIL_OP_KEEP;
+		}
+		back = front;
+	}
 
 	VkPipelineColorBlendAttachmentState blendAttachment;
 	memset(&blendAttachment, 0, sizeof(blendAttachment));
@@ -1805,10 +1897,14 @@ static int CreatePsxResources(void)
 	for (int mode = 0; mode < PSYX_VK_PSX_BLEND_COUNT; mode++)
 	{
 		// BM_NONE draws depth-tested (PGXP-Z); the other modes depth-test off.
-		if (!CreatePsxPipeline(mode, mode == 0 ? 1 : 0, g_vk.mainRenderPass, &psx->pipelines[mode]))
+		if (!CreatePsxPipeline(mode, mode == 0 ? 1 : 0, 0, g_vk.mainRenderPass, &psx->pipelines[mode]))
+			return 0;
+		// The mask-set draw still writes the stencil bit; its depth config
+		// matches the test variant so the mask draw's depth result is identical.
+		if (!CreatePsxPipeline(mode, mode == 0 ? 1 : 0, 1, g_vk.mainRenderPass, &psx->pipelinesStencilWrite[mode]))
 			return 0;
 	}
-	if (!CreatePsxPipeline(0, 0, g_vk.mainRenderPass, &psx->pipelineNoDepth))
+	if (!CreatePsxPipeline(0, 0, -1, g_vk.mainRenderPass, &psx->pipelineNoDepth))
 		return 0;
 
 	// The per-frame draw list belongs to frameIndex, so the queue maps one
@@ -1820,7 +1916,7 @@ static int CreatePsxResources(void)
 		return 0;
 	for (int mode = 0; mode < PSYX_VK_PSX_BLEND_COUNT; mode++)
 	{
-		if (!CreatePsxPipeline(mode, 0, psx->offscreenRenderPass, &psx->offscreenPipelines[mode]))
+		if (!CreatePsxPipeline(mode, 0, -1, psx->offscreenRenderPass, &psx->offscreenPipelines[mode]))
 			return 0;
 	}
 
@@ -1974,6 +2070,7 @@ static void DestroyPsxResources(void)
 	for (int i = 0; i < PSYX_VK_PSX_BLEND_COUNT; i++)
 	{
 		if (psx->pipelines[i]) vkDestroyPipeline(g_vk.device, psx->pipelines[i], NULL);
+		if (psx->pipelinesStencilWrite[i]) vkDestroyPipeline(g_vk.device, psx->pipelinesStencilWrite[i], NULL);
 	}
 	if (psx->pipelineNoDepth) vkDestroyPipeline(g_vk.device, psx->pipelineNoDepth, NULL);
 	for (int i = 0; i < PSYX_VK_PSX_BLEND_COUNT; i++)
@@ -2278,6 +2375,7 @@ int PsyX_Vk_GameDrawTriangles(int firstVertex, int triangles)
 	draw->vertexCount = (uint32_t)(triangles * 3);
 	draw->frame = psx->frameIndex;
 	draw->offscreen = psx->offscreenActive;
+	draw->stencilMode = psx->stStencilMode;
 
 	return triangles;
 }
@@ -2499,6 +2597,9 @@ static void RecordPsxDraws(VkCommandBuffer cmd, int offscreen, int frame,
 
 	VkDescriptorSet boundSet = VK_NULL_HANDLE;
 
+	int stencilDraws = 0;
+	int recordedDraws = 0;
+
 	for (int i = 0; i < endDraw; i++)
 	{
 		const VkPsxDraw* draw = &psx->draws[i];
@@ -2507,12 +2608,18 @@ static void RecordPsxDraws(VkCommandBuffer cmd, int offscreen, int frame,
 		if ((draw->offscreen ? 1 : 0) != offscreen)
 			continue;
 
+		recordedDraws++;
+		if (!offscreen && draw->stencilMode)
+			stencilDraws++;
+
 		const VkDescriptorSet set = draw->textureSet ? draw->textureSet : psx->dummySet;
 		const VkPipeline pipeline = offscreen
 			? psx->offscreenPipelines[draw->blendMode]
-			: ((draw->blendMode == 0 && !draw->depthTest)
-				? psx->pipelineNoDepth
-				: psx->pipelines[draw->blendMode]);
+			: (draw->stencilMode
+				? psx->pipelinesStencilWrite[draw->blendMode]
+				: ((draw->blendMode == 0 && !draw->depthTest)
+					? psx->pipelineNoDepth
+					: psx->pipelines[draw->blendMode]));
 
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
@@ -2566,6 +2673,12 @@ static void RecordPsxDraws(VkCommandBuffer cmd, int offscreen, int frame,
 			VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(constants), &constants);
 
 		vkCmdDraw(cmd, draw->vertexCount, 1, draw->firstVertex, 0);
+	}
+
+	if (!offscreen)
+	{
+		psx->lastDraws = recordedDraws;
+		psx->lastStencilDraws = stencilDraws;
 	}
 }
 
@@ -3728,6 +3841,7 @@ int PsyX_Vk_RenderFrame(void)
 		clears[0].color.float32[3] = 1.0f;
 	}
 	clears[1].depthStencil.depth = 1.0f;
+	clears[1].depthStencil.stencil = 0;	// PSX mask bit starts clear every frame
 
 	VkRenderPassBeginInfo mainBegin;
 	memset(&mainBegin, 0, sizeof(mainBegin));
@@ -3797,7 +3911,8 @@ int PsyX_Vk_RenderFrame(void)
 	if (g_vk.frameIndex == 0)
 	{
 		char line[128];
-		snprintf(line, sizeof(line), "frame: main pass recorded draws=%d", drawCalls - g_vk.lastDrawCalls);
+		snprintf(line, sizeof(line), "frame: main pass recorded draws=%d stencil=%d",
+			g_vk.psx.lastDraws, g_vk.psx.lastStencilDraws);
 		VkStage(line);
 	}
 
