@@ -1586,13 +1586,13 @@ void GR_Clear(int x, int y, int w, int h, unsigned char r, unsigned char g, unsi
 
 void GR_SaveVRAM(const char* outputFileName, int x, int y, int width, int height, int bReadFromFrameBuffer)
 {
+	// The export reads the CPU `vram` mirror, which both the OpenGL and the
+	// Vulkan backend keep current (GR_UpdateVRAM plus the frame/offscreen
+	// readbacks), so the writer is backend-agnostic. It used to be compiled out
+	// on the Vulkan build, which wrote a TGA header with no pixel data.
 #if !defined(__EMSCRIPTEN__) && !defined(__ANDROID__)
 
-#if USE_OPENGL
-
 #define FLIP_Y (VRAM_HEIGHT - i - 1)
-
-#endif
 
 	FILE* fp = fopen(outputFileName, "wb");
 	if (fp == NULL)

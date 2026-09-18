@@ -208,6 +208,12 @@ static VkTexture g_textures[PSYX_VK_MAX_TEXTURES];
 // layout is asserted below so a change on either side breaks the build instead
 // of the picture.
 
+// Defined in PsyX_render.cpp with C linkage; the PSX self-test exercises the
+// VRAM TGA export (F10) so the Vulkan build cannot silently regress to a
+// header-only file. Declared here rather than including PsyX_render.h to keep
+// the backend independent of the OpenGL renderer header.
+extern "C" void GR_SaveVRAM(const char* outputFileName, int x, int y, int width, int height, int bReadFromFrameBuffer);
+
 typedef struct
 {
 	float x, y, page, clut;
@@ -3104,6 +3110,32 @@ int PsyX_Vk_GameSelfTest(char* report, int reportSize)
 
 	delete[] rgba;
 	delete[] vram;
+
+	// Case 4: the VRAM TGA export (F10 / GR_SaveVRAM) must write the full pixel
+	// payload on the Vulkan build. It used to be compiled out unless USE_OPENGL,
+	// leaving a 18-byte header-only file.
+	{
+		const char* path = "vk_fixture_vram.tga";
+		remove(path);
+		GR_SaveVRAM(path, 0, 0, PSYX_VK_VRAM_WIDTH, PSYX_VK_VRAM_HEIGHT, 0);
+
+		long size = 0;
+		FILE* file = fopen(path, "rb");
+		if (file)
+		{
+			fseek(file, 0, SEEK_END);
+			size = ftell(file);
+			fclose(file);
+		}
+
+		const long expected = 18 + (long)PSYX_VK_VRAM_WIDTH * PSYX_VK_VRAM_HEIGHT * 2;
+		char line[128];
+		snprintf(line, sizeof(line), "vram export %ld/%ld bytes: %s\n", size, expected,
+			size == expected ? "ok" : "FAIL");
+		ReportAppend(report, reportSize, line);
+		if (size != expected)
+			failures++;
+	}
 
 	{
 		char line[128];
