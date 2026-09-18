@@ -23,9 +23,12 @@
 
 #include "PsyX_Vk_Shaders.h"
 
+#include "PsyX/PsyX_public.h"
+
 #include <SDL.h>
 #include <SDL_vulkan.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
 #include <math.h>
@@ -1009,6 +1012,39 @@ static int CreateSwapchain(void)
 	info.preTransform = capabilities.currentTransform;
 	info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
 	info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+	// Developer/benchmark override. The shipped default stays FIFO (vsync),
+	// which caps the reported rate at the display refresh and would make a
+	// backend throughput comparison meaningless. PSYX_VK_PRESENT_MODE=mailbox
+	// (or immediate) picks an uncapped mode when the surface supports it.
+	if (const char* requestedMode = getenv("PSYX_VK_PRESENT_MODE"))
+	{
+		VkPresentModeKHR wanted = VK_PRESENT_MODE_FIFO_KHR;
+		if (!strcmp(requestedMode, "mailbox"))
+			wanted = VK_PRESENT_MODE_MAILBOX_KHR;
+		else if (!strcmp(requestedMode, "immediate"))
+			wanted = VK_PRESENT_MODE_IMMEDIATE_KHR;
+
+		if (wanted != VK_PRESENT_MODE_FIFO_KHR)
+		{
+			uint32_t modeCount = 0;
+			vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.physicalDevice, g_vk.surface, &modeCount, NULL);
+			VkPresentModeKHR modes[16];
+			if (modeCount > 16)
+				modeCount = 16;
+			if (modeCount > 0 &&
+				vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.physicalDevice, g_vk.surface, &modeCount, modes) == VK_SUCCESS)
+			{
+				for (uint32_t m = 0; m < modeCount; m++)
+				{
+					if (modes[m] == wanted)
+					{
+						info.presentMode = wanted;
+						break;
+					}
+				}
+			}
+		}
+	}
 	info.clipped = VK_TRUE;
 	info.oldSwapchain = g_vk.swapchain;
 
@@ -2466,6 +2502,23 @@ int PsyX_Vk_GameCreateTexture(const unsigned char* rgba, int width, int height, 
 	vkCmdCopyBufferToImage(cmd, staging, tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
 	// Mirror GR_CreateRGBATextureMipmapped's glGenerateMipmap.
+	//
+	// Barriers are per mip level. A single image can hold different layouts in
+	// different mips, but a whole-image barrier would force one layout on every
+	// level, which is what previously produced oldLayout-01197 and 00221: the
+	// source mip was left TRANSFER_SRC while the destination mip was written as
+	// TRANSFER_DST. Mip 0 is moved DST -> SRC once up front; each iteration then
+	// writes the new level as UNDEFINED -> DST (a generated mip has no prior
+	// contents) and immediately leaves it TRANSFER_SRC so it feeds the next
+	// blit.
+	if (levels > 1)
+	{
+		ImageBarrierLevels(cmd, tex->image, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1,
+			VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+			VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+	}
+
 	for (int level = 1; level < levels; level++)
 	{
 		const int srcW = width >> (level - 1);
@@ -2473,8 +2526,10 @@ int PsyX_Vk_GameCreateTexture(const unsigned char* rgba, int width, int height, 
 		int dstW = srcW > 1 ? srcW / 2 : 1;
 		int dstH = srcH > 1 ? srcH / 2 : 1;
 
-		ImageBarrier(cmd, tex->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+		ImageBarrierLevels(cmd, tex->image, VK_IMAGE_ASPECT_COLOR_BIT, level, 1,
+			VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+			0, VK_ACCESS_TRANSFER_WRITE_BIT);
 
 		VkImageBlit blit;
 		memset(&blit, 0, sizeof(blit));
@@ -2492,10 +2547,21 @@ int PsyX_Vk_GameCreateTexture(const unsigned char* rgba, int width, int height, 
 		blit.dstOffsets[1].z = 1;
 		vkCmdBlitImage(cmd, tex->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 			1, &blit, VK_FILTER_LINEAR);
+
+		ImageBarrierLevels(cmd, tex->image, VK_IMAGE_ASPECT_COLOR_BIT, level, 1,
+			VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+			VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
 	}
 
-	ImageBarrier(cmd, tex->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+	// With no mip chain mip 0 is still TRANSFER_DST; otherwise every level is
+	// TRANSFER_SRC after generation. The transition covers every level (the
+	// single-level ImageBarrier helper would leave mips 1..N as TRANSFER_SRC,
+	// which the sampler then rejects with VUID-vkCmdDraw-None-09600).
+	ImageBarrierLevels(cmd, tex->image, VK_IMAGE_ASPECT_COLOR_BIT, 0, levels,
+		(levels > 1) ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT);
 	EndOneShot(cmd);
 
 	vkDestroyBuffer(g_vk.device, staging, NULL);
@@ -4065,6 +4131,27 @@ int PsyX_Vk_RenderFrame(void)
 				g_vk.lastFps = g_vk.lastFps * 0.9 + (1.0 / delta) * 0.1;
 		}
 		lastTicks = now;
+
+		// Publish the smoothed rate so the game can log a real measurement
+		// without the ImGui overlay.
+		g_vk.info.fps = g_vk.lastFps;
+		g_vk.info.frameTimeMs = (g_vk.lastFps > 0.0) ? (1000.0 / g_vk.lastFps) : 0.0;
+	}
+
+	// Periodic performance sample. The counter has warmed up after a couple of
+	// seconds, so the first entry lands once the rate is meaningful. `drawCalls`
+	// is the recorded PSX draw count for this frame; `vertexCount` comes from
+	// the emulated-GPU stats the panel also reads.
+	if (g_vk.lastFps > 0.0 && (g_vk.frameIndex % 120) == 0)
+	{
+		PsyXRenderStats psxStats;
+		PsyX_GetRenderStats(&psxStats);
+		char line[192];
+		snprintf(line, sizeof(line),
+			"perf: frame=%llu fps=%.1f frame_ms=%.2f draws=%d vertices=%d",
+			(unsigned long long)g_vk.frameIndex, g_vk.lastFps, g_vk.info.frameTimeMs,
+			drawCalls, psxStats.vertexCount);
+		VkStage(line);
 	}
 
 	return 1;

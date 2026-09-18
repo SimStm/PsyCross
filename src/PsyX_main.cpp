@@ -17,6 +17,7 @@
 #include "psx/libspu.h"
 
 #include <assert.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <stdio.h>
@@ -936,7 +937,59 @@ void PsyX_EndScene()
 
 		GR_SwapWindow();
 	}
-	
+
+	// Backend-agnostic performance sample. Both the OpenGL and the Vulkan path
+	// reach this point once per presented frame, so a single wall-clock counter
+	// produces directly comparable numbers in psyx_perf.log. Opt-in through
+	// PSYX_PERF_LOG so a normal run writes nothing.
+#if !defined(__EMSCRIPTEN__) && !defined(__ANDROID__)
+	{
+		static int perfEnabled = -1;
+		static unsigned int perfFrames = 0;
+		static Uint32 perfWindowStart = 0;
+
+		if (perfEnabled < 0)
+		{
+			const char* requested = getenv("PSYX_PERF_LOG");
+			perfEnabled = (requested && requested[0] != '0' && requested[0] != '\0') ? 1 : 0;
+		}
+
+		if (perfEnabled)
+		{
+			const Uint32 now = SDL_GetTicks();
+			if (perfWindowStart == 0)
+				perfWindowStart = now;
+			perfFrames++;
+
+			// Emit one sample per completed second window. The counter is
+			// wall-clock from the first frame, so the reported rate already
+			// averages load spikes instead of sampling a single cold frame.
+			if (now - perfWindowStart >= 1000)
+			{
+				const double elapsedMs = (double)(now - perfWindowStart);
+				const double fps = (elapsedMs > 0.0) ? (perfFrames * 1000.0 / elapsedMs) : 0.0;
+
+				PsyXRenderStats stats = { 0, 0 };
+				PsyX_GetRenderStats(&stats);
+
+				FILE* file = fopen("psyx_perf.log", "a");
+				if (file)
+				{
+					fprintf(file, "perf: backend=%s frames=%u window_ms=%.0f fps=%.1f frame_ms=%.2f vertices=%d draws=%d\n",
+						(g_renderBackend == PSYX_BACKEND_VULKAN) ? "vulkan" : "opengl",
+						perfFrames, elapsedMs, fps,
+						(fps > 0.0) ? (1000.0 / fps) : 0.0,
+						stats.vertexCount, stats.drawSplitCount);
+					fclose(file);
+				}
+
+				perfFrames = 0;
+				perfWindowStart = now;
+			}
+		}
+	}
+#endif
+
 	SDL_Delay(0);
 }
 

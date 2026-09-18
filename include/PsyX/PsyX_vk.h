@@ -40,6 +40,8 @@ typedef struct
 	int shadowMapSize;
 	int vulkanApiVersion;	/* VK_MAKE_API_VERSION packed, 0 when unknown */
 	int imguiActive;
+	double fps;			/* smoothed frames per second, 0 until two frames elapsed */
+	double frameTimeMs;	/* smoothed milliseconds per frame, 0 until two frames elapsed */
 	char deviceName[256];
 } PsyXVkInfo;
 
