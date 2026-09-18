@@ -227,6 +227,9 @@ typedef char VkPsxVertexLayoutCheck[(sizeof(VkPsxVertex) == 44) ? 1 : -1];
 #define PSYX_VK_PSX_MAX_VERTICES 65536
 #define PSYX_VK_PSX_VERTEX_CAPACITY (PSYX_VK_PSX_MAX_VERTICES * 44)
 #define PSYX_VK_PSX_MAX_TEXTURES 512
+// GR_SetOffscreenState groups per frame (the game reaches for a render-to-VRAM
+// target from DR_ENV dfe=0 draws such as the Tanner shadow).
+#define PSYX_VK_PSX_MAX_OFFSCREEN_GROUPS 16
 
 typedef struct
 {
@@ -242,7 +245,20 @@ typedef struct
 	VkDescriptorSet textureSet;	// 32-bit game texture, or VK_NULL_HANDLE
 	uint32_t firstVertex;
 	uint32_t vertexCount;
+	int frame;			// g_vk.psx.frameIndex at queue time
+	int offscreen;			// queued while GR_SetOffscreenState(enable=1)
 } VkPsxDraw;
+
+// One GR_SetOffscreenState(enable=1 .. enable=0) run: the PSX draws render into
+// an offscreen image and are copied back into VRAM at `rect`. The projection
+// active at queue time is captured so the offscreen pass reproduces exactly
+// what the immediate-mode OpenGL renderer would have drawn.
+typedef struct
+{
+	int frame;			// frameIndex whose draw list holds the run
+	int rect[4];
+	float matrix[32];
+} VkPsxOffscreenGroup;
 
 typedef struct
 {
@@ -266,6 +282,29 @@ typedef struct
 	VkPipeline pipelines[PSYX_VK_PSX_BLEND_COUNT];
 	VkPipeline pipelineNoDepth;
 	VkDescriptorSet set;
+
+	// Offscreen (render-to-VRAM) target, mirroring GR_SetOffscreenState. The
+	// dedicated pipelines are needed because a pipeline is bound to the render
+	// pass it was created with, and the offscreen pass has no depth attachment.
+	VkRenderPass offscreenRenderPass;
+	VkPipeline offscreenPipelines[PSYX_VK_PSX_BLEND_COUNT];
+	VkImage offscreenImage;
+	VkDeviceMemory offscreenMemory;
+	VkImageView offscreenView;
+	VkFramebuffer offscreenFramebuffer;
+	int offscreenWidth;
+	int offscreenHeight;
+	VkBuffer offscreenReadback;
+	VkDeviceMemory offscreenReadbackMemory;
+	void* offscreenReadbackMapped;
+	VkDeviceSize offscreenReadbackSize;
+	int frameIndex;			// g_vk frame the queued draw list belongs to
+	int offscreenActive;
+	int offscreenRect[4];
+	int offscreenGroupPendingDraw;
+	float offscreenGroupMatrix[32];
+	VkPsxOffscreenGroup offscreenGroups[PSYX_VK_PSX_MAX_OFFSCREEN_GROUPS];
+	int offscreenGroupCount;
 
 	VkSampler sampler;		// VRAM: nearest, wrapping
 	VkSampler lutSampler;		// RG8 table: nearest, clamped (the shader offsets
@@ -1444,7 +1483,7 @@ static void BuildRG8Lut(unsigned char* lut)
 	}
 }
 
-static int CreatePsxPipeline(int blendMode, int depthEnable, VkPipeline* pipeline)
+static int CreatePsxPipeline(int blendMode, int depthEnable, VkRenderPass renderPass, VkPipeline* pipeline)
 {
 	VkShaderModule vertex = CreateShaderModuleFromSpirv(psx_vert_spv, psx_vert_spv_size);
 	VkShaderModule fragment = CreateShaderModuleFromSpirv(psx_frag_spv, psx_frag_spv_size);
@@ -1590,7 +1629,7 @@ static int CreatePsxPipeline(int blendMode, int depthEnable, VkPipeline* pipelin
 	pipelineInfo.pColorBlendState = &blend;
 	pipelineInfo.pDynamicState = &dynamic;
 	pipelineInfo.layout = g_vk.psx.layout;
-	pipelineInfo.renderPass = g_vk.mainRenderPass;
+	pipelineInfo.renderPass = renderPass;
 	pipelineInfo.subpass = 0;
 
 	const int ok = VkOk(vkCreateGraphicsPipelines(g_vk.device, VK_NULL_HANDLE, 1, &pipelineInfo, NULL, pipeline),
@@ -1667,6 +1706,56 @@ static int PsxWriteTextureSet(VkPsxTexture* tex)
 	return PsxAllocateSet(&tex->set, tex->view, tex->sampler);
 }
 
+// Colour-only pass for the GR_SetOffscreenState render target. GL renders the
+// offscreen FBO with no depth attachment, so this mirrors it; the final layout
+// is TRANSFER_SRC because the result is copied back into VRAM right away.
+static int CreatePsxOffscreenRenderPass(void)
+{
+	VkAttachmentDescription attachment;
+	memset(&attachment, 0, sizeof(attachment));
+	attachment.format = VK_FORMAT_R8G8B8A8_UNORM;
+	attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+	attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+	attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+	attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	attachment.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+
+	VkAttachmentReference colorReference;
+	memset(&colorReference, 0, sizeof(colorReference));
+	colorReference.attachment = 0;
+	colorReference.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+	VkSubpassDescription subpass;
+	memset(&subpass, 0, sizeof(subpass));
+	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+	subpass.colorAttachmentCount = 1;
+	subpass.pColorAttachments = &colorReference;
+
+	VkSubpassDependency dependency;
+	memset(&dependency, 0, sizeof(dependency));
+	dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+	dependency.dstSubpass = 0;
+	dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	dependency.srcAccessMask = 0;
+	dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+	VkRenderPassCreateInfo renderPass;
+	memset(&renderPass, 0, sizeof(renderPass));
+	renderPass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+	renderPass.attachmentCount = 1;
+	renderPass.pAttachments = &attachment;
+	renderPass.subpassCount = 1;
+	renderPass.pSubpasses = &subpass;
+	renderPass.dependencyCount = 1;
+	renderPass.pDependencies = &dependency;
+
+	return VkOk(vkCreateRenderPass(g_vk.device, &renderPass, NULL, &g_vk.psx.offscreenRenderPass),
+		"vkCreateRenderPass(psx offscreen)");
+}
+
 static int CreatePsxResources(void)
 {
 	VkPsxState* psx = &g_vk.psx;
@@ -1716,11 +1805,24 @@ static int CreatePsxResources(void)
 	for (int mode = 0; mode < PSYX_VK_PSX_BLEND_COUNT; mode++)
 	{
 		// BM_NONE draws depth-tested (PGXP-Z); the other modes depth-test off.
-		if (!CreatePsxPipeline(mode, mode == 0 ? 1 : 0, &psx->pipelines[mode]))
+		if (!CreatePsxPipeline(mode, mode == 0 ? 1 : 0, g_vk.mainRenderPass, &psx->pipelines[mode]))
 			return 0;
 	}
-	if (!CreatePsxPipeline(0, 0, &psx->pipelineNoDepth))
+	if (!CreatePsxPipeline(0, 0, g_vk.mainRenderPass, &psx->pipelineNoDepth))
 		return 0;
+
+	// The per-frame draw list belongs to frameIndex, so the queue maps one
+	// frame to one render pass, mirroring the double-buffered display lists.
+	psx->frameIndex = g_vk.frameIndex;
+
+	// Offscreen pass and its depth-less pipelines.
+	if (!CreatePsxOffscreenRenderPass())
+		return 0;
+	for (int mode = 0; mode < PSYX_VK_PSX_BLEND_COUNT; mode++)
+	{
+		if (!CreatePsxPipeline(mode, 0, psx->offscreenRenderPass, &psx->offscreenPipelines[mode]))
+			return 0;
+	}
 
 	// Nearest sampling with wrapping addresses, like PSX VRAM.
 	VkSamplerCreateInfo samplerInfo;
@@ -1874,6 +1976,17 @@ static void DestroyPsxResources(void)
 		if (psx->pipelines[i]) vkDestroyPipeline(g_vk.device, psx->pipelines[i], NULL);
 	}
 	if (psx->pipelineNoDepth) vkDestroyPipeline(g_vk.device, psx->pipelineNoDepth, NULL);
+	for (int i = 0; i < PSYX_VK_PSX_BLEND_COUNT; i++)
+	{
+		if (psx->offscreenPipelines[i]) vkDestroyPipeline(g_vk.device, psx->offscreenPipelines[i], NULL);
+	}
+	if (psx->offscreenFramebuffer) vkDestroyFramebuffer(g_vk.device, psx->offscreenFramebuffer, NULL);
+	if (psx->offscreenView) vkDestroyImageView(g_vk.device, psx->offscreenView, NULL);
+	if (psx->offscreenImage) vkDestroyImage(g_vk.device, psx->offscreenImage, NULL);
+	if (psx->offscreenMemory) vkFreeMemory(g_vk.device, psx->offscreenMemory, NULL);
+	if (psx->offscreenReadback) vkDestroyBuffer(g_vk.device, psx->offscreenReadback, NULL);
+	if (psx->offscreenReadbackMemory) vkFreeMemory(g_vk.device, psx->offscreenReadbackMemory, NULL);
+	if (psx->offscreenRenderPass) vkDestroyRenderPass(g_vk.device, psx->offscreenRenderPass, NULL);
 	if (psx->sampler) vkDestroySampler(g_vk.device, psx->sampler, NULL);
 	if (psx->lutSampler) vkDestroySampler(g_vk.device, psx->lutSampler, NULL);
 	if (psx->layout) vkDestroyPipelineLayout(g_vk.device, psx->layout, NULL);
@@ -1895,13 +2008,16 @@ void PsyX_Vk_GameBeginFrame(void)
 	g_vk.psx.vertexSize = 0;
 	g_vk.psx.vertexCount = 0;
 	g_vk.psx.drawCount = 0;
+	// The game queues the frame N draws during frame N+1's DrawSync, so the
+	// list being built is one frame ahead of the one now presented.
+	g_vk.psx.frameIndex = g_vk.frameIndex + 1;
+	g_vk.psx.offscreenActive = 0;
+	g_vk.psx.offscreenGroupPendingDraw = 0;
+	g_vk.psx.offscreenGroupCount = 0;
 }
 
-void PsyX_Vk_GameSetVram(const unsigned short* vram)
+static void UploadVramMirror(const unsigned short* vram)
 {
-	if (!g_vk.psx.ready || !vram)
-		return;
-
 	// GL uploads the same mirror as GL_RG / GL_UNSIGNED_BYTE into an RG32F
 	// texture, so R = low byte / 255 and G = high byte / 255.
 	float* dst = (float*)g_vk.psx.vramStagingMapped;
@@ -1928,6 +2044,14 @@ void PsyX_Vk_GameSetVram(const unsigned short* vram)
 	ImageBarrier(cmd, g_vk.psx.vramImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 	EndOneShot(cmd);
+}
+
+void PsyX_Vk_GameSetVram(const unsigned short* vram)
+{
+	if (!g_vk.psx.ready || !vram)
+		return;
+
+	UploadVramMirror(vram);
 }
 
 void PsyX_Vk_GameSetProjection2D(const float projection[16])
@@ -2023,6 +2147,53 @@ void PsyX_Vk_GameSetViewPort(int x, int y, int width, int height)
 	psx->stViewport[3] = height;
 }
 
+void PsyX_Vk_GameSetOffscreen(int enable, int x, int y, int width, int height)
+{
+	VkPsxState* psx = &g_vk.psx;
+	if (!psx->ready)
+		return;
+
+	if (enable)
+	{
+		// GR_SetOffscreenState returns early on a repeated enable, so back-to-
+		// back offscreen splits keep sharing the first rectangle and image.
+		// The game calls GR_SetOffscreenState when building the display list
+		// (DrawSync time is too late), so groups are tracked per frame index
+		// instead of by a monotonic draw counter: group i is the run queued in
+		// frame i, which is the run the renderer submits for frame i.
+		if (psx->offscreenActive)
+			return;
+
+		psx->offscreenActive = 1;
+		psx->offscreenGroupPendingDraw = psx->frameIndex;
+		psx->offscreenRect[0] = x;
+		psx->offscreenRect[1] = y;
+		psx->offscreenRect[2] = width;
+		psx->offscreenRect[3] = height;
+		// The projection active at that moment is the offscreen one set by the
+		// caller's GR_Ortho2D.
+		memcpy(psx->offscreenGroupMatrix, psx->uboMapped, sizeof(psx->offscreenGroupMatrix));
+		return;
+	}
+
+	if (!psx->offscreenActive)
+		return;
+
+	psx->offscreenActive = 0;
+
+	const int frame = psx->offscreenGroupPendingDraw;
+	if (psx->offscreenGroupCount >= PSYX_VK_PSX_MAX_OFFSCREEN_GROUPS)
+	{
+		eprintwarn("PsyX Vulkan: too many offscreen groups, dropping one\n");
+		return;
+	}
+
+	VkPsxOffscreenGroup* group = &psx->offscreenGroups[psx->offscreenGroupCount++];
+	group->frame = frame;
+	memcpy(group->rect, psx->offscreenRect, sizeof(group->rect));
+	memcpy(group->matrix, psx->offscreenGroupMatrix, sizeof(group->matrix));
+}
+
 void PsyX_Vk_GameStoreFrameBuffer(int x, int y, int width, int height)
 {
 	VkPsxState* psx = &g_vk.psx;
@@ -2105,6 +2276,8 @@ int PsyX_Vk_GameDrawTriangles(int firstVertex, int triangles)
 		: VK_NULL_HANDLE;
 	draw->firstVertex = (uint32_t)firstVertex;
 	draw->vertexCount = (uint32_t)(triangles * 3);
+	draw->frame = psx->frameIndex;
+	draw->offscreen = psx->offscreenActive;
 
 	return triangles;
 }
@@ -2304,34 +2477,48 @@ SDL_Window* PsyX_Vk_GetSDLWindow(void)
 	return g_vk.window;
 }
 
-static void RecordPsxDraws(void)
+// Records the queued PSX draws into `cmd`. A draw belongs to a single display
+// list (frame index); `frame` selects which one. `offscreen` selects the draws
+// queued inside a GR_SetOffscreenState render-to-VRAM run, and the main pass
+// records the complement so those draws are not also drawn on screen.
+static void RecordPsxDraws(VkCommandBuffer cmd, int offscreen, int frame,
+	int targetWidth, int targetHeight)
 {
 	VkPsxState* psx = &g_vk.psx;
 	if (!psx->ready || psx->drawCount == 0)
 		return;
 
+	const int endDraw = psx->drawCount;
+
 	// One vertex buffer per frame, as the game uploads it once.
 	const VkDeviceSize offset = 0;
-	vkCmdBindVertexBuffers(g_vk.commandBuffer, 0, 1, &psx->vertexBuffer, &offset);
+	vkCmdBindVertexBuffers(cmd, 0, 1, &psx->vertexBuffer, &offset);
 
 	const float blendConstants[4] = { 0.5f, 0.5f, 0.5f, 0.25f };
-	vkCmdSetBlendConstants(g_vk.commandBuffer, blendConstants);
+	vkCmdSetBlendConstants(cmd, blendConstants);
 
 	VkDescriptorSet boundSet = VK_NULL_HANDLE;
 
-	for (int i = 0; i < psx->drawCount; i++)
+	for (int i = 0; i < endDraw; i++)
 	{
 		const VkPsxDraw* draw = &psx->draws[i];
-		const VkDescriptorSet set = draw->textureSet ? draw->textureSet : psx->dummySet;
-		const VkPipeline pipeline = (draw->blendMode == 0 && !draw->depthTest)
-			? psx->pipelineNoDepth
-			: psx->pipelines[draw->blendMode];
+		if (draw->frame != frame)
+			continue;
+		if ((draw->offscreen ? 1 : 0) != offscreen)
+			continue;
 
-		vkCmdBindPipeline(g_vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+		const VkDescriptorSet set = draw->textureSet ? draw->textureSet : psx->dummySet;
+		const VkPipeline pipeline = offscreen
+			? psx->offscreenPipelines[draw->blendMode]
+			: ((draw->blendMode == 0 && !draw->depthTest)
+				? psx->pipelineNoDepth
+				: psx->pipelines[draw->blendMode]);
+
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
 		if (set != boundSet)
 		{
-			vkCmdBindDescriptorSets(g_vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
 				psx->layout, 0, 1, &set, 0, NULL);
 			boundSet = set;
 		}
@@ -2344,23 +2531,23 @@ static void RecordPsxDraws(void)
 		// Vulkan's top-left one.
 		VkViewport viewport;
 		viewport.x = (float)draw->viewport[0];
-		viewport.width = (float)(draw->viewport[2] > 0 ? draw->viewport[2] : g_vk.width);
-		viewport.height = (float)(draw->viewport[3] > 0 ? draw->viewport[3] : g_vk.height);
-		viewport.y = (float)g_vk.height - ((float)draw->viewport[1] + viewport.height);
+		viewport.width = (float)(draw->viewport[2] > 0 ? draw->viewport[2] : targetWidth);
+		viewport.height = (float)(draw->viewport[3] > 0 ? draw->viewport[3] : targetHeight);
+		viewport.y = (float)targetHeight - ((float)draw->viewport[1] + viewport.height);
 		viewport.minDepth = 0.0f;
 		viewport.maxDepth = 1.0f;
-		vkCmdSetViewport(g_vk.commandBuffer, 0, 1, &viewport);
+		vkCmdSetViewport(cmd, 0, 1, &viewport);
 
 		VkRect2D scissor;
 		scissor.offset.x = draw->scissorEnable ? draw->scissor[0] : 0;
 		// GR_SetupClipMode hands over the same bottom-left rectangle glScissor
 		// receives, so map it to Vulkan's top-left origin like the viewport.
 		scissor.offset.y = draw->scissorEnable
-			? (int)g_vk.height - (draw->scissor[1] + draw->scissor[3])
+			? (int)targetHeight - (draw->scissor[1] + draw->scissor[3])
 			: 0;
-		scissor.extent.width = (uint32_t)(draw->scissorEnable ? draw->scissor[2] : g_vk.width);
-		scissor.extent.height = (uint32_t)(draw->scissorEnable ? draw->scissor[3] : g_vk.height);
-		vkCmdSetScissor(g_vk.commandBuffer, 0, 1, &scissor);
+		scissor.extent.width = (uint32_t)(draw->scissorEnable ? draw->scissor[2] : targetWidth);
+		scissor.extent.height = (uint32_t)(draw->scissorEnable ? draw->scissor[3] : targetHeight);
+		vkCmdSetScissor(cmd, 0, 1, &scissor);
 
 		struct
 		{
@@ -2375,11 +2562,193 @@ static void RecordPsxDraws(void)
 		constants.texelSize[1] = draw->texelSize[1];
 		constants.overrideAlphaMode = draw->overrideAlphaMode;
 
-		vkCmdPushConstants(g_vk.commandBuffer, psx->layout,
+		vkCmdPushConstants(cmd, psx->layout,
 			VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(constants), &constants);
 
-		vkCmdDraw(g_vk.commandBuffer, draw->vertexCount, 1, draw->firstVertex, 0);
+		vkCmdDraw(cmd, draw->vertexCount, 1, draw->firstVertex, 0);
 	}
+}
+
+// Creates or resizes the render-to-VRAM target so its attachment matches the
+// GR_SetOffscreenState rectangle (the GL renderer resizes its offscreen texture
+// the same way). The result is read back through a host-visible buffer.
+static int EnsureOffscreenTarget(int width, int height)
+{
+	VkPsxState* psx = &g_vk.psx;
+
+	if (width <= 0 || height <= 0)
+		return 0;
+	if (width > PSYX_VK_VRAM_WIDTH || height > PSYX_VK_VRAM_HEIGHT)
+		return 0;
+
+	if (psx->offscreenImage && psx->offscreenWidth == width && psx->offscreenHeight == height)
+		return 1;
+
+	if (psx->offscreenFramebuffer) { vkDestroyFramebuffer(g_vk.device, psx->offscreenFramebuffer, NULL); psx->offscreenFramebuffer = VK_NULL_HANDLE; }
+	if (psx->offscreenView) { vkDestroyImageView(g_vk.device, psx->offscreenView, NULL); psx->offscreenView = VK_NULL_HANDLE; }
+	if (psx->offscreenImage) { vkDestroyImage(g_vk.device, psx->offscreenImage, NULL); psx->offscreenImage = VK_NULL_HANDLE; }
+	if (psx->offscreenMemory) { vkFreeMemory(g_vk.device, psx->offscreenMemory, NULL); psx->offscreenMemory = VK_NULL_HANDLE; }
+	if (psx->offscreenReadback) { vkDestroyBuffer(g_vk.device, psx->offscreenReadback, NULL); psx->offscreenReadback = VK_NULL_HANDLE; }
+	if (psx->offscreenReadbackMemory) { vkFreeMemory(g_vk.device, psx->offscreenReadbackMemory, NULL); psx->offscreenReadbackMemory = VK_NULL_HANDLE; }
+	psx->offscreenReadbackMapped = NULL;
+	psx->offscreenReadbackSize = 0;
+	psx->offscreenWidth = 0;
+	psx->offscreenHeight = 0;
+
+	if (!CreateImage2D((uint32_t)width, (uint32_t)height, VK_FORMAT_R8G8B8A8_UNORM,
+		VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+		&psx->offscreenImage, &psx->offscreenMemory))
+		return 0;
+	if (!CreateImageView2D(psx->offscreenImage, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, &psx->offscreenView))
+		return 0;
+
+	VkFramebufferCreateInfo framebuffer;
+	memset(&framebuffer, 0, sizeof(framebuffer));
+	framebuffer.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+	framebuffer.renderPass = psx->offscreenRenderPass;
+	framebuffer.attachmentCount = 1;
+	framebuffer.pAttachments = &psx->offscreenView;
+	framebuffer.width = (uint32_t)width;
+	framebuffer.height = (uint32_t)height;
+	framebuffer.layers = 1;
+	if (!VkOk(vkCreateFramebuffer(g_vk.device, &framebuffer, NULL, &psx->offscreenFramebuffer), "vkCreateFramebuffer(psx offscreen)"))
+		return 0;
+
+	const VkDeviceSize size = (VkDeviceSize)width * height * 4;
+	if (!CreateBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		&psx->offscreenReadback, &psx->offscreenReadbackMemory, &psx->offscreenReadbackMapped))
+		return 0;
+	psx->offscreenReadbackSize = size;
+
+	psx->offscreenWidth = width;
+	psx->offscreenHeight = height;
+
+	{
+		char line[128];
+		snprintf(line, sizeof(line), "psx: offscreen target %dx%d", width, height);
+		VkStage(line);
+	}
+	return 1;
+}
+
+// Renders one GR_SetOffscreenState group into the offscreen target, copies the
+// pixels back and packs them into the PSX VRAM mirror at the group rectangle.
+static void ResolveOffscreenGroup(const VkPsxOffscreenGroup* group, unsigned short* vram)
+{
+	VkPsxState* psx = &g_vk.psx;
+	const int w = group->rect[2];
+	const int h = group->rect[3];
+
+	if (group->rect[0] < 0 || group->rect[1] < 0 ||
+		group->rect[0] + w > PSYX_VK_VRAM_WIDTH ||
+		group->rect[1] + h > PSYX_VK_VRAM_HEIGHT)
+	{
+		eprintwarn("PsyX Vulkan: offscreen rect outside VRAM, skipping\n");
+		return;
+	}
+	if (!EnsureOffscreenTarget(w, h) || !psx->offscreenReadbackMapped)
+		return;
+
+	// The projection active when the group was queued (GR_SetOffscreenState's
+	// GR_Ortho2D) is restored for this pass only; the main frame sees whatever
+	// the game left behind, exactly like the immediate-mode OpenGL renderer.
+	float saved[32];
+	memcpy(saved, psx->uboMapped, sizeof(saved));
+
+	VkCommandBuffer cmd = BeginOneShot();
+	if (cmd == VK_NULL_HANDLE)
+		return;
+
+	memcpy(psx->uboMapped, group->matrix, sizeof(saved));
+
+	VkClearValue clear;
+	memset(&clear, 0, sizeof(clear));
+	clear.color.float32[0] = 0.5f;
+	clear.color.float32[1] = 0.5f;
+	clear.color.float32[2] = 0.5f;
+	clear.color.float32[3] = 0.0f;
+
+	VkRenderPassBeginInfo begin;
+	memset(&begin, 0, sizeof(begin));
+	begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	begin.renderPass = psx->offscreenRenderPass;
+	begin.framebuffer = psx->offscreenFramebuffer;
+	begin.renderArea.extent.width = (uint32_t)w;
+	begin.renderArea.extent.height = (uint32_t)h;
+	begin.clearValueCount = 1;
+	begin.pClearValues = &clear;
+
+	vkCmdBeginRenderPass(cmd, &begin, VK_SUBPASS_CONTENTS_INLINE);
+
+	VkViewport viewport;
+	memset(&viewport, 0, sizeof(viewport));
+	viewport.width = (float)w;
+	viewport.height = (float)h;
+	viewport.maxDepth = 1.0f;
+	vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+	VkRect2D scissor;
+	memset(&scissor, 0, sizeof(scissor));
+	scissor.extent.width = (uint32_t)w;
+	scissor.extent.height = (uint32_t)h;
+	vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+	RecordPsxDraws(cmd, 1, group->frame, w, h);
+
+	vkCmdEndRenderPass(cmd);
+
+	VkBufferImageCopy copy;
+	memset(&copy, 0, sizeof(copy));
+	copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	copy.imageSubresource.layerCount = 1;
+	copy.imageExtent.width = (uint32_t)w;
+	copy.imageExtent.height = (uint32_t)h;
+	copy.imageExtent.depth = 1;
+	vkCmdCopyImageToBuffer(cmd, psx->offscreenImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		psx->offscreenReadback, 1, &copy);
+
+	EndOneShot(cmd);	// submits and waits, so the pixels below are complete
+
+	memcpy(psx->uboMapped, saved, sizeof(saved));
+
+	// The Vulkan render target is top-down like the presented image, so the
+	// rows map straight onto VRAM (the GL path flips its bottom-up FBO).
+	const unsigned char* src = (const unsigned char*)psx->offscreenReadbackMapped;
+	for (int row = 0; row < h; row++)
+	{
+		const unsigned char* s = src + (size_t)row * (size_t)w * 4;
+		unsigned short* d = vram + (size_t)(group->rect[1] + row) * PSYX_VK_VRAM_WIDTH + group->rect[0];
+		for (int col = 0; col < w; col++)
+		{
+			const int r = s[0] >> 3;
+			const int g = s[1] >> 3;
+			const int b = s[2] >> 3;
+			// PSX 5551 is "transparent unless the word is non-zero", matching
+			// the texture decode (master.alpha = w != 0 ? 1 : 0).
+			const int a = (r | g | b) ? 1 : 0;
+			d[col] = (unsigned short)(r | (g << 5) | (b << 10) | (a << 15));
+			s += 4;
+		}
+	}
+}
+
+int PsyX_Vk_GameResolveOffscreen(unsigned short* vram)
+{
+	VkPsxState* psx = &g_vk.psx;
+	if (!g_vk.initialised || !psx->ready || !vram || psx->offscreenGroupCount == 0)
+		return 0;
+
+	for (int i = 0; i < psx->offscreenGroupCount; i++)
+		ResolveOffscreenGroup(&psx->offscreenGroups[i], vram);
+
+	psx->offscreenGroupCount = 0;
+
+	// The mirror changed: re-upload it so the on-screen draws that sample the
+	// offscreen region see it during this frame, and so the frame's mirror
+	// upload does not overwrite it with stale data.
+	UploadVramMirror(vram);
+	return 1;
 }
 
 static float SrgbEncodeFloat(float value)
@@ -2561,6 +2930,62 @@ int PsyX_Vk_GameSelfTest(char* report, int reportSize)
 		const float expected[4] = { 0.0f, 0.0f, channel, 1.0f };
 		if (!PsxCheckPixel(rgba, readWidth, readHeight, readWidth / 2, readHeight / 2, expected, tolerance,
 			"4-bit CLUT entry 5", report, reportSize))
+			failures++;
+	}
+
+	// Case 3: offscreen (render-to-VRAM) target. A 32x32 quad sampling the red
+	// word at VRAM (0,0) renders into the GR_SetOffscreenState target and must
+	// land in the mirror at (64,64), which proves PsyX_Vk_GameResolveOffscreen's
+	// render + readback + pack path the game's Tanner shadow relies on.
+	memset(vram, 0, sizeof(unsigned short) * PSYX_VK_VRAM_WIDTH * PSYX_VK_VRAM_HEIGHT);
+	vram[0] = 0x001F;	// red
+
+	PsxFillQuad(32.0f, 32.0f, 0.0f, 0.0f, 0.0f, 0.0f, quad);
+
+	PsyX_Vk_GameBeginFrame();
+	PsyX_Vk_GameSetVram(vram);
+	PsyX_Vk_GameUpdateVertexBuffer(quad, 6);
+	PsyX_Vk_GameSetBlendMode(PSYX_VK_BLEND_NONE);
+	PsyX_Vk_GameSetTexture(PSYX_VK_TEX_16BIT, 0);
+	PsyX_Vk_GameEnableDepth(0);
+	PsyX_Vk_GameSetBilinear(0);
+	PsyX_Vk_GameSetViewPort(0, 0, 32, 32);
+	PsyX_Vk_GameSetScissor(0, 0, 0, 32, 32);
+
+	float offscreenOrtho[16];
+	PsxBuildOrtho(0.0f, 32.0f, 32.0f, 0.0f, -1.0f, 1.0f, offscreenOrtho);
+	PsyX_Vk_GameSetProjection2D(offscreenOrtho);
+
+	PsyX_Vk_GameSetOffscreen(1, 64, 64, 32, 32);
+	PsyX_Vk_GameDrawTriangles(0, 2);
+	PsyX_Vk_GameSetOffscreen(0, 64, 64, 32, 32);	// group->frame = frameIndex
+
+	if (!PsyX_Vk_GameResolveOffscreen(vram))
+	{
+		ReportAppend(report, reportSize, "offscreen resolve: no group resolved FAIL\n");
+		failures++;
+	}
+	else
+	{
+		// Alpha is derived from "non-zero word", exactly like the texture
+		// decode, so the expected word carries the opaque bit. The corners are
+		// checked too so a partial quad fails even if the center happens to
+		// match.
+		const unsigned short expected = 0x801F;
+		const int samples[3][2] = { { 8, 8 }, { 16, 16 }, { 30, 30 } };
+		int offscreenFailures = 0;
+		for (int s = 0; s < 3; s++)
+		{
+			const unsigned short packed = vram[(64 + samples[s][1]) * PSYX_VK_VRAM_WIDTH + (64 + samples[s][0])];
+			if (packed != expected)
+				offscreenFailures++;
+		}
+
+		char line[128];
+		snprintf(line, sizeof(line), "offscreen 64,64 32x32: samples %s\n",
+			offscreenFailures == 0 ? "ok" : "FAIL");
+		ReportAppend(report, reportSize, line);
+		if (offscreenFailures != 0)
 			failures++;
 	}
 
@@ -3330,8 +3755,9 @@ int PsyX_Vk_RenderFrame(void)
 	vkCmdSetScissor(g_vk.commandBuffer, 0, 1, &scissor);
 
 	// The emulated PSX game image goes down first; the modern meshes and the
-	// overlay draw on top of it.
-	RecordPsxDraws();
+	// overlay draw on top of it. Offscreen (render-to-VRAM) draws are resolved
+	// into the VRAM mirror before the frame, so they are skipped here.
+	RecordPsxDraws(g_vk.commandBuffer, 0, g_vk.psx.frameIndex, g_vk.width, g_vk.height);
 	drawCalls += g_vk.psx.drawCount;
 
 	vkCmdBindPipeline(g_vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.pbrPipeline);
@@ -4141,6 +4567,11 @@ void PsyX_Vk_GameSetScissor(int enable, int x, int y, int width, int height)
 	(void)enable; (void)x; (void)y; (void)width; (void)height;
 }
 void PsyX_Vk_GameSetViewPort(int x, int y, int width, int height) { (void)x; (void)y; (void)width; (void)height; }
+void PsyX_Vk_GameSetOffscreen(int enable, int x, int y, int width, int height)
+{
+	(void)enable; (void)x; (void)y; (void)width; (void)height;
+}
+int PsyX_Vk_GameResolveOffscreen(unsigned short* vram) { (void)vram; return 0; }
 void PsyX_Vk_GameStoreFrameBuffer(int x, int y, int width, int height) { (void)x; (void)y; (void)width; (void)height; }
 int PsyX_Vk_TakeStoredFrameBuffer(const unsigned char** rgba, int* stride,
 	int* srcWidth, int* srcHeight, int* bgra, int* x, int* y, int* width, int* height)

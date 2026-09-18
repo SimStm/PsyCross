@@ -94,6 +94,10 @@ int g_cfg_bilinearFiltering = 0;
 int vram_need_update = 1;
 int framebuffer_need_update = 0;
 
+// Defined below; declared here so the frame functions above it can resolve the
+// Vulkan offscreen render-to-VRAM groups into the mirror.
+extern unsigned short vram[VRAM_WIDTH * VRAM_HEIGHT];
+
 #if defined(__EMSCRIPTEN__) || defined(__RPI__) || defined(__ANDROID__)
 #if defined(RENDERER_OGL)
 #error It should not be enabled
@@ -537,6 +541,13 @@ void GR_EndScene()
 
 	if (GR_UseVulkan())
 	{
+		// Every draw has been queued by now, so the offscreen render-to-VRAM
+		// groups can be resolved into the mirror before the frame is submitted.
+		// This mirrors GR_SetOffscreenState's synchronous GL blit: the on-screen
+		// draws that sample the offscreen region see it in the same frame.
+		if (PsyX_Vk_GameResolveOffscreen(vram))
+			vram_need_update = 0;
+
 		// The modern mesh scene is still an OpenGL-only slice of the fixture;
 		// the Vulkan game frame ends in GR_SwapWindow.
 		return;
@@ -1805,10 +1816,13 @@ void GR_SetOffscreenState(const RECT16* offscreenRect, int enable)
 
 	if (GR_UseVulkan())
 	{
-		// The offscreen render target is not ported yet: enable=1 draws into
-		// the presented image instead of an offscreen buffer. The matrices and
-		// viewport still follow the GL renderer so geometry lines up.
+		// The Vulkan backend owns a render-to-VRAM target: draws queued while
+		// `enable` is set are rendered offscreen and copied into VRAM when it is
+		// cleared, mirroring the GL framebuffer below. The matrices and viewport
+		// follow the GL renderer so geometry lines up.
 		g_PreviousOffscreen = *offscreenRect;
+		PsyX_Vk_GameSetOffscreen(enable, offscreenRect->x, offscreenRect->y,
+			offscreenRect->w, offscreenRect->h);
 		GR_SetViewPort(0, 0,
 			enable ? offscreenRect->w : g_windowWidth,
 			enable ? offscreenRect->h : g_windowHeight);

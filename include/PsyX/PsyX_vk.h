@@ -141,6 +141,19 @@ void PsyX_Vk_GameSetBilinear(int enable);
 void PsyX_Vk_GameSetScissor(int enable, int x, int y, int width, int height);
 void PsyX_Vk_GameSetViewPort(int x, int y, int width, int height);
 
+/* Render-to-VRAM (offscreen) target, mirroring GR_SetOffscreenState. While
+   `enable` is set, subsequently queued PSX draws render into an offscreen
+   buffer of `width` x `height`; once cleared, the buffer is copied into the PSX
+   VRAM mirror at (x, y) so later draws in the frame sample the result, exactly
+   like the OpenGL renderer's offscreen framebuffer blit. */
+void PsyX_Vk_GameSetOffscreen(int enable, int x, int y, int width, int height);
+
+/* Renders every queued offscreen group, packs the pixels into `vram` (the full
+   1024x512 PSX mirror) and re-uploads the GPU VRAM image. Call once per frame
+   after the draws are queued and before the frame is submitted. Returns 1 when
+   at least one group was resolved. */
+int  PsyX_Vk_GameResolveOffscreen(unsigned short* vram);
+
 /* Clears the presented image (PSX framebuffer clear). */
 void PsyX_Vk_GameClear(int x, int y, int width, int height, unsigned char r, unsigned char g, unsigned char b);
 
