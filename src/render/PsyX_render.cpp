@@ -5,7 +5,18 @@
 
 #include "PsyX/PsyX_render.h"
 #include "PsyX/PsyX_globals.h"
+#include "PsyX/PsyX_vk.h"
 #include "PsyX/util/timer.h"
+
+#include "PsyX_ModernMesh.h"
+
+// The GR_* entry points below are the OpenGL renderer's contract. When the
+// Vulkan backend was selected (PsyX_SetRenderBackend) the same calls are
+// forwarded to its emulated-PSX path instead, and the GL-only work is skipped.
+static inline int GR_UseVulkan(void)
+{
+	return PsyX_GetRenderBackend() == PSYX_BACKEND_VULKAN;
+}
 
 #include <assert.h>
 #include <string.h>
@@ -348,6 +359,29 @@ int GR_InitialiseGLContext(char* windowName, int fullscreen)
 }
 #endif
 
+#ifndef GL_TEXTURE_MAX_ANISOTROPY_EXT
+#define GL_TEXTURE_MAX_ANISOTROPY_EXT 0x84FE
+#endif
+#ifndef GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT
+#define GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT 0x84FF
+#endif
+
+// Optional GL_EXT_texture_filter_anisotropic. The glad loader does not expose
+// its token, so it is queried through SDL; the core glTexParameterf() call is
+// used, which drivers accept for the extension enum. A value <= 1 leaves it off.
+static GLfloat g_maxAnisotropy = 0.0f;
+
+// Anisotropy sharpens mipmapped overrides viewed at grazing angles (roads,
+// ground) without changing the PSX nearest-filtered path.
+static void GR_ApplyOverrideAnisotropy()
+{
+	if (g_maxAnisotropy <= 1.0f)
+		return;
+
+	const GLfloat level = g_maxAnisotropy > 4.0f ? 4.0f : g_maxAnisotropy;
+	glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, level);
+}
+
 int GR_InitialiseGLExt()
 {
 #ifdef USE_GLAD
@@ -366,6 +400,16 @@ int GR_InitialiseGLExt()
 
 	const char* glslVersionStr = (const char*)glGetString(GL_SHADING_LANGUAGE_VERSION);
 	eprintf("*GLSL version: %s\n", glslVersionStr);
+
+	if (SDL_GL_ExtensionSupported("GL_EXT_texture_filter_anisotropic"))
+	{
+		glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &g_maxAnisotropy);
+		eprintf("*Anisotropic filtering: up to %.0fx\n", g_maxAnisotropy);
+	}
+	else
+	{
+		eprintf("*Anisotropic filtering: not supported by this driver\n");
+	}
 
 	return 1;
 }
@@ -405,7 +449,15 @@ int GR_InitialiseRender(char* windowName, int width, int height, int fullscreen)
 
 void GR_Shutdown()
 {
+	if (GR_UseVulkan())
+	{
+		// PsyX_Shutdown destroys the Vulkan backend (it owns the window).
+		return;
+	}
+
 #if USE_OPENGL
+	PsyX_ModernMesh_Shutdown();
+
 	glDeleteVertexArrays(2, g_glVertexArray);
 	glDeleteBuffers(2, g_glVertexBuffer);
 
@@ -428,6 +480,12 @@ void GR_Shutdown()
 
 void GR_UpdateSwapIntervalState(int swapInterval)
 {
+	if (GR_UseVulkan())
+	{
+		// Present mode is FIFO; a runtime vsync toggle is not wired up yet.
+		return;
+	}
+
 #if defined(RENDERER_OGL)
 	SDL_GL_SetSwapInterval(swapInterval);
 #endif
@@ -436,6 +494,14 @@ void GR_UpdateSwapIntervalState(int swapInterval)
 void GR_BeginScene()
 {
 	g_lastBoundTexture = 0;
+
+	if (GR_UseVulkan())
+	{
+		PsyX_Vk_GameBeginFrame();
+		GR_UpdateVRAM();
+		GR_SetViewPort(0, 0, g_windowWidth, g_windowHeight);
+		return;
+	}
 
 #if USE_OPENGL
 #ifdef RENDERER_OGLES
@@ -468,9 +534,21 @@ void GR_EndScene()
 	if (g_dbg_wireframeMode)
 		GR_SetWireframe(0);
 
+	if (GR_UseVulkan())
+	{
+		// The modern mesh scene is still an OpenGL-only slice of the fixture;
+		// the Vulkan game frame ends in GR_SwapWindow.
+		return;
+	}
+
 #if USE_OPENGL
 	glBindVertexArray(0);
 #endif
+
+	// The legacy scene is complete in the shared framebuffer; draw the
+	// experimental modern meshes into the same colour/depth before the frame
+	// is handed to the overlay and swapped.
+	PsyX_ModernMesh_RenderFrame();
 }
 
 //----------------------------------------------------------------------------------------
@@ -480,6 +558,12 @@ static u_char rgLUT[LUT_WIDTH * LUT_HEIGHT * sizeof(u_int)];
 
 void GR_ResetDevice()
 {
+	if (GR_UseVulkan())
+	{
+		PsyX_Vk_GameResetDevice();
+		return;
+	}
+
 	GR_UpdateSwapIntervalState(0);
 }
 
@@ -493,6 +577,7 @@ typedef struct
 	GLint projection3DLoc;
 	GLint bilinearFilterLoc;
 	GLint texelSizeLoc;
+	GLint overrideAlphaModeLoc;
 	GLint texLoc;
 	GLint lutLoc;
 #endif
@@ -508,6 +593,7 @@ PSXGPU_Shader g_gpu_shader_32_rgba;
 GLint u_projectionLoc;
 GLint u_projection3DLoc;
 GLint u_texelSizeLoc;
+GLint u_overrideAlphaModeLoc;
 
 #define GPU_SAMPLE_TEXTURE_4BIT_FUNC\
     "   // returns 16 bit colour\n"\
@@ -634,9 +720,15 @@ const char* gpu_shader_16 = GPU_FRAGMENT_SAMPLE_SHADER(16);
 const char* gpu_shader_32_rgba = 
 	"	uniform sampler2D s_texture;\n"\
 	"	uniform vec2 texelSize;\n"\
+	"	uniform int overrideAlphaMode;\n"\
 	"	void main() {\n"\
 	"		vec2 tc = v_texcoord.xy * texelSize + texelSize * 0.5;\n"\
 	"		vec4 color = texture2D(s_texture, tc);\n"\
+	"		// 0 = not an override, 1 = binary cutout (compatibility), 2 = proportional\n"\
+	"		// alpha where only a fully transparent texel is a hole. Original PSX\n"\
+	"		// behaviour is unchanged because the mode is 0 for non-overrides.\n"\
+	"		if (overrideAlphaMode == 1 && color.a < 0.5) { discard; }\n"\
+	"		else if (overrideAlphaMode == 2 && color.a < (0.5 / 255.0)) { discard; }\n"\
 	"		fragColor = dither(color * v_color);\n"\
 	"	}\n";
 
@@ -868,6 +960,13 @@ ShaderID GR_Shader_Compile(const char* source, int isPsxShader)
 
 void GR_GenerateCommonTextures()
 {
+	if (GR_UseVulkan())
+	{
+		// The Vulkan backend owns its own VRAM mirror, RG8 table and white
+		// texture; nothing to generate here.
+		return;
+	}
+
 	unsigned int whitePixelData = 0xFFFFFFFF;
 
 #if USE_OPENGL
@@ -899,6 +998,9 @@ void GR_GenerateCommonTextures()
 
 TextureID GR_CreateRGBATexture(int width, int height, u_char* data /*= nullptr*/)
 {
+	if (GR_UseVulkan())
+		return (TextureID)PsyX_Vk_GameCreateTexture(data, width, height, 0);
+
 	TextureID newTexture;
 	glGenTextures(1, &newTexture);
 
@@ -916,6 +1018,29 @@ TextureID GR_CreateRGBATexture(int width, int height, u_char* data /*= nullptr*/
 	return newTexture;
 }
 
+TextureID GR_CreateRGBATextureMipmapped(int width, int height, u_char* data /*= nullptr*/)
+{
+	if (GR_UseVulkan())
+		return (TextureID)PsyX_Vk_GameCreateTexture(data, width, height, 1);
+
+	TextureID newTexture;
+	glGenTextures(1, &newTexture);
+
+	glBindTexture(GL_TEXTURE_2D, newTexture);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, g_cfg_bilinearFiltering ? GL_LINEAR : GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, g_cfg_bilinearFiltering ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_NEAREST);
+
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+	glGenerateMipmap(GL_TEXTURE_2D);
+	GR_ApplyOverrideAnisotropy();
+	glBindTexture(GL_TEXTURE_2D, 0);
+
+	return newTexture;
+}
+
 void GR_CompilePSXShader(PSXGPU_Shader* sh, const char* source)
 {
 	sh->shader = GR_Shader_Compile(source, true);
@@ -924,6 +1049,7 @@ void GR_CompilePSXShader(PSXGPU_Shader* sh, const char* source)
 	sh->bilinearFilterLoc = glGetUniformLocation(sh->shader, "bilinearFilter");
 	sh->projectionLoc = glGetUniformLocation(sh->shader, "Projection");
 	sh->texelSizeLoc = glGetUniformLocation(sh->shader, "texelSize");
+	sh->overrideAlphaModeLoc = glGetUniformLocation(sh->shader, "overrideAlphaMode");
 	sh->texLoc = glGetUniformLocation(sh->shader, "s_texture");
 	sh->lutLoc = glGetUniformLocation(sh->shader, "s_rgLut");
 #if USE_PGXP
@@ -1114,6 +1240,12 @@ void GR_Ortho2D(float left, float right, float bottom, float top, float znear, f
 		x, y, z, 1
 	};
 
+	if (GR_UseVulkan())
+	{
+		PsyX_Vk_GameSetProjection2D(ortho);
+		return;
+	}
+
 #if USE_OPENGL
 	glUniformMatrix4fv(u_projectionLoc, 1, GL_FALSE, ortho);
 #endif
@@ -1134,6 +1266,16 @@ void GR_Perspective3D(const float fov, const float width, const float height, co
 		0, 0, (zFar + zNear) / (zFar - zNear), 1,
 		0, 0, -(2 * zFar * zNear) / (zFar - zNear), 0
 	};
+
+	if (GR_UseVulkan())
+	{
+		PsyX_Vk_GameSetProjection3D(persp);
+		return;
+	}
+
+	// The modern mesh path shares this exact projection so its clip position
+	// and depth match legacy geometry.
+	PsyX_ModernMesh_SetProjection(persp);
 
 #if USE_OPENGL
 	glUniformMatrix4fv(u_projection3DLoc, 1, GL_FALSE, persp);
@@ -1179,6 +1321,19 @@ void GR_SetupClipMode(const RECT16* rect, int enable)
 		clipRectX += 0.5f;
 	}
 
+	if (GR_UseVulkan())
+	{
+		// Same top-left window-space rectangle the GL path scissored.
+		const float flipOffset = g_windowHeight - clipRectH * (float)g_windowHeight;
+		const float crx = clipRectX * (float)g_windowWidth;
+		const float cry = clipRectY * (float)g_windowHeight;
+		const float crw = clipRectW * (float)g_windowWidth;
+		const float crh = clipRectH * (float)g_windowHeight;
+
+		PsyX_Vk_GameSetScissor(1, (int)crx, (int)(flipOffset - cry), (int)crw, (int)crh);
+		return;
+	}
+
 #if USE_OPENGL
 	// adjust scissor rectangle by the backbuffer size (window dimensions)
 	const float flipOffset = g_windowHeight - clipRectH * (float)g_windowHeight;
@@ -1221,6 +1376,13 @@ void PsyX_GetPSXWidescreenMappedViewport(struct _RECT16* rect)
 
 void GR_SetShader(const ShaderID shader)
 {
+	if (GR_UseVulkan())
+	{
+		// The Vulkan pipeline is picked from the blend mode and texture format
+		// in PsyX_Vk_GameSetBlendMode/SetTexture.
+		return;
+	}
+
 	if (g_PreviousShader != shader)
 	{
 #if USE_OPENGL
@@ -1236,6 +1398,16 @@ void GR_SetShader(const ShaderID shader)
 
 void GR_SetTexture(TextureID texture, TexFormat texFormat)
 {
+	if (GR_UseVulkan())
+	{
+		// TextureID and TexFormat values match PsyX_Vk_GameCreateTexture
+		// handles and PSYX_VK_TEX_*.
+		PsyX_Vk_GameSetTexture((int)texFormat, (int)texture);
+		PsyX_Vk_GameSetBilinear(g_cfg_bilinearFiltering);
+		g_lastBoundTexture = texture;
+		return;
+	}
+
 	GLint texLoc = 0;
 	GLint lutLoc = 0;
 	GLint bilinearFilterLoc = 0;
@@ -1249,6 +1421,7 @@ void GR_SetTexture(TextureID texture, TexFormat texFormat)
 		texLoc = g_gpu_shader_4.texLoc;
 		lutLoc = g_gpu_shader_4.lutLoc;
 		u_texelSizeLoc = -1;
+		u_overrideAlphaModeLoc = -1;
 		break;
 	case TF_8_BIT:
 		GR_SetShader(g_gpu_shader_8.shader);
@@ -1258,6 +1431,7 @@ void GR_SetTexture(TextureID texture, TexFormat texFormat)
 		texLoc = g_gpu_shader_8.texLoc;
 		lutLoc = g_gpu_shader_8.lutLoc;
 		u_texelSizeLoc = -1;
+		u_overrideAlphaModeLoc = -1;
 		break;
 	case TF_16_BIT:
 		GR_SetShader(g_gpu_shader_16.shader);
@@ -1267,6 +1441,7 @@ void GR_SetTexture(TextureID texture, TexFormat texFormat)
 		texLoc = g_gpu_shader_16.texLoc;
 		lutLoc = g_gpu_shader_16.lutLoc;
 		u_texelSizeLoc = -1;
+		u_overrideAlphaModeLoc = -1;
 		break;
 	case TF_32_BIT_RGBA:
 		GR_SetShader(g_gpu_shader_32_rgba.shader);
@@ -1276,6 +1451,7 @@ void GR_SetTexture(TextureID texture, TexFormat texFormat)
 		texLoc = g_gpu_shader_32_rgba.texLoc;
 		lutLoc = -1;
 		u_texelSizeLoc = g_gpu_shader_32_rgba.texelSizeLoc;
+		u_overrideAlphaModeLoc = g_gpu_shader_32_rgba.overrideAlphaModeLoc;
 		break;
 	}
 
@@ -1308,6 +1484,12 @@ void GR_SetTexture(TextureID texture, TexFormat texFormat)
 
 void GR_SetOverrideTextureSize(int width, int height)
 {
+	if (GR_UseVulkan())
+	{
+		PsyX_Vk_GameSetOverrideTextureSize(width, height);
+		return;
+	}
+
 	if(u_texelSizeLoc == -1)
 		return;
 
@@ -1316,10 +1498,30 @@ void GR_SetOverrideTextureSize(int width, int height)
 	glUniform2fv(u_texelSizeLoc, 1, vec);
 }
 
+void GR_SetOverrideAlphaMode(int mode)
+{
+	if (GR_UseVulkan())
+	{
+		PsyX_Vk_GameSetOverrideAlphaMode(mode);
+		return;
+	}
+
+	if (u_overrideAlphaModeLoc == -1)
+		return;
+
+	glUniform1i(u_overrideAlphaModeLoc, mode);
+}
+
 void GR_DestroyTexture(TextureID texture)
 {
 	if (texture == -1)
 		return;
+
+	if (GR_UseVulkan())
+	{
+		PsyX_Vk_GameDestroyTexture((int)texture);
+		return;
+	}
 
 #if USE_OPENGL
 	glDeleteTextures(1, &texture);
@@ -1355,6 +1557,14 @@ void GR_ClearVRAM(int x, int y, int w, int h, unsigned char r, unsigned char g, 
 void GR_Clear(int x, int y, int w, int h, unsigned char r, unsigned char g, unsigned char b)
 {
 	framebuffer_need_update = 1;
+
+	if (GR_UseVulkan())
+	{
+		// The Vulkan main pass clears the whole presented image, matching
+		// glClear on the default framebuffer.
+		PsyX_Vk_GameClear(x, y, w, h, r, g, b);
+		return;
+	}
 
 #if USE_OPENGL
 	glClearColor(r / 255.0f, g / 255.0f, b / 255.0f, 1.0f);
@@ -1452,6 +1662,15 @@ void GR_ReadFramebufferDataToVRAM()
 	if (!framebuffer_need_update)
 		return;
 
+	if (GR_UseVulkan())
+	{
+		// Part of the not-yet-ported GPU readback path (see
+		// GR_StoreFrameBuffer). Clearing the flag keeps the GL mirror
+		// bookkeeping consistent.
+		framebuffer_need_update = 0;
+		return;
+	}
+
 	framebuffer_need_update = 0;
 
 	x = g_PreviousFramebuffer.x;
@@ -1475,6 +1694,12 @@ void GR_ReadFramebufferDataToVRAM()
 
 void GR_SetScissorState(int enable)
 {
+	if (GR_UseVulkan())
+	{
+		PsyX_Vk_GameSetScissor(enable ? 1 : 0, 0, 0, g_windowWidth, g_windowHeight);
+		return;
+	}
+
 	if (g_PreviousScissorState == enable)
 		return;
 
@@ -1515,6 +1740,18 @@ void GR_SetOffscreenState(const RECT16* offscreenRect, int enable)
 #else
 		GR_Ortho2D(0, activeDispEnv.disp.w, activeDispEnv.disp.h, 0, -1.0f, 1.0f);
 #endif
+	}
+
+	if (GR_UseVulkan())
+	{
+		// The offscreen render target is not ported yet: enable=1 draws into
+		// the presented image instead of an offscreen buffer. The matrices and
+		// viewport still follow the GL renderer so geometry lines up.
+		g_PreviousOffscreen = *offscreenRect;
+		GR_SetViewPort(0, 0,
+			enable ? offscreenRect->w : g_windowWidth,
+			enable ? offscreenRect->h : g_windowHeight);
+		return;
 	}
 
 	if (g_PreviousOffscreenState == enable)
@@ -1590,6 +1827,16 @@ void GR_SetOffscreenState(const RECT16* offscreenRect, int enable)
 
 void GR_StoreFrameBuffer(int x, int y, int w, int h)
 {
+	if (GR_UseVulkan())
+	{
+		// The back buffer -> VRAM screen-area copy is a GPU readback and is not
+		// ported yet (mirrors and other framebuffer-as-texture effects will be
+		// stale). The rect is remembered so the copy can be added without
+		// touching the game side.
+		PsyX_Vk_GameStoreFrameBuffer(x, y, w, h);
+		return;
+	}
+
 #if USE_OPENGL
 	// set storage size first
 	if (g_PreviousFramebuffer.w != w ||
@@ -1690,6 +1937,12 @@ void GR_UpdateVRAM()
 
 	vram_need_update = 0;
 
+	if (GR_UseVulkan())
+	{
+		PsyX_Vk_GameSetVram(vram);
+		return;
+	}
+
 #if USE_OPENGL
 	g_vramTexture = g_vramTexturesDouble[g_vramTextureIdx];
 	g_vramTextureIdx++;
@@ -1708,6 +1961,12 @@ void GR_UpdateVRAM()
 
 void GR_SwapWindow()
 {
+	if (GR_UseVulkan())
+	{
+		PsyX_Vk_GameEndFrame();
+		return;
+	}
+
 #if defined(RENDERER_OGL) || defined(RENDERER_OGLES)
 	SDL_GL_SwapWindow(g_window);
 #endif
@@ -1717,6 +1976,13 @@ void GR_SwapWindow()
 
 void GR_EnableDepth(int enable)
 {
+	if (GR_UseVulkan())
+	{
+		// Matches the GL branch: the PGXP Z-buffer config gates the test.
+		PsyX_Vk_GameEnableDepth(enable && g_cfg_pgxpZBuffer);
+		return;
+	}
+
 	if (g_PreviousDepthMode == enable)
 		return;
 
@@ -1732,6 +1998,13 @@ void GR_EnableDepth(int enable)
 
 void GR_SetStencilMode(int drawPrim)
 {
+	if (GR_UseVulkan())
+	{
+		// The PSX stencil mask has no Vulkan equivalent in this backend yet.
+		PsyX_Vk_GameSetStencilMode(drawPrim);
+		return;
+	}
+
 	if (g_PreviousStencilMode == drawPrim)
 		return;
 
@@ -1753,6 +2026,15 @@ void GR_SetStencilMode(int drawPrim)
 
 void GR_SetBlendMode(BlendMode blendMode)
 {
+	if (GR_UseVulkan())
+	{
+		// The GL branch also toggles depth: BM_NONE draws depth-tested, every
+		// other mode turns the test off.
+		PsyX_Vk_GameSetBlendMode((int)blendMode);
+		GR_EnableDepth(blendMode == BM_NONE);
+		return;
+	}
+
 	if (g_PreviousBlendMode == blendMode)
 		return;
 
@@ -1801,6 +2083,9 @@ void GR_SetBlendMode(BlendMode blendMode)
 
 void GR_SetPolygonOffset(float ofs)
 {
+	if (GR_UseVulkan())
+		return;
+
 #if USE_OPENGL
 	if (ofs == 0.0f)
 	{
@@ -1816,6 +2101,12 @@ void GR_SetPolygonOffset(float ofs)
 
 void GR_SetViewPort(int x, int y, int width, int height)
 {
+	if (GR_UseVulkan())
+	{
+		PsyX_Vk_GameSetViewPort(x, y, width, height);
+		return;
+	}
+
 #if USE_OPENGL
 	glViewport(x, y, width, height);
 #endif
@@ -1823,6 +2114,9 @@ void GR_SetViewPort(int x, int y, int width, int height)
 
 void GR_SetWireframe(int enable)
 {
+	if (GR_UseVulkan())
+		return;
+
 #if defined(RENDERER_OGL)
 	glPolygonMode(GL_FRONT_AND_BACK, enable ? GL_LINE : GL_FILL);
 #endif
@@ -1830,6 +2124,12 @@ void GR_SetWireframe(int enable)
 
 void GR_BindVertexBuffer()
 {
+	if (GR_UseVulkan())
+	{
+		// RecordPsxDraws binds the frame's vertex buffer once.
+		return;
+	}
+
 #if USE_OPENGL
 	glBindVertexArray(g_glVertexArray[g_curVertexBuffer]);
 
@@ -1865,6 +2165,12 @@ void GR_UpdateVertexBuffer(const GrVertex* vertices, int num_vertices)
 		num_vertices = MAX_VERTEX_BUFFER_SIZE;
 	}
 
+	if (GR_UseVulkan())
+	{
+		PsyX_Vk_GameUpdateVertexBuffer(vertices, num_vertices);
+		return;
+	}
+
 	//assert(num_vertices <= MAX_VERTEX_BUFFER_SIZE);
 	GR_BindVertexBuffer();
 
@@ -1877,6 +2183,12 @@ void GR_UpdateVertexBuffer(const GrVertex* vertices, int num_vertices)
 
 void GR_DrawTriangles(int start_vertex, int triangles)
 {
+	if (GR_UseVulkan())
+	{
+		PsyX_Vk_GameDrawTriangles(start_vertex, triangles);
+		return;
+	}
+
 #if USE_OPENGL
 	glDrawArrays(GL_TRIANGLES, start_vertex, triangles * 3);
 #else

@@ -1,0 +1,4146 @@
+/*
+ * Native Vulkan backend for the experimental modern scene (renderer roadmap
+ * R7). See PsyX_vk.h for the public contract.
+ *
+ * Design notes:
+ * - The Vulkan loader is discovered at runtime through SDL, so the build needs
+ *   the Vulkan headers only (no import library). On macOS SDL resolves
+ *   MoltenVK, which is why this file has no platform-specific surface code.
+ * - Single frame in flight with a fence wait per frame keeps the
+ *   synchronisation simple and correct for a developer tool.
+ * - Instance world transforms travel through push constants; the scene uniform
+ *   buffer, shadow map and material textures share one descriptor set per mesh.
+ */
+
+#include "PsyX/PsyX_vk.h"
+
+#if !defined(PSX) && !defined(__ANDROID__) && !defined(__EMSCRIPTEN__)
+
+#define VK_NO_PROTOTYPES
+#include <vulkan/vulkan.h>
+
+#include "../platform.h"
+
+#include "PsyX_Vk_Shaders.h"
+
+#include <SDL.h>
+#include <SDL_vulkan.h>
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include <new>
+
+#if !defined(PSYX_VK_DISABLE_IMGUI)
+#	define PSYX_VK_IMGUI 1
+#	include "imgui.h"
+#	include "imgui_impl_sdl2.h"
+#	include "imgui_impl_vulkan.h"
+#endif
+
+// ---------------------------------------------------------------------------
+// Dynamic function loading
+
+#define PSYX_VK_FUNCTIONS(X) \
+	X(vkCreateInstance) \
+	X(vkDestroyInstance) \
+	X(vkEnumerateInstanceExtensionProperties) \
+	X(vkEnumerateInstanceLayerProperties) \
+	X(vkEnumerateInstanceVersion) \
+	X(vkEnumeratePhysicalDevices) \
+	X(vkGetPhysicalDeviceProperties) \
+	X(vkGetPhysicalDeviceQueueFamilyProperties) \
+	X(vkGetPhysicalDeviceMemoryProperties) \
+	X(vkGetPhysicalDeviceFormatProperties) \
+	X(vkDestroySurfaceKHR) \
+	X(vkGetPhysicalDeviceSurfaceSupportKHR) \
+	X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) \
+	X(vkGetPhysicalDeviceSurfaceFormatsKHR) \
+	X(vkGetPhysicalDeviceSurfacePresentModesKHR) \
+	X(vkCreateDevice) \
+	X(vkDestroyDevice) \
+	X(vkGetDeviceProcAddr) \
+	X(vkGetDeviceQueue) \
+	X(vkDeviceWaitIdle) \
+	X(vkQueueWaitIdle) \
+	X(vkQueueSubmit) \
+	X(vkQueuePresentKHR) \
+	X(vkCreateSwapchainKHR) \
+	X(vkDestroySwapchainKHR) \
+	X(vkGetSwapchainImagesKHR) \
+	X(vkAcquireNextImageKHR) \
+	X(vkCreateFence) \
+	X(vkDestroyFence) \
+	X(vkWaitForFences) \
+	X(vkResetFences) \
+	X(vkCreateSemaphore) \
+	X(vkDestroySemaphore) \
+	X(vkCreateBuffer) \
+	X(vkDestroyBuffer) \
+	X(vkGetBufferMemoryRequirements) \
+	X(vkBindBufferMemory) \
+	X(vkMapMemory) \
+	X(vkUnmapMemory) \
+	X(vkAllocateMemory) \
+	X(vkFreeMemory) \
+	X(vkGetImageMemoryRequirements) \
+	X(vkBindImageMemory) \
+	X(vkCreateImage) \
+	X(vkDestroyImage) \
+	X(vkCreateImageView) \
+	X(vkDestroyImageView) \
+	X(vkCreateSampler) \
+	X(vkDestroySampler) \
+	X(vkCreateRenderPass) \
+	X(vkDestroyRenderPass) \
+	X(vkCreateFramebuffer) \
+	X(vkDestroyFramebuffer) \
+	X(vkCreateShaderModule) \
+	X(vkDestroyShaderModule) \
+	X(vkCreatePipelineLayout) \
+	X(vkDestroyPipelineLayout) \
+	X(vkCreateGraphicsPipelines) \
+	X(vkDestroyPipeline) \
+	X(vkCreateDescriptorSetLayout) \
+	X(vkDestroyDescriptorSetLayout) \
+	X(vkCreateDescriptorPool) \
+	X(vkDestroyDescriptorPool) \
+	X(vkAllocateDescriptorSets) \
+	X(vkResetDescriptorPool) \
+	X(vkUpdateDescriptorSets) \
+	X(vkCreateCommandPool) \
+	X(vkDestroyCommandPool) \
+	X(vkAllocateCommandBuffers) \
+	X(vkFreeCommandBuffers) \
+	X(vkResetCommandBuffer) \
+	X(vkBeginCommandBuffer) \
+	X(vkEndCommandBuffer) \
+	X(vkCmdBeginRenderPass) \
+	X(vkCmdEndRenderPass) \
+	X(vkCmdBindPipeline) \
+	X(vkCmdBindDescriptorSets) \
+	X(vkCmdBindVertexBuffers) \
+	X(vkCmdBindIndexBuffer) \
+	X(vkCmdPushConstants) \
+	X(vkCmdDraw) \
+	X(vkCmdDrawIndexed) \
+	X(vkCmdSetViewport) \
+	X(vkCmdSetScissor) \
+	X(vkCmdSetBlendConstants) \
+	X(vkCmdPipelineBarrier) \
+	X(vkCmdCopyBufferToImage) \
+	X(vkCmdCopyImageToBuffer) \
+	X(vkCmdBlitImage) \
+	X(vkCmdClearColorImage)
+
+#define PSYX_VK_DECLARE_FN(name) static PFN_##name name = nullptr;
+PSYX_VK_FUNCTIONS(PSYX_VK_DECLARE_FN)
+#undef PSYX_VK_DECLARE_FN
+
+static PFN_vkGetInstanceProcAddr g_gipa = nullptr;
+static int g_loaderReady = 0;
+
+// ---------------------------------------------------------------------------
+// State
+
+static const int kShadowSize = 2048;
+
+typedef struct
+{
+	float pos[3];
+	float color[4];
+	float normal[3];
+	float uv[2];
+} VkVertex;
+
+typedef struct
+{
+	float posRange[4];
+	float dirType[4];
+	float color[4];
+} VkLightStd140;
+
+typedef struct
+{
+	float view[16];
+	float proj[16];
+	float shadowMatrix[16];
+	float cameraPos[4];
+	float ambientExposure[4];
+	float shadowParams[4];
+	float lightInfo[4];
+	VkLightStd140 lights[PSYX_VK_MAX_LIGHTS];
+} VkSceneUbo;
+
+#define PSYX_VK_MAX_TEXTURES 64
+
+typedef struct
+{
+	int used;
+	VkImage image;
+	VkDeviceMemory memory;
+	VkImageView view;
+} VkTexture;
+
+typedef struct
+{
+	int used;
+	int vertexCount;
+	int indexCount;
+	VkBuffer vertexBuffer;
+	VkDeviceMemory vertexMemory;
+	VkBuffer indexBuffer;
+	VkDeviceMemory indexMemory;
+	VkDescriptorSet descriptorSet;
+	int textureSlots[4];		// handles into the shared texture table, -1 = default
+	float factors[3];			// metallic, roughness, emissive scale
+	float world[16];
+	float color[4];
+	int visible;
+} VkMesh;
+
+static VkTexture g_textures[PSYX_VK_MAX_TEXTURES];
+
+// ---------------------------------------------------------------------------
+// Emulated PSX GPU path (renderer roadmap R7b)
+//
+// The packed vertex mirrors PsyX_render.h's GrVertex with PGXP enabled; the
+// layout is asserted below so a change on either side breaks the build instead
+// of the picture.
+
+typedef struct
+{
+	float x, y, page, clut;
+	float z, scr_h, ofsX, ofsY;
+	unsigned char u, v, bright, dither;
+	unsigned char r, g, b, a;
+	signed char tcx, tcy, p0, p1;
+} VkPsxVertex;
+
+typedef char VkPsxVertexLayoutCheck[(sizeof(VkPsxVertex) == 44) ? 1 : -1];
+
+#define PSYX_VK_PSX_MAX_DRAWS 4096
+#define PSYX_VK_PSX_BLEND_COUNT 5
+#define PSYX_VK_PSX_VRAM_BYTES (PSYX_VK_VRAM_WIDTH * PSYX_VK_VRAM_HEIGHT * 8)
+// The game uploads the whole frame's vertex list once per frame, exactly like
+// the OpenGL path. Keep the same 65536-vertex ceiling (MAX_VERTEX_BUFFER_SIZE)
+// so no geometry is dropped; 44 is sizeof(VkPsxVertex) (asserted below).
+#define PSYX_VK_PSX_MAX_VERTICES 65536
+#define PSYX_VK_PSX_VERTEX_CAPACITY (PSYX_VK_PSX_MAX_VERTICES * 44)
+#define PSYX_VK_PSX_MAX_TEXTURES 512
+
+typedef struct
+{
+	int texFormat;
+	int bilinearFilter;
+	float texelSize[2];
+	int overrideAlphaMode;
+	int blendMode;
+	int depthTest;
+	int scissorEnable;
+	int scissor[4];			// x, y, width, height, top-left origin
+	int viewport[4];		// x, y, width, height, top-left origin
+	VkDescriptorSet textureSet;	// 32-bit game texture, or VK_NULL_HANDLE
+	uint32_t firstVertex;
+	uint32_t vertexCount;
+} VkPsxDraw;
+
+typedef struct
+{
+	int used;
+	int width;
+	int height;
+	VkImage image;
+	VkDeviceMemory memory;
+	VkImageView view;
+	VkSampler sampler;
+	VkDescriptorSet set;
+} VkPsxTexture;
+
+typedef struct
+{
+	int ready;
+	int failed;
+
+	VkDescriptorSetLayout setLayout;
+	VkPipelineLayout layout;
+	VkPipeline pipelines[PSYX_VK_PSX_BLEND_COUNT];
+	VkPipeline pipelineNoDepth;
+	VkDescriptorSet set;
+
+	VkSampler sampler;		// VRAM: nearest, wrapping
+	VkSampler lutSampler;		// RG8 table: nearest, clamped (the shader offsets
+					// the coordinate slightly negative, like GL's)
+
+	VkImage vramImage;
+	VkDeviceMemory vramMemory;
+	VkImageView vramView;
+	VkBuffer vramStaging;
+	VkDeviceMemory vramStagingMemory;
+	void* vramStagingMapped;
+
+	VkImage lutImage;
+	VkDeviceMemory lutMemory;
+	VkImageView lutView;
+	VkBuffer lutStaging;
+	VkDeviceMemory lutStagingMemory;
+	void* lutStagingMapped;
+
+	VkBuffer ubo;
+	VkDeviceMemory uboMemory;
+	float* uboMapped;		// mat4 Projection, mat4 Projection3D
+
+	VkBuffer vertexBuffer;
+	VkDeviceMemory vertexMemory;
+	unsigned char* vertexMapped;
+	VkDeviceSize vertexCapacity;
+	VkDeviceSize vertexSize;
+	uint32_t vertexCount;
+
+	VkPsxDraw draws[PSYX_VK_PSX_MAX_DRAWS];
+	int drawCount;
+
+	/*
+	 * Mirror of the GR_* state the game sets between draws. The OpenGL renderer
+	 * keeps the equivalent in GL objects and uniforms; here it is plain state
+	 * captured when each draw is queued.
+	 */
+	int stTexFormat;
+	int stTexture;			// 1-based game texture handle, 0 = dummy
+	int stOverrideWidth;
+	int stOverrideHeight;
+	int stOverrideAlphaMode;
+	int stBlendMode;
+	int stDepth;
+	int stBilinear;
+	int stStencilMode;
+	int stScissorEnable;
+	int stScissor[4];
+	int stViewport[4];
+
+	int clearRequested;
+	float clearColor[3];
+
+	// Pending back-buffer -> VRAM blit rect (GR_StoreFrameBuffer). The readback
+	// itself is not ported yet; the rect is recorded so it can be added.
+	int frameBufferRect[4];
+	int frameBufferPending;
+	int frameBufferWarned;
+
+	VkDescriptorSet dummySet;	// white texture, used by 4/8/16-bit draws
+	VkPsxTexture textures[PSYX_VK_PSX_MAX_TEXTURES];
+} VkPsxState;
+
+static struct
+{
+	int initialised;
+	int gameMode;			// owns the game window (not the developer fixture)
+	SDL_Window* window;
+	int width;
+	int height;
+	int windowWidth;
+	int windowHeight;
+
+	VkInstance instance;
+	uint32_t apiVersion;
+	VkSurfaceKHR surface;
+	VkPhysicalDevice physicalDevice;
+	VkPhysicalDeviceMemoryProperties memoryProperties;
+	uint32_t queueFamily;
+	VkDevice device;
+	VkQueue queue;
+
+	VkSwapchainKHR swapchain;
+	VkFormat swapchainFormat;
+	int srgbOutput;
+	uint32_t swapchainImageCount;
+	VkImage swapchainImages[8];
+	VkImageView swapchainViews[8];
+	VkFramebuffer framebuffers[8];
+	int framebufferCount;
+
+	VkImage depthImage;
+	VkDeviceMemory depthMemory;
+	VkImageView depthView;
+
+	VkRenderPass mainRenderPass;
+	VkRenderPass shadowRenderPass;
+	VkPipelineLayout pipelineLayout;
+	VkPipelineLayout shadowPipelineLayout;
+	VkPipeline pbrPipeline;
+	VkPipeline shadowPipeline;
+
+	VkDescriptorSetLayout descriptorSetLayout;
+	VkDescriptorPool descriptorPool;
+
+	VkImage shadowImage;
+	VkDeviceMemory shadowMemory;
+	VkImageView shadowView;
+	VkSampler shadowSampler;
+	VkFramebuffer shadowFramebuffer;
+
+	VkBuffer uboBuffer;
+	VkDeviceMemory uboMemory;
+	VkSceneUbo* uboMapped;
+
+	VkBuffer readbackBuffer;
+	VkDeviceMemory readbackMemory;
+	unsigned char* readbackMapped;
+	VkDeviceSize readbackSize;
+
+	VkCommandPool commandPool;
+	VkCommandBuffer commandBuffer;
+	VkFence frameFence;
+	VkSemaphore imageAvailable;
+	VkSemaphore renderFinished[8];
+
+	VkSampler textureSampler;
+	int dummyTextures[4];
+
+	VkPsxState psx;
+
+	VkMesh meshes[PSYX_VK_MAX_MESHES];
+	int meshCount;
+	int resizePending;
+	int frameIndex;
+	int lastDrawCalls;
+
+	PsyXModernLightSet lights;
+
+	int imguiActive;
+	char overlayText[512];
+	double lastFps;
+
+	PsyXVkInfo info;
+} g_vk;
+
+static int g_supported = -1;
+
+// PsyCross logging is only wired up once the game has started, so the Vulkan
+// initialisation stages also go to a small side log for developer runs.
+static void VkStage(const char* stage)
+{
+	FILE* file = fopen("psyx_vk.log", "a");
+	if (!file)
+		return;
+
+	fprintf(file, "%s\n", stage);
+	fclose(file);
+}
+
+// ---------------------------------------------------------------------------
+// Small helpers
+
+static const char* VkResultName(VkResult result)
+{
+	switch (result)
+	{
+	case VK_SUCCESS: return "VK_SUCCESS";
+	case VK_NOT_READY: return "VK_NOT_READY";
+	case VK_TIMEOUT: return "VK_TIMEOUT";
+	case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
+	case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+	case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
+	case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
+	case VK_ERROR_EXTENSION_NOT_PRESENT: return "VK_ERROR_EXTENSION_NOT_PRESENT";
+	case VK_ERROR_LAYER_NOT_PRESENT: return "VK_ERROR_LAYER_NOT_PRESENT";
+	case VK_ERROR_INCOMPATIBLE_DRIVER: return "VK_ERROR_INCOMPATIBLE_DRIVER";
+	case VK_ERROR_SURFACE_LOST_KHR: return "VK_ERROR_SURFACE_LOST_KHR";
+	case VK_ERROR_OUT_OF_DATE_KHR: return "VK_ERROR_OUT_OF_DATE_KHR";
+	case VK_SUBOPTIMAL_KHR: return "VK_SUBOPTIMAL_KHR";
+	default: return "VK_ERROR_OTHER";
+	}
+}
+
+static int VkOk(VkResult result, const char* what)
+{
+	if (result == VK_SUCCESS)
+		return 1;
+
+	eprinterr("PsyX Vulkan: %s failed (%s)\n", what, VkResultName(result));
+	return 0;
+}
+
+static void MulMatrix4(const float a[16], const float b[16], float out[16])
+{
+	for (int c = 0; c < 4; c++)
+	{
+		for (int r = 0; r < 4; r++)
+		{
+			float sum = 0.0f;
+			for (int k = 0; k < 4; k++)
+				sum += a[k * 4 + r] * b[c * 4 + k];
+			out[c * 4 + r] = sum;
+		}
+	}
+}
+
+static void ImageBarrier(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect,
+	VkImageLayout oldLayout, VkImageLayout newLayout,
+	VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage,
+	VkAccessFlags srcAccess, VkAccessFlags dstAccess)
+{
+	VkImageMemoryBarrier barrier;
+	memset(&barrier, 0, sizeof(barrier));
+	barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	barrier.oldLayout = oldLayout;
+	barrier.newLayout = newLayout;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image = image;
+	barrier.subresourceRange.aspectMask = aspect;
+	barrier.subresourceRange.levelCount = 1;
+	barrier.subresourceRange.layerCount = 1;
+	barrier.srcAccessMask = srcAccess;
+	barrier.dstAccessMask = dstAccess;
+
+	vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, NULL, 0, NULL, 1, &barrier);
+}
+
+static uint32_t FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags properties)
+{
+	for (uint32_t i = 0; i < g_vk.memoryProperties.memoryTypeCount; i++)
+	{
+		if ((typeBits & (1u << i)) &&
+			(g_vk.memoryProperties.memoryTypes[i].propertyFlags & properties) == properties)
+			return i;
+	}
+	return 0xFFFFFFFFu;
+}
+
+static int CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
+	VkBuffer* buffer, VkDeviceMemory* memory, void** mapped)
+{
+	VkBufferCreateInfo info;
+	memset(&info, 0, sizeof(info));
+	info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	info.size = size;
+	info.usage = usage;
+	info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+	if (!VkOk(vkCreateBuffer(g_vk.device, &info, NULL, buffer), "vkCreateBuffer"))
+		return 0;
+
+	VkMemoryRequirements requirements;
+	vkGetBufferMemoryRequirements(g_vk.device, *buffer, &requirements);
+
+	VkMemoryAllocateInfo allocate;
+	memset(&allocate, 0, sizeof(allocate));
+	allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocate.allocationSize = requirements.size;
+	allocate.memoryTypeIndex = FindMemoryType(requirements.memoryTypeBits, properties);
+	if (allocate.memoryTypeIndex == 0xFFFFFFFFu)
+	{
+		eprinterr("PsyX Vulkan: no memory type for buffer\n");
+		return 0;
+	}
+
+	if (!VkOk(vkAllocateMemory(g_vk.device, &allocate, NULL, memory), "vkAllocateMemory(buffer)"))
+		return 0;
+	if (!VkOk(vkBindBufferMemory(g_vk.device, *buffer, *memory, 0), "vkBindBufferMemory"))
+		return 0;
+
+	if (mapped)
+	{
+		if (!VkOk(vkMapMemory(g_vk.device, *memory, 0, size, 0, mapped), "vkMapMemory"))
+		{
+			*mapped = NULL;
+			return 0;
+		}
+	}
+	return 1;
+}
+
+static int CreateImage2D(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage,
+	VkImage* image, VkDeviceMemory* memory)
+{
+	VkImageCreateInfo info;
+	memset(&info, 0, sizeof(info));
+	info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	info.imageType = VK_IMAGE_TYPE_2D;
+	info.format = format;
+	info.extent.width = width;
+	info.extent.height = height;
+	info.extent.depth = 1;
+	info.mipLevels = 1;
+	info.arrayLayers = 1;
+	info.samples = VK_SAMPLE_COUNT_1_BIT;
+	info.tiling = VK_IMAGE_TILING_OPTIMAL;
+	info.usage = usage;
+	info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+	if (!VkOk(vkCreateImage(g_vk.device, &info, NULL, image), "vkCreateImage"))
+		return 0;
+
+	VkMemoryRequirements requirements;
+	vkGetImageMemoryRequirements(g_vk.device, *image, &requirements);
+
+	VkMemoryAllocateInfo allocate;
+	memset(&allocate, 0, sizeof(allocate));
+	allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocate.allocationSize = requirements.size;
+	allocate.memoryTypeIndex = FindMemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+	if (allocate.memoryTypeIndex == 0xFFFFFFFFu)
+	{
+		eprinterr("PsyX Vulkan: no memory type for image\n");
+		return 0;
+	}
+
+	if (!VkOk(vkAllocateMemory(g_vk.device, &allocate, NULL, memory), "vkAllocateMemory(image)"))
+		return 0;
+	if (!VkOk(vkBindImageMemory(g_vk.device, *image, *memory, 0), "vkBindImageMemory"))
+		return 0;
+
+	return 1;
+}
+
+static int CreateImageView2D(VkImage image, VkFormat format, VkImageAspectFlags aspect, VkImageView* view)
+{
+	VkImageViewCreateInfo info;
+	memset(&info, 0, sizeof(info));
+	info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	info.image = image;
+	info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+	info.format = format;
+	info.subresourceRange.aspectMask = aspect;
+	info.subresourceRange.levelCount = 1;
+	info.subresourceRange.layerCount = 1;
+
+	return VkOk(vkCreateImageView(g_vk.device, &info, NULL, view), "vkCreateImageView");
+}
+
+static void ImageBarrierLevels(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect,
+	int baseLevel, int levelCount, VkImageLayout oldLayout, VkImageLayout newLayout,
+	VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage,
+	VkAccessFlags srcAccess, VkAccessFlags dstAccess)
+{
+	VkImageMemoryBarrier barrier;
+	memset(&barrier, 0, sizeof(barrier));
+	barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	barrier.oldLayout = oldLayout;
+	barrier.newLayout = newLayout;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image = image;
+	barrier.subresourceRange.aspectMask = aspect;
+	barrier.subresourceRange.baseMipLevel = (uint32_t)baseLevel;
+	barrier.subresourceRange.levelCount = (uint32_t)levelCount;
+	barrier.subresourceRange.layerCount = 1;
+	barrier.srcAccessMask = srcAccess;
+	barrier.dstAccessMask = dstAccess;
+
+	vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, NULL, 0, NULL, 1, &barrier);
+}
+
+static int CreateImage2DLevels(uint32_t width, uint32_t height, int levels, VkFormat format, VkImageUsageFlags usage,
+	VkImage* image, VkDeviceMemory* memory)
+{
+	VkImageCreateInfo info;
+	memset(&info, 0, sizeof(info));
+	info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	info.imageType = VK_IMAGE_TYPE_2D;
+	info.format = format;
+	info.extent.width = width;
+	info.extent.height = height;
+	info.extent.depth = 1;
+	info.mipLevels = (uint32_t)(levels > 0 ? levels : 1);
+	info.arrayLayers = 1;
+	info.samples = VK_SAMPLE_COUNT_1_BIT;
+	info.tiling = VK_IMAGE_TILING_OPTIMAL;
+	info.usage = usage;
+	info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+	if (!VkOk(vkCreateImage(g_vk.device, &info, NULL, image), "vkCreateImage(levels)"))
+		return 0;
+
+	VkMemoryRequirements requirements;
+	vkGetImageMemoryRequirements(g_vk.device, *image, &requirements);
+
+	VkMemoryAllocateInfo allocate;
+	memset(&allocate, 0, sizeof(allocate));
+	allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocate.allocationSize = requirements.size;
+	allocate.memoryTypeIndex = FindMemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+	if (allocate.memoryTypeIndex == 0xFFFFFFFFu)
+	{
+		eprinterr("PsyX Vulkan: no memory type for image\n");
+		return 0;
+	}
+
+	if (!VkOk(vkAllocateMemory(g_vk.device, &allocate, NULL, memory), "vkAllocateMemory(image)"))
+		return 0;
+	if (!VkOk(vkBindImageMemory(g_vk.device, *image, *memory, 0), "vkBindImageMemory"))
+		return 0;
+
+	return 1;
+}
+
+static int CreateImageView2DLevels(VkImage image, VkFormat format, int levels, VkImageView* view)
+{
+	VkImageViewCreateInfo info;
+	memset(&info, 0, sizeof(info));
+	info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	info.image = image;
+	info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+	info.format = format;
+	info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	info.subresourceRange.levelCount = (uint32_t)(levels > 0 ? levels : 1);
+	info.subresourceRange.layerCount = 1;
+
+	return VkOk(vkCreateImageView(g_vk.device, &info, NULL, view), "vkCreateImageView(levels)");
+}
+
+static VkCommandBuffer BeginOneShot(void)
+{
+	VkCommandBufferAllocateInfo allocate;
+	memset(&allocate, 0, sizeof(allocate));
+	allocate.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	allocate.commandPool = g_vk.commandPool;
+	allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	allocate.commandBufferCount = 1;
+
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	if (!VkOk(vkAllocateCommandBuffers(g_vk.device, &allocate, &cmd), "vkAllocateCommandBuffers(one-shot)"))
+		return VK_NULL_HANDLE;
+
+	VkCommandBufferBeginInfo begin;
+	memset(&begin, 0, sizeof(begin));
+	begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	vkBeginCommandBuffer(cmd, &begin);
+	return cmd;
+}
+
+static void EndOneShot(VkCommandBuffer cmd)
+{
+	vkEndCommandBuffer(cmd);
+
+	VkSubmitInfo submit;
+	memset(&submit, 0, sizeof(submit));
+	submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	submit.commandBufferCount = 1;
+	submit.pCommandBuffers = &cmd;
+
+	vkQueueSubmit(g_vk.queue, 1, &submit, VK_NULL_HANDLE);
+	vkQueueWaitIdle(g_vk.queue);
+	vkFreeCommandBuffers(g_vk.device, g_vk.commandPool, 1, &cmd);
+}
+
+// ---------------------------------------------------------------------------
+// Loader
+
+int PsyX_Vk_IsSupported(void)
+{
+	if (g_supported >= 0)
+		return g_supported;
+
+	g_supported = 0;
+
+	if (SDL_WasInit(SDL_INIT_VIDEO) == 0 && SDL_InitSubSystem(SDL_INIT_VIDEO) != 0)
+		return 0;
+	if (SDL_Vulkan_LoadLibrary(NULL) != 0)
+	{
+		eprinterr("PsyX Vulkan: no Vulkan loader (%s)\n", SDL_GetError());
+		return 0;
+	}
+
+	g_gipa = (PFN_vkGetInstanceProcAddr)SDL_Vulkan_GetVkGetInstanceProcAddr();
+	if (!g_gipa)
+		return 0;
+
+	g_loaderReady = 1;
+	g_supported = 1;
+	return g_supported;
+}
+
+static void LoadInstanceFunctions()
+{
+#define PSYX_VK_LOAD_FN(name) name = (PFN_##name)g_gipa(g_vk.instance, #name);
+	PSYX_VK_FUNCTIONS(PSYX_VK_LOAD_FN)
+#undef PSYX_VK_LOAD_FN
+}
+
+// Global commands must be resolved with a NULL instance before the instance
+// exists; resolving them afterwards is also valid but too late for creation.
+static void LoadGlobalFunctions()
+{
+	vkCreateInstance = (PFN_vkCreateInstance)g_gipa(NULL, "vkCreateInstance");
+	vkEnumerateInstanceExtensionProperties = (PFN_vkEnumerateInstanceExtensionProperties)g_gipa(NULL, "vkEnumerateInstanceExtensionProperties");
+	vkEnumerateInstanceLayerProperties = (PFN_vkEnumerateInstanceLayerProperties)g_gipa(NULL, "vkEnumerateInstanceLayerProperties");
+	vkEnumerateInstanceVersion = (PFN_vkEnumerateInstanceVersion)g_gipa(NULL, "vkEnumerateInstanceVersion");
+}
+
+// ---------------------------------------------------------------------------
+// Swapchain and render targets
+
+static VkFormat PickSurfaceFormat(VkFormat* outFormat, int* outSrgb)
+{
+	uint32_t count = 0;
+	if (!VkOk(vkGetPhysicalDeviceSurfaceFormatsKHR(g_vk.physicalDevice, g_vk.surface, &count, NULL), "surface formats") || count == 0)
+		return VK_FORMAT_UNDEFINED;
+
+	VkSurfaceFormatKHR formats[64];
+	if (count > 64)
+		count = 64;
+	vkGetPhysicalDeviceSurfaceFormatsKHR(g_vk.physicalDevice, g_vk.surface, &count, formats);
+
+	const VkFormat preferred[4] =
+	{
+		VK_FORMAT_B8G8R8A8_SRGB,
+		VK_FORMAT_R8G8B8A8_SRGB,
+		VK_FORMAT_B8G8R8A8_UNORM,
+		VK_FORMAT_R8G8B8A8_UNORM,
+	};
+
+	for (int p = 0; p < 4; p++)
+	{
+		for (uint32_t i = 0; i < count; i++)
+		{
+			if (formats[i].format == preferred[p] &&
+				formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+			{
+				*outFormat = formats[i].format;
+				*outSrgb = (p < 2) ? 1 : 0;
+				return formats[i].format;
+			}
+		}
+	}
+
+	*outFormat = formats[0].format;
+	*outSrgb = 0;
+	return formats[0].format;
+}
+
+static void DestroySwapchainResources(void)
+{
+	for (int i = 0; i < g_vk.framebufferCount; i++)
+	{
+		if (g_vk.framebuffers[i])
+			vkDestroyFramebuffer(g_vk.device, g_vk.framebuffers[i], NULL);
+		g_vk.framebuffers[i] = VK_NULL_HANDLE;
+	}
+	g_vk.framebufferCount = 0;
+
+	for (uint32_t i = 0; i < g_vk.swapchainImageCount; i++)
+	{
+		if (g_vk.swapchainViews[i])
+			vkDestroyImageView(g_vk.device, g_vk.swapchainViews[i], NULL);
+		g_vk.swapchainViews[i] = VK_NULL_HANDLE;
+	}
+
+	if (g_vk.depthView)
+	{
+		vkDestroyImageView(g_vk.device, g_vk.depthView, NULL);
+		g_vk.depthView = VK_NULL_HANDLE;
+	}
+	if (g_vk.depthImage)
+	{
+		vkDestroyImage(g_vk.device, g_vk.depthImage, NULL);
+		g_vk.depthImage = VK_NULL_HANDLE;
+	}
+	if (g_vk.depthMemory)
+	{
+		vkFreeMemory(g_vk.device, g_vk.depthMemory, NULL);
+		g_vk.depthMemory = VK_NULL_HANDLE;
+	}
+}
+
+// The surface format must be known before the render passes are created,
+// because the main pass declares its colour attachment with that format.
+static int QuerySwapchainFormat(void)
+{
+	VkFormat format = PickSurfaceFormat(&g_vk.swapchainFormat, &g_vk.srgbOutput);
+	if (format == VK_FORMAT_UNDEFINED)
+		return 0;
+
+	g_vk.swapchainFormat = format;
+	return 1;
+}
+
+static int CreateSwapchain(void)
+{
+	VkSurfaceCapabilitiesKHR capabilities;
+	if (!VkOk(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.physicalDevice, g_vk.surface, &capabilities), "surface capabilities"))
+		return 0;
+
+	uint32_t width = (uint32_t)g_vk.windowWidth;
+	uint32_t height = (uint32_t)g_vk.windowHeight;
+	if (capabilities.currentExtent.width != 0xFFFFFFFFu)
+	{
+		width = capabilities.currentExtent.width;
+		height = capabilities.currentExtent.height;
+	}
+	if (width == 0 || height == 0)
+		return 0;
+
+	if (width < capabilities.minImageExtent.width) width = capabilities.minImageExtent.width;
+	if (height < capabilities.minImageExtent.height) height = capabilities.minImageExtent.height;
+	if (width > capabilities.maxImageExtent.width) width = capabilities.maxImageExtent.width;
+	if (height > capabilities.maxImageExtent.height) height = capabilities.maxImageExtent.height;
+
+	uint32_t imageCount = capabilities.minImageCount + 1;
+	if (capabilities.maxImageCount > 0 && imageCount > capabilities.maxImageCount)
+		imageCount = capabilities.maxImageCount;
+	if (imageCount > 8)
+		imageCount = 8;
+
+	// Normally already negotiated during initialisation (the render passes
+	// need it); fall back to querying here so a resize still works.
+	if (g_vk.swapchainFormat == VK_FORMAT_UNDEFINED && !QuerySwapchainFormat())
+		return 0;
+
+	VkFormat format = g_vk.swapchainFormat;
+
+	VkSwapchainCreateInfoKHR info;
+	memset(&info, 0, sizeof(info));
+	info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+	info.surface = g_vk.surface;
+	info.minImageCount = imageCount;
+	info.imageFormat = format;
+	info.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+	info.imageExtent.width = width;
+	info.imageExtent.height = height;
+	info.imageArrayLayers = 1;
+	info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+	info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	info.preTransform = capabilities.currentTransform;
+	info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+	info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+	info.clipped = VK_TRUE;
+	info.oldSwapchain = g_vk.swapchain;
+
+	g_vk.swapchainFormat = format;
+
+	if (!VkOk(vkCreateSwapchainKHR(g_vk.device, &info, NULL, &g_vk.swapchain), "vkCreateSwapchainKHR"))
+		return 0;
+
+	uint32_t actualImageCount = 0;
+	if (!VkOk(vkGetSwapchainImagesKHR(g_vk.device, g_vk.swapchain, &actualImageCount, NULL), "swapchain image count"))
+		return 0;
+	if (actualImageCount > 8)
+		actualImageCount = 8;
+	g_vk.swapchainImageCount = actualImageCount;
+	vkGetSwapchainImagesKHR(g_vk.device, g_vk.swapchain, &g_vk.swapchainImageCount, g_vk.swapchainImages);
+
+	for (uint32_t i = 0; i < g_vk.swapchainImageCount; i++)
+	{
+		if (!CreateImageView2D(g_vk.swapchainImages[i], format, VK_IMAGE_ASPECT_COLOR_BIT, &g_vk.swapchainViews[i]))
+			return 0;
+	}
+
+	// Depth buffer, shared by every framebuffer (single frame in flight).
+	VkFormat depthFormat = VK_FORMAT_D32_SFLOAT;
+	VkFormatProperties formatProperties;
+	vkGetPhysicalDeviceFormatProperties(g_vk.physicalDevice, depthFormat, &formatProperties);
+	if ((formatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) == 0)
+		depthFormat = VK_FORMAT_D24_UNORM_S8_UINT;
+
+	VkImageAspectFlags depthAspect = (depthFormat == VK_FORMAT_D24_UNORM_S8_UINT)
+		? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+		: VK_IMAGE_ASPECT_DEPTH_BIT;
+
+	if (!CreateImage2D(width, height, depthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+		&g_vk.depthImage, &g_vk.depthMemory))
+		return 0;
+	if (!CreateImageView2D(g_vk.depthImage, depthFormat, depthAspect, &g_vk.depthView))
+		return 0;
+
+	for (uint32_t i = 0; i < g_vk.swapchainImageCount; i++)
+	{
+		VkImageView attachments[2] = { g_vk.swapchainViews[i], g_vk.depthView };
+
+		VkFramebufferCreateInfo framebuffer;
+		memset(&framebuffer, 0, sizeof(framebuffer));
+		framebuffer.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+		framebuffer.renderPass = g_vk.mainRenderPass;
+		framebuffer.attachmentCount = 2;
+		framebuffer.pAttachments = attachments;
+		framebuffer.width = width;
+		framebuffer.height = height;
+		framebuffer.layers = 1;
+
+		if (!VkOk(vkCreateFramebuffer(g_vk.device, &framebuffer, NULL, &g_vk.framebuffers[i]), "vkCreateFramebuffer"))
+			return 0;
+	}
+	g_vk.framebufferCount = (int)g_vk.swapchainImageCount;
+
+	// Readback buffer for the last frame.
+	if (g_vk.readbackBuffer)
+	{
+		vkDestroyBuffer(g_vk.device, g_vk.readbackBuffer, NULL);
+		vkFreeMemory(g_vk.device, g_vk.readbackMemory, NULL);
+		g_vk.readbackBuffer = VK_NULL_HANDLE;
+		g_vk.readbackMemory = VK_NULL_HANDLE;
+		g_vk.readbackMapped = NULL;
+	}
+
+	g_vk.readbackSize = (VkDeviceSize)width * height * 4;
+	if (!CreateBuffer(g_vk.readbackSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		&g_vk.readbackBuffer, &g_vk.readbackMemory, (void**)&g_vk.readbackMapped))
+		return 0;
+
+	g_vk.width = (int)width;
+	g_vk.height = (int)height;
+	g_vk.info.width = (int)width;
+	g_vk.info.height = (int)height;
+
+	eprintinfo("PsyX Vulkan: swapchain %dx%d, %d images, %s format\n", (int)width, (int)height,
+		(int)g_vk.swapchainImageCount, g_vk.srgbOutput ? "sRGB" : "linear");
+
+	return 1;
+}
+
+static void DestroySwapchain(void)
+{
+	if (g_vk.swapchain)
+	{
+		vkDestroySwapchainKHR(g_vk.device, g_vk.swapchain, NULL);
+		g_vk.swapchain = VK_NULL_HANDLE;
+		g_vk.swapchainImageCount = 0;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Pipelines and descriptors
+
+static VkShaderModule CreateShaderModuleFromSpirv(const unsigned int* words, unsigned int wordCount)
+{
+	VkShaderModuleCreateInfo info;
+	memset(&info, 0, sizeof(info));
+	info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+	info.codeSize = (size_t)wordCount * 4;
+	info.pCode = words;
+
+	VkShaderModule module = VK_NULL_HANDLE;
+	if (!VkOk(vkCreateShaderModule(g_vk.device, &info, NULL, &module), "vkCreateShaderModule"))
+		return VK_NULL_HANDLE;
+	return module;
+}
+
+static int CreatePipelines(void)
+{
+	VkDescriptorSetLayoutBinding bindings[6];
+	memset(bindings, 0, sizeof(bindings));
+
+	bindings[0].binding = 0;
+	bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	bindings[0].descriptorCount = 1;
+	bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+
+	for (int i = 1; i < 6; i++)
+	{
+		bindings[i].binding = (uint32_t)i;
+		bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		bindings[i].descriptorCount = 1;
+		bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+	}
+
+	VkDescriptorSetLayoutCreateInfo layoutInfo;
+	memset(&layoutInfo, 0, sizeof(layoutInfo));
+	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	layoutInfo.bindingCount = 6;
+	layoutInfo.pBindings = bindings;
+
+	if (!VkOk(vkCreateDescriptorSetLayout(g_vk.device, &layoutInfo, NULL, &g_vk.descriptorSetLayout), "vkCreateDescriptorSetLayout"))
+		return 0;
+
+	VkPushConstantRange pushRange;
+	memset(&pushRange, 0, sizeof(pushRange));
+	pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+	pushRange.offset = 0;
+	pushRange.size = 96;	// mat4 world + vec4 color + vec4 factors
+
+	VkPipelineLayoutCreateInfo pipelineLayout;
+	memset(&pipelineLayout, 0, sizeof(pipelineLayout));
+	pipelineLayout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	pipelineLayout.setLayoutCount = 1;
+	pipelineLayout.pSetLayouts = &g_vk.descriptorSetLayout;
+	pipelineLayout.pushConstantRangeCount = 1;
+	pipelineLayout.pPushConstantRanges = &pushRange;
+
+	if (!VkOk(vkCreatePipelineLayout(g_vk.device, &pipelineLayout, NULL, &g_vk.pipelineLayout), "vkCreatePipelineLayout(main)"))
+		return 0;
+
+	VkShaderModule vertex = CreateShaderModuleFromSpirv(fixture_vert_spv, fixture_vert_spv_size);
+	VkShaderModule fragment = CreateShaderModuleFromSpirv(fixture_frag_spv, fixture_frag_spv_size);
+	if (!vertex || !fragment)
+		return 0;
+
+	VkPipelineShaderStageCreateInfo stages[2];
+	memset(stages, 0, sizeof(stages));
+	stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+	stages[0].module = vertex;
+	stages[0].pName = "main";
+	stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+	stages[1].module = fragment;
+	stages[1].pName = "main";
+
+	VkVertexInputBindingDescription binding;
+	memset(&binding, 0, sizeof(binding));
+	binding.binding = 0;
+	binding.stride = sizeof(VkVertex);
+	binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+	VkVertexInputAttributeDescription attributes[4];
+	memset(attributes, 0, sizeof(attributes));
+	attributes[0].location = 0; attributes[0].binding = 0; attributes[0].format = VK_FORMAT_R32G32B32_SFLOAT; attributes[0].offset = 0;
+	attributes[1].location = 1; attributes[1].binding = 0; attributes[1].format = VK_FORMAT_R32G32B32A32_SFLOAT; attributes[1].offset = 12;
+	attributes[2].location = 2; attributes[2].binding = 0; attributes[2].format = VK_FORMAT_R32G32B32_SFLOAT; attributes[2].offset = 28;
+	attributes[3].location = 3; attributes[3].binding = 0; attributes[3].format = VK_FORMAT_R32G32_SFLOAT; attributes[3].offset = 40;
+
+	VkPipelineVertexInputStateCreateInfo vertexInput;
+	memset(&vertexInput, 0, sizeof(vertexInput));
+	vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+	vertexInput.vertexBindingDescriptionCount = 1;
+	vertexInput.pVertexBindingDescriptions = &binding;
+	vertexInput.vertexAttributeDescriptionCount = 4;
+	vertexInput.pVertexAttributeDescriptions = attributes;
+
+	VkPipelineInputAssemblyStateCreateInfo assembly;
+	memset(&assembly, 0, sizeof(assembly));
+	assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+	assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+	VkPipelineViewportStateCreateInfo viewport;
+	memset(&viewport, 0, sizeof(viewport));
+	viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+	viewport.viewportCount = 1;
+	viewport.scissorCount = 1;
+
+	VkPipelineRasterizationStateCreateInfo raster;
+	memset(&raster, 0, sizeof(raster));
+	raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+	raster.polygonMode = VK_POLYGON_MODE_FILL;
+	raster.cullMode = VK_CULL_MODE_NONE;
+	raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+	raster.lineWidth = 1.0f;
+
+	VkPipelineMultisampleStateCreateInfo multisample;
+	memset(&multisample, 0, sizeof(multisample));
+	multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+	multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+	VkPipelineDepthStencilStateCreateInfo depthStencil;
+	memset(&depthStencil, 0, sizeof(depthStencil));
+	depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+	depthStencil.depthTestEnable = VK_TRUE;
+	depthStencil.depthWriteEnable = VK_TRUE;
+	depthStencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+	VkPipelineColorBlendAttachmentState blendAttachment;
+	memset(&blendAttachment, 0, sizeof(blendAttachment));
+	blendAttachment.blendEnable = VK_FALSE;
+	blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+		VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+	VkPipelineColorBlendStateCreateInfo blend;
+	memset(&blend, 0, sizeof(blend));
+	blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+	blend.attachmentCount = 1;
+	blend.pAttachments = &blendAttachment;
+
+	VkDynamicState dynamicStates[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+	VkPipelineDynamicStateCreateInfo dynamic;
+	memset(&dynamic, 0, sizeof(dynamic));
+	dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+	dynamic.dynamicStateCount = 2;
+	dynamic.pDynamicStates = dynamicStates;
+
+	VkGraphicsPipelineCreateInfo pipeline;
+	memset(&pipeline, 0, sizeof(pipeline));
+	pipeline.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+	pipeline.stageCount = 2;
+	pipeline.pStages = stages;
+	pipeline.pVertexInputState = &vertexInput;
+	pipeline.pInputAssemblyState = &assembly;
+	pipeline.pViewportState = &viewport;
+	pipeline.pRasterizationState = &raster;
+	pipeline.pMultisampleState = &multisample;
+	pipeline.pDepthStencilState = &depthStencil;
+	pipeline.pColorBlendState = &blend;
+	pipeline.pDynamicState = &dynamic;
+	pipeline.layout = g_vk.pipelineLayout;
+	pipeline.renderPass = g_vk.mainRenderPass;
+	pipeline.subpass = 0;
+
+	if (!VkOk(vkCreateGraphicsPipelines(g_vk.device, VK_NULL_HANDLE, 1, &pipeline, NULL, &g_vk.pbrPipeline), "vkCreateGraphicsPipelines(pbr)"))
+		return 0;
+
+	vkDestroyShaderModule(g_vk.device, vertex, NULL);
+	vkDestroyShaderModule(g_vk.device, fragment, NULL);
+
+	// Shadow pipeline: push constants only.
+	VkPushConstantRange shadowPush;
+	memset(&shadowPush, 0, sizeof(shadowPush));
+	shadowPush.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+	shadowPush.offset = 0;
+	shadowPush.size = 64;
+
+	VkPipelineLayoutCreateInfo shadowLayout;
+	memset(&shadowLayout, 0, sizeof(shadowLayout));
+	shadowLayout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	shadowLayout.pushConstantRangeCount = 1;
+	shadowLayout.pPushConstantRanges = &shadowPush;
+
+	if (!VkOk(vkCreatePipelineLayout(g_vk.device, &shadowLayout, NULL, &g_vk.shadowPipelineLayout), "vkCreatePipelineLayout(shadow)"))
+		return 0;
+
+	VkShaderModule shadowVertex = CreateShaderModuleFromSpirv(shadow_vert_spv, shadow_vert_spv_size);
+	VkShaderModule shadowFragment = CreateShaderModuleFromSpirv(shadow_frag_spv, shadow_frag_spv_size);
+	if (!shadowVertex || !shadowFragment)
+		return 0;
+
+	VkPipelineShaderStageCreateInfo shadowStages[2];
+	memset(shadowStages, 0, sizeof(shadowStages));
+	shadowStages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	shadowStages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+	shadowStages[0].module = shadowVertex;
+	shadowStages[0].pName = "main";
+	shadowStages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	shadowStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+	shadowStages[1].module = shadowFragment;
+	shadowStages[1].pName = "main";
+
+	VkVertexInputBindingDescription shadowBinding;
+	memset(&shadowBinding, 0, sizeof(shadowBinding));
+	shadowBinding.binding = 0;
+	shadowBinding.stride = sizeof(VkVertex);
+	shadowBinding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+	VkVertexInputAttributeDescription shadowAttribute;
+	memset(&shadowAttribute, 0, sizeof(shadowAttribute));
+	shadowAttribute.location = 0;
+	shadowAttribute.binding = 0;
+	shadowAttribute.format = VK_FORMAT_R32G32B32_SFLOAT;
+	shadowAttribute.offset = 0;
+
+	VkPipelineVertexInputStateCreateInfo shadowVertexInput;
+	memset(&shadowVertexInput, 0, sizeof(shadowVertexInput));
+	shadowVertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+	shadowVertexInput.vertexBindingDescriptionCount = 1;
+	shadowVertexInput.pVertexBindingDescriptions = &shadowBinding;
+	shadowVertexInput.vertexAttributeDescriptionCount = 1;
+	shadowVertexInput.pVertexAttributeDescriptions = &shadowAttribute;
+
+	VkPipelineRasterizationStateCreateInfo shadowRaster;
+	memset(&shadowRaster, 0, sizeof(shadowRaster));
+	shadowRaster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+	shadowRaster.polygonMode = VK_POLYGON_MODE_FILL;
+	shadowRaster.cullMode = VK_CULL_MODE_NONE;
+	shadowRaster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+	shadowRaster.lineWidth = 1.0f;
+
+	VkPipelineDepthStencilStateCreateInfo shadowDepth;
+	memset(&shadowDepth, 0, sizeof(shadowDepth));
+	shadowDepth.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+	shadowDepth.depthTestEnable = VK_TRUE;
+	shadowDepth.depthWriteEnable = VK_TRUE;
+	shadowDepth.depthCompareOp = VK_COMPARE_OP_LESS;
+
+	VkPipelineColorBlendStateCreateInfo shadowBlend;
+	memset(&shadowBlend, 0, sizeof(shadowBlend));
+	shadowBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+
+	memset(&pipeline, 0, sizeof(pipeline));
+	pipeline.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+	pipeline.stageCount = 2;
+	pipeline.pStages = shadowStages;
+	pipeline.pVertexInputState = &shadowVertexInput;
+	pipeline.pInputAssemblyState = &assembly;
+	pipeline.pViewportState = &viewport;
+	pipeline.pRasterizationState = &shadowRaster;
+	pipeline.pMultisampleState = &multisample;
+	pipeline.pDepthStencilState = &shadowDepth;
+	pipeline.pColorBlendState = &shadowBlend;
+	pipeline.pDynamicState = &dynamic;
+	pipeline.layout = g_vk.shadowPipelineLayout;
+	pipeline.renderPass = g_vk.shadowRenderPass;
+
+	if (!VkOk(vkCreateGraphicsPipelines(g_vk.device, VK_NULL_HANDLE, 1, &pipeline, NULL, &g_vk.shadowPipeline), "vkCreateGraphicsPipelines(shadow)"))
+		return 0;
+
+	vkDestroyShaderModule(g_vk.device, shadowVertex, NULL);
+	vkDestroyShaderModule(g_vk.device, shadowFragment, NULL);
+
+	VkDescriptorPoolSize poolSizes[2];
+	poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	// Meshes get one set each; the PSX path takes one set for the dummy
+	// (VRAM-decoded) case plus one per game RGBA texture.
+	const int psxSetCount = PSYX_VK_PSX_MAX_TEXTURES + 1;
+	poolSizes[0].descriptorCount = PSYX_VK_MAX_MESHES + 4 + psxSetCount;
+	poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	poolSizes[1].descriptorCount = (PSYX_VK_MAX_MESHES + 4) * 5 + psxSetCount * 3;
+
+	VkDescriptorPoolCreateInfo pool;
+	memset(&pool, 0, sizeof(pool));
+	pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	pool.maxSets = PSYX_VK_MAX_MESHES + 4 + psxSetCount;
+	pool.poolSizeCount = 2;
+	pool.pPoolSizes = poolSizes;
+
+	if (!VkOk(vkCreateDescriptorPool(g_vk.device, &pool, NULL, &g_vk.descriptorPool), "vkCreateDescriptorPool"))
+		return 0;
+
+	return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Render passes
+
+static int CreateRenderPasses(void)
+{
+	// Main pass: swapchain colour + depth.
+	VkAttachmentDescription attachments[2];
+	memset(attachments, 0, sizeof(attachments));
+
+	attachments[0].format = g_vk.swapchainFormat;
+	attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+	attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+	attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+	attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	attachments[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+	VkFormat depthFormat = VK_FORMAT_D32_SFLOAT;
+	VkFormatProperties formatProperties;
+	vkGetPhysicalDeviceFormatProperties(g_vk.physicalDevice, depthFormat, &formatProperties);
+	if ((formatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) == 0)
+		depthFormat = VK_FORMAT_D24_UNORM_S8_UINT;
+
+	attachments[1].format = depthFormat;
+	attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
+	attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+	attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	attachments[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+	VkAttachmentReference colorReference;
+	memset(&colorReference, 0, sizeof(colorReference));
+	colorReference.attachment = 0;
+	colorReference.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+	VkAttachmentReference depthReference;
+	memset(&depthReference, 0, sizeof(depthReference));
+	depthReference.attachment = 1;
+	depthReference.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+	VkSubpassDescription subpass;
+	memset(&subpass, 0, sizeof(subpass));
+	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+	subpass.colorAttachmentCount = 1;
+	subpass.pColorAttachments = &colorReference;
+	subpass.pDepthStencilAttachment = &depthReference;
+
+	VkSubpassDependency dependency;
+	memset(&dependency, 0, sizeof(dependency));
+	dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+	dependency.dstSubpass = 0;
+	dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+	dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+	dependency.srcAccessMask = 0;
+	dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+	VkRenderPassCreateInfo renderPass;
+	memset(&renderPass, 0, sizeof(renderPass));
+	renderPass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+	renderPass.attachmentCount = 2;
+	renderPass.pAttachments = attachments;
+	renderPass.subpassCount = 1;
+	renderPass.pSubpasses = &subpass;
+	renderPass.dependencyCount = 1;
+	renderPass.pDependencies = &dependency;
+
+	if (!VkOk(vkCreateRenderPass(g_vk.device, &renderPass, NULL, &g_vk.mainRenderPass), "vkCreateRenderPass(main)"))
+		return 0;
+
+	// Shadow pass: depth only, sampled afterwards.
+	VkAttachmentDescription shadowAttachment;
+	memset(&shadowAttachment, 0, sizeof(shadowAttachment));
+	shadowAttachment.format = VK_FORMAT_D32_SFLOAT;
+	shadowAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+	shadowAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+	shadowAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+	shadowAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	shadowAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	shadowAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	shadowAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+	// D32 only exists when the device supports it; otherwise use the first
+	// supported depth format. The shadow map always uses its own image, so the
+	// format can differ from the swapchain depth buffer.
+	vkGetPhysicalDeviceFormatProperties(g_vk.physicalDevice, VK_FORMAT_D32_SFLOAT, &formatProperties);
+	if ((formatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) == 0)
+	{
+		shadowAttachment.format = VK_FORMAT_D16_UNORM;
+	}
+
+	VkAttachmentReference shadowDepthReference;
+	memset(&shadowDepthReference, 0, sizeof(shadowDepthReference));
+	shadowDepthReference.attachment = 0;
+	shadowDepthReference.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+	VkSubpassDescription shadowSubpass;
+	memset(&shadowSubpass, 0, sizeof(shadowSubpass));
+	shadowSubpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+	shadowSubpass.pDepthStencilAttachment = &shadowDepthReference;
+
+	VkSubpassDependency shadowDependency;
+	memset(&shadowDependency, 0, sizeof(shadowDependency));
+	shadowDependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+	shadowDependency.dstSubpass = 0;
+	shadowDependency.srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+	shadowDependency.dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+	shadowDependency.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	shadowDependency.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+	memset(&renderPass, 0, sizeof(renderPass));
+	renderPass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+	renderPass.attachmentCount = 1;
+	renderPass.pAttachments = &shadowAttachment;
+	renderPass.subpassCount = 1;
+	renderPass.pSubpasses = &shadowSubpass;
+	renderPass.dependencyCount = 1;
+	renderPass.pDependencies = &shadowDependency;
+
+	if (!VkOk(vkCreateRenderPass(g_vk.device, &renderPass, NULL, &g_vk.shadowRenderPass), "vkCreateRenderPass(shadow)"))
+		return 0;
+
+	return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Emulated PSX GPU path (renderer roadmap R7b, phase 1)
+//
+// Mirrors the OpenGL renderer's PSX model. The CPU VRAM mirror is uploaded as
+// an R32G32_SFLOAT image (R = low byte, G = high byte of every little-endian
+// 16-bit PSX pixel), a 256x256 RGBA table decodes PSX 5551 colours, and the
+// ported psx.vert/psx.frag do the CLUT, texture-window, dither and bilinear
+// work inside the shader. knowledge/roadmap/planned/vulkan-game-renderer.md
+// holds the phased plan that maps the game's GR_* contract onto this.
+
+// Mirrors GR_InitRG8LUT (PsyX_render.cpp). The table turns a PSX 5551 word,
+// addressed as its two VRAM bytes, into RGBA8. Kept in sync by hand so this
+// backend does not include the OpenGL renderer's header; the self-test below
+// fails if the two ever disagree.
+static void BuildRG8Lut(unsigned char* lut)
+{
+	for (int y = 0; y < 256; y++)
+	{
+		for (int x = 0; x < 256; x++)
+		{
+			const unsigned short c = (unsigned short)((y << 8) | x);
+			unsigned char* pixel = lut + (y * 256 + x) * 4;
+			pixel[0] = (unsigned char)((c & 31)) << 3;
+			pixel[1] = (unsigned char)((c >> 5) & 31) << 3;
+			pixel[2] = (unsigned char)((c >> 10) & 31) << 3;
+			pixel[3] = (unsigned char)((c >> 15) & 1) << 7;
+		}
+	}
+}
+
+static int CreatePsxPipeline(int blendMode, int depthEnable, VkPipeline* pipeline)
+{
+	VkShaderModule vertex = CreateShaderModuleFromSpirv(psx_vert_spv, psx_vert_spv_size);
+	VkShaderModule fragment = CreateShaderModuleFromSpirv(psx_frag_spv, psx_frag_spv_size);
+	if (!vertex || !fragment)
+		return 0;
+
+	VkPipelineShaderStageCreateInfo stages[2];
+	memset(stages, 0, sizeof(stages));
+	stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+	stages[0].module = vertex;
+	stages[0].pName = "main";
+	stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+	stages[1].module = fragment;
+	stages[1].pName = "main";
+
+	VkVertexInputBindingDescription binding;
+	memset(&binding, 0, sizeof(binding));
+	binding.binding = 0;
+	binding.stride = sizeof(VkPsxVertex);
+	binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+	VkVertexInputAttributeDescription attributes[5];
+	memset(attributes, 0, sizeof(attributes));
+	attributes[0].location = 0; attributes[0].binding = 0; attributes[0].format = VK_FORMAT_R32G32B32A32_SFLOAT; attributes[0].offset = 0;
+	attributes[1].location = 1; attributes[1].binding = 0; attributes[1].format = VK_FORMAT_R32G32B32A32_SFLOAT; attributes[1].offset = 16;
+	attributes[2].location = 2; attributes[2].binding = 0; attributes[2].format = VK_FORMAT_R8G8B8A8_UINT; attributes[2].offset = 32;
+	attributes[3].location = 3; attributes[3].binding = 0; attributes[3].format = VK_FORMAT_R8G8B8A8_UNORM; attributes[3].offset = 36;
+	attributes[4].location = 4; attributes[4].binding = 0; attributes[4].format = VK_FORMAT_R8G8B8A8_SINT; attributes[4].offset = 40;
+
+	VkPipelineVertexInputStateCreateInfo vertexInput;
+	memset(&vertexInput, 0, sizeof(vertexInput));
+	vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+	vertexInput.vertexBindingDescriptionCount = 1;
+	vertexInput.pVertexBindingDescriptions = &binding;
+	vertexInput.vertexAttributeDescriptionCount = 5;
+	vertexInput.pVertexAttributeDescriptions = attributes;
+
+	VkPipelineInputAssemblyStateCreateInfo assembly;
+	memset(&assembly, 0, sizeof(assembly));
+	assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+	assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+	VkPipelineViewportStateCreateInfo viewport;
+	memset(&viewport, 0, sizeof(viewport));
+	viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+	viewport.viewportCount = 1;
+	viewport.scissorCount = 1;
+
+	VkPipelineRasterizationStateCreateInfo raster;
+	memset(&raster, 0, sizeof(raster));
+	raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+	raster.polygonMode = VK_POLYGON_MODE_FILL;
+	raster.cullMode = VK_CULL_MODE_NONE;
+	raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+	raster.lineWidth = 1.0f;
+
+	VkPipelineMultisampleStateCreateInfo multisample;
+	memset(&multisample, 0, sizeof(multisample));
+	multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+	multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+	VkPipelineDepthStencilStateCreateInfo depthStencil;
+	memset(&depthStencil, 0, sizeof(depthStencil));
+	depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+	depthStencil.depthTestEnable = depthEnable ? VK_TRUE : VK_FALSE;
+	depthStencil.depthWriteEnable = depthEnable ? VK_TRUE : VK_FALSE;
+	depthStencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+	VkPipelineColorBlendAttachmentState blendAttachment;
+	memset(&blendAttachment, 0, sizeof(blendAttachment));
+	blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+		VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+	blendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+	blendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+
+	// The PSX blend modes map straight onto GL's: Vulkan has no reverse
+	// subtract for alpha, so only the colour channel reverses.
+	switch (blendMode)
+	{
+	case 0:	// BM_NONE
+		blendAttachment.blendEnable = VK_FALSE;
+		break;
+	case 1:	// BM_AVERAGE
+		blendAttachment.blendEnable = VK_TRUE;
+		blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+		blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+		blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+		blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+		break;
+	case 2:	// BM_ADD
+		blendAttachment.blendEnable = VK_TRUE;
+		blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+		blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+		blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+		blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+		break;
+	case 3:	// BM_SUBTRACT
+		blendAttachment.blendEnable = VK_TRUE;
+		blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+		blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+		blendAttachment.colorBlendOp = VK_BLEND_OP_REVERSE_SUBTRACT;
+		blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+		blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+		break;
+	default:	// BM_ADD_QUATER_SOURCE
+		blendAttachment.blendEnable = VK_TRUE;
+		blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_CONSTANT_ALPHA;
+		blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+		blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_CONSTANT_ALPHA;
+		blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+		break;
+	}
+
+	VkPipelineColorBlendStateCreateInfo blend;
+	memset(&blend, 0, sizeof(blend));
+	blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+	blend.attachmentCount = 1;
+	blend.pAttachments = &blendAttachment;
+
+	VkDynamicState dynamicStates[3] =
+	{
+		VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS
+	};
+	VkPipelineDynamicStateCreateInfo dynamic;
+	memset(&dynamic, 0, sizeof(dynamic));
+	dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+	dynamic.dynamicStateCount = 3;
+	dynamic.pDynamicStates = dynamicStates;
+
+	VkGraphicsPipelineCreateInfo pipelineInfo;
+	memset(&pipelineInfo, 0, sizeof(pipelineInfo));
+	pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+	pipelineInfo.stageCount = 2;
+	pipelineInfo.pStages = stages;
+	pipelineInfo.pVertexInputState = &vertexInput;
+	pipelineInfo.pInputAssemblyState = &assembly;
+	pipelineInfo.pViewportState = &viewport;
+	pipelineInfo.pRasterizationState = &raster;
+	pipelineInfo.pMultisampleState = &multisample;
+	pipelineInfo.pDepthStencilState = &depthStencil;
+	pipelineInfo.pColorBlendState = &blend;
+	pipelineInfo.pDynamicState = &dynamic;
+	pipelineInfo.layout = g_vk.psx.layout;
+	pipelineInfo.renderPass = g_vk.mainRenderPass;
+	pipelineInfo.subpass = 0;
+
+	const int ok = VkOk(vkCreateGraphicsPipelines(g_vk.device, VK_NULL_HANDLE, 1, &pipelineInfo, NULL, pipeline),
+		"vkCreateGraphicsPipelines(psx)");
+
+	vkDestroyShaderModule(g_vk.device, vertex, NULL);
+	vkDestroyShaderModule(g_vk.device, fragment, NULL);
+	return ok;
+}
+
+// Allocates and writes a PSX descriptor set. The matrices, VRAM mirror and
+// RG8 table are shared by every set; only the RGBA slot (the game's 32-bit
+// textures) differs.
+static int PsxAllocateSet(VkDescriptorSet* set, VkImageView rgbaView, VkSampler rgbaSampler)
+{
+	VkPsxState* psx = &g_vk.psx;
+
+	VkDescriptorSetAllocateInfo setAllocate;
+	memset(&setAllocate, 0, sizeof(setAllocate));
+	setAllocate.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	setAllocate.descriptorPool = g_vk.descriptorPool;
+	setAllocate.descriptorSetCount = 1;
+	setAllocate.pSetLayouts = &psx->setLayout;
+	if (!VkOk(vkAllocateDescriptorSets(g_vk.device, &setAllocate, set), "vkAllocateDescriptorSets(psx)"))
+		return 0;
+
+	VkDescriptorBufferInfo uboInfo;
+	memset(&uboInfo, 0, sizeof(uboInfo));
+	uboInfo.buffer = psx->ubo;
+	uboInfo.range = VK_WHOLE_SIZE;
+
+	VkDescriptorImageInfo vramInfo;
+	memset(&vramInfo, 0, sizeof(vramInfo));
+	vramInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	vramInfo.imageView = psx->vramView;
+	vramInfo.sampler = psx->sampler;
+
+	VkDescriptorImageInfo lutInfo;
+	memset(&lutInfo, 0, sizeof(lutInfo));
+	lutInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	lutInfo.imageView = psx->lutView;
+	lutInfo.sampler = psx->lutSampler;
+
+	VkDescriptorImageInfo rgbaInfo;
+	memset(&rgbaInfo, 0, sizeof(rgbaInfo));
+	rgbaInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	rgbaInfo.imageView = rgbaView;
+	rgbaInfo.sampler = rgbaSampler;
+
+	VkWriteDescriptorSet writes[4];
+	memset(writes, 0, sizeof(writes));
+	for (int i = 0; i < 4; i++)
+	{
+		writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[i].dstSet = *set;
+		writes[i].dstBinding = (uint32_t)i;
+		writes[i].descriptorCount = 1;
+	}
+	writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	writes[0].pBufferInfo = &uboInfo;
+	writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	writes[1].pImageInfo = &vramInfo;
+	writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	writes[2].pImageInfo = &lutInfo;
+	writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	writes[3].pImageInfo = &rgbaInfo;
+	vkUpdateDescriptorSets(g_vk.device, 4, writes, 0, NULL);
+
+	return 1;
+}
+
+static int PsxWriteTextureSet(VkPsxTexture* tex)
+{
+	return PsxAllocateSet(&tex->set, tex->view, tex->sampler);
+}
+
+static int CreatePsxResources(void)
+{
+	VkPsxState* psx = &g_vk.psx;
+	memset(psx, 0, sizeof(*psx));
+
+	// Descriptor set: 0 = matrices, 1 = VRAM, 2 = RG8 LUT, 3 = RGBA texture.
+	VkDescriptorSetLayoutBinding bindings[4];
+	memset(bindings, 0, sizeof(bindings));
+	bindings[0].binding = 0;
+	bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	bindings[0].descriptorCount = 1;
+	bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+	for (int i = 1; i < 4; i++)
+	{
+		bindings[i].binding = (uint32_t)i;
+		bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		bindings[i].descriptorCount = 1;
+		bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+	}
+
+	VkDescriptorSetLayoutCreateInfo layoutInfo;
+	memset(&layoutInfo, 0, sizeof(layoutInfo));
+	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	layoutInfo.bindingCount = 4;
+	layoutInfo.pBindings = bindings;
+
+	if (!VkOk(vkCreateDescriptorSetLayout(g_vk.device, &layoutInfo, NULL, &psx->setLayout), "vkCreateDescriptorSetLayout(psx)"))
+		return 0;
+
+	VkPushConstantRange pushRange;
+	memset(&pushRange, 0, sizeof(pushRange));
+	pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+	pushRange.offset = 0;
+	pushRange.size = 32;	// texFormat, bilinearFilter, texelSize, overrideAlphaMode
+
+	VkPipelineLayoutCreateInfo pipelineLayout;
+	memset(&pipelineLayout, 0, sizeof(pipelineLayout));
+	pipelineLayout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	pipelineLayout.setLayoutCount = 1;
+	pipelineLayout.pSetLayouts = &psx->setLayout;
+	pipelineLayout.pushConstantRangeCount = 1;
+	pipelineLayout.pPushConstantRanges = &pushRange;
+
+	if (!VkOk(vkCreatePipelineLayout(g_vk.device, &pipelineLayout, NULL, &psx->layout), "vkCreatePipelineLayout(psx)"))
+		return 0;
+
+	for (int mode = 0; mode < PSYX_VK_PSX_BLEND_COUNT; mode++)
+	{
+		// BM_NONE draws depth-tested (PGXP-Z); the other modes depth-test off.
+		if (!CreatePsxPipeline(mode, mode == 0 ? 1 : 0, &psx->pipelines[mode]))
+			return 0;
+	}
+	if (!CreatePsxPipeline(0, 0, &psx->pipelineNoDepth))
+		return 0;
+
+	// Nearest sampling with wrapping addresses, like PSX VRAM.
+	VkSamplerCreateInfo samplerInfo;
+	memset(&samplerInfo, 0, sizeof(samplerInfo));
+	samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+	samplerInfo.magFilter = VK_FILTER_NEAREST;
+	samplerInfo.minFilter = VK_FILTER_NEAREST;
+	samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+	samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+	samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+	samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+	samplerInfo.maxLod = 0.25f;
+
+	if (!VkOk(vkCreateSampler(g_vk.device, &samplerInfo, NULL, &psx->sampler), "vkCreateSampler(psx)"))
+		return 0;
+
+	// The RG8 lookup subtracts a fraction of a texel from the coordinate, so it
+	// must clamp: GL sets GL_CLAMP_TO_EDGE on the same table. With wrapping, a
+	// zero high byte would sample the last row instead of the first.
+	samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	if (!VkOk(vkCreateSampler(g_vk.device, &samplerInfo, NULL, &psx->lutSampler), "vkCreateSampler(psx lut)"))
+		return 0;
+
+	// VRAM: RG32F because the shader samples the two bytes independently.
+	if (!CreateImage2D(PSYX_VK_VRAM_WIDTH, PSYX_VK_VRAM_HEIGHT, VK_FORMAT_R32G32_SFLOAT,
+		VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, &psx->vramImage, &psx->vramMemory))
+		return 0;
+	if (!CreateImageView2D(psx->vramImage, VK_FORMAT_R32G32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, &psx->vramView))
+		return 0;
+	if (!CreateBuffer((VkDeviceSize)PSYX_VK_PSX_VRAM_BYTES, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		&psx->vramStaging, &psx->vramStagingMemory, &psx->vramStagingMapped))
+		return 0;
+
+	// RG8 decode table.
+	if (!CreateImage2D(256, 256, VK_FORMAT_R8G8B8A8_UNORM,
+		VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, &psx->lutImage, &psx->lutMemory))
+		return 0;
+	if (!CreateImageView2D(psx->lutImage, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, &psx->lutView))
+		return 0;
+	if (!CreateBuffer(256 * 256 * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		&psx->lutStaging, &psx->lutStagingMemory, &psx->lutStagingMapped))
+		return 0;
+
+	if (!CreateBuffer(32 * sizeof(float), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		&psx->ubo, &psx->uboMemory, (void**)&psx->uboMapped))
+		return 0;
+	// Identity defaults so a draw before any GR_Ortho2D still lands on screen.
+	psx->uboMapped[0] = psx->uboMapped[5] = psx->uboMapped[10] = psx->uboMapped[15] = 1.0f;
+	psx->uboMapped[16] = psx->uboMapped[21] = psx->uboMapped[26] = psx->uboMapped[31] = 1.0f;
+
+	if (!CreateBuffer(PSYX_VK_PSX_VERTEX_CAPACITY, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		&psx->vertexBuffer, &psx->vertexMemory, (void**)&psx->vertexMapped))
+		return 0;
+	psx->vertexCapacity = PSYX_VK_PSX_VERTEX_CAPACITY;
+
+	// Upload the LUT once; it only depends on the PSX colour format.
+	BuildRG8Lut((unsigned char*)psx->lutStagingMapped);
+	{
+		VkCommandBuffer cmd = BeginOneShot();
+		ImageBarrier(cmd, psx->lutImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+		VkBufferImageCopy region;
+		memset(&region, 0, sizeof(region));
+		region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		region.imageSubresource.layerCount = 1;
+		region.imageExtent.width = 256;
+		region.imageExtent.height = 256;
+		region.imageExtent.depth = 1;
+		vkCmdCopyBufferToImage(cmd, psx->lutStaging, psx->lutImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+		ImageBarrier(cmd, psx->lutImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+		EndOneShot(cmd);
+	}
+
+	// VRAM starts zeroed and shader-readable.
+	{
+		VkCommandBuffer cmd = BeginOneShot();
+		ImageBarrier(cmd, psx->vramImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+		VkClearColorValue clearValue;
+		memset(&clearValue, 0, sizeof(clearValue));
+		VkImageSubresourceRange range;
+		memset(&range, 0, sizeof(range));
+		range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		range.levelCount = 1;
+		range.layerCount = 1;
+		vkCmdClearColorImage(cmd, psx->vramImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearValue, 1, &range);
+		ImageBarrier(cmd, psx->vramImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+		EndOneShot(cmd);
+	}
+
+	// The RGBA slot reuses the shared white texture: 4/8/16-bit draws decode
+	// from VRAM and never sample it.
+	const int white = (g_vk.dummyTextures[0] >= 0) ? g_vk.dummyTextures[0] : 0;
+	if (!PsxAllocateSet(&psx->dummySet, g_textures[white].view, g_vk.textureSampler))
+		return 0;
+
+	// State the game expects before it has set anything.
+	psx->stTexFormat = PSYX_VK_TEX_16BIT;
+	psx->stBlendMode = 0;
+	psx->stDepth = 1;
+	psx->stBilinear = g_cfg_bilinearFiltering ? 1 : 0;
+	psx->stScissor[2] = g_vk.width;
+	psx->stScissor[3] = g_vk.height;
+	psx->stViewport[2] = g_vk.width;
+	psx->stViewport[3] = g_vk.height;
+
+	psx->ready = 1;
+	return 1;
+}
+
+static void DestroyPsxResources(void)
+{
+	VkPsxState* psx = &g_vk.psx;
+
+	for (int i = 0; i < PSYX_VK_PSX_MAX_TEXTURES; i++)
+	{
+		VkPsxTexture* tex = &psx->textures[i];
+		if (!tex->used)
+			continue;
+		if (tex->sampler) vkDestroySampler(g_vk.device, tex->sampler, NULL);
+		if (tex->view) vkDestroyImageView(g_vk.device, tex->view, NULL);
+		if (tex->image) vkDestroyImage(g_vk.device, tex->image, NULL);
+		if (tex->memory) vkFreeMemory(g_vk.device, tex->memory, NULL);
+		tex->used = 0;
+	}
+
+	if (psx->vramStaging) vkDestroyBuffer(g_vk.device, psx->vramStaging, NULL);
+	if (psx->vramStagingMemory) vkFreeMemory(g_vk.device, psx->vramStagingMemory, NULL);
+	if (psx->lutStaging) vkDestroyBuffer(g_vk.device, psx->lutStaging, NULL);
+	if (psx->lutStagingMemory) vkFreeMemory(g_vk.device, psx->lutStagingMemory, NULL);
+	if (psx->vramView) vkDestroyImageView(g_vk.device, psx->vramView, NULL);
+	if (psx->vramImage) vkDestroyImage(g_vk.device, psx->vramImage, NULL);
+	if (psx->vramMemory) vkFreeMemory(g_vk.device, psx->vramMemory, NULL);
+	if (psx->lutView) vkDestroyImageView(g_vk.device, psx->lutView, NULL);
+	if (psx->lutImage) vkDestroyImage(g_vk.device, psx->lutImage, NULL);
+	if (psx->lutMemory) vkFreeMemory(g_vk.device, psx->lutMemory, NULL);
+	if (psx->ubo) vkDestroyBuffer(g_vk.device, psx->ubo, NULL);
+	if (psx->uboMemory) vkFreeMemory(g_vk.device, psx->uboMemory, NULL);
+	if (psx->vertexBuffer) vkDestroyBuffer(g_vk.device, psx->vertexBuffer, NULL);
+	if (psx->vertexMemory) vkFreeMemory(g_vk.device, psx->vertexMemory, NULL);
+	for (int i = 0; i < PSYX_VK_PSX_BLEND_COUNT; i++)
+	{
+		if (psx->pipelines[i]) vkDestroyPipeline(g_vk.device, psx->pipelines[i], NULL);
+	}
+	if (psx->pipelineNoDepth) vkDestroyPipeline(g_vk.device, psx->pipelineNoDepth, NULL);
+	if (psx->sampler) vkDestroySampler(g_vk.device, psx->sampler, NULL);
+	if (psx->lutSampler) vkDestroySampler(g_vk.device, psx->lutSampler, NULL);
+	if (psx->layout) vkDestroyPipelineLayout(g_vk.device, psx->layout, NULL);
+	if (psx->setLayout) vkDestroyDescriptorSetLayout(g_vk.device, psx->setLayout, NULL);
+
+	memset(psx, 0, sizeof(*psx));
+}
+
+void PsyX_Vk_GameBeginFrame(void)
+{
+	if (!g_vk.initialised || !g_vk.psx.ready)
+		return;
+
+	// The caller refills the shared vertex buffer next, so make sure the GPU is
+	// done with the previous frame before those writes land.
+	if (g_vk.frameFence)
+		vkWaitForFences(g_vk.device, 1, &g_vk.frameFence, VK_TRUE, UINT64_MAX);
+
+	g_vk.psx.vertexSize = 0;
+	g_vk.psx.vertexCount = 0;
+	g_vk.psx.drawCount = 0;
+}
+
+void PsyX_Vk_GameSetVram(const unsigned short* vram)
+{
+	if (!g_vk.psx.ready || !vram)
+		return;
+
+	// GL uploads the same mirror as GL_RG / GL_UNSIGNED_BYTE into an RG32F
+	// texture, so R = low byte / 255 and G = high byte / 255.
+	float* dst = (float*)g_vk.psx.vramStagingMapped;
+	for (int i = 0; i < PSYX_VK_VRAM_WIDTH * PSYX_VK_VRAM_HEIGHT; i++)
+	{
+		const unsigned short word = vram[i];
+		dst[i * 2 + 0] = (float)(word & 0xFF) * (1.0f / 255.0f);
+		dst[i * 2 + 1] = (float)((word >> 8) & 0xFF) * (1.0f / 255.0f);
+	}
+
+	VkCommandBuffer cmd = BeginOneShot();
+	ImageBarrier(cmd, g_vk.psx.vramImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+
+	VkBufferImageCopy region;
+	memset(&region, 0, sizeof(region));
+	region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	region.imageSubresource.layerCount = 1;
+	region.imageExtent.width = PSYX_VK_VRAM_WIDTH;
+	region.imageExtent.height = PSYX_VK_VRAM_HEIGHT;
+	region.imageExtent.depth = 1;
+	vkCmdCopyBufferToImage(cmd, g_vk.psx.vramStaging, g_vk.psx.vramImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+	ImageBarrier(cmd, g_vk.psx.vramImage, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+	EndOneShot(cmd);
+}
+
+void PsyX_Vk_GameSetProjection2D(const float projection[16])
+{
+	if (!g_vk.psx.ready || !projection)
+		return;
+	memcpy(g_vk.psx.uboMapped, projection, 16 * sizeof(float));
+}
+
+void PsyX_Vk_GameSetProjection3D(const float projection[16])
+{
+	if (!g_vk.psx.ready || !projection)
+		return;
+	memcpy(g_vk.psx.uboMapped + 16, projection, 16 * sizeof(float));
+}
+
+void PsyX_Vk_GameUpdateVertexBuffer(const void* vertices, int vertexCount)
+{
+	VkPsxState* psx = &g_vk.psx;
+	if (!psx->ready || !vertices || vertexCount <= 0)
+		return;
+
+	VkDeviceSize bytes = (VkDeviceSize)vertexCount * sizeof(VkPsxVertex);
+	if (bytes > psx->vertexCapacity)
+	{
+		eprintwarn("PsyX Vulkan: PSX vertex buffer overflow (%d vertices)\n", vertexCount);
+		vertexCount = (int)(psx->vertexCapacity / sizeof(VkPsxVertex));
+		bytes = (VkDeviceSize)vertexCount * sizeof(VkPsxVertex);
+	}
+
+	memcpy(psx->vertexMapped, vertices, (size_t)bytes);
+	psx->vertexSize = bytes;
+	psx->vertexCount = (uint32_t)vertexCount;
+}
+
+void PsyX_Vk_GameSetBlendMode(int blendMode)
+{
+	g_vk.psx.stBlendMode = (blendMode >= 0 && blendMode < PSYX_VK_PSX_BLEND_COUNT) ? blendMode : 0;
+}
+
+void PsyX_Vk_GameSetTexture(int texFormat, int texture)
+{
+	VkPsxState* psx = &g_vk.psx;
+	psx->stTexFormat = (texFormat >= 0) ? texFormat : PSYX_VK_TEX_16BIT;
+	psx->stTexture = texture;
+}
+
+void PsyX_Vk_GameSetOverrideTextureSize(int width, int height)
+{
+	VkPsxState* psx = &g_vk.psx;
+	psx->stOverrideWidth = width > 0 ? width : 0;
+	psx->stOverrideHeight = height > 0 ? height : 0;
+}
+
+void PsyX_Vk_GameSetOverrideAlphaMode(int mode)
+{
+	g_vk.psx.stOverrideAlphaMode = mode;
+}
+
+void PsyX_Vk_GameSetStencilMode(int drawPrimMode)
+{
+	// The PSX stencil mask is not emulated by this backend yet; the value is
+	// kept so the state mirror matches the OpenGL renderer's inputs.
+	g_vk.psx.stStencilMode = drawPrimMode;
+}
+
+void PsyX_Vk_GameEnableDepth(int enable)
+{
+	g_vk.psx.stDepth = enable ? 1 : 0;
+}
+
+void PsyX_Vk_GameSetBilinear(int enable)
+{
+	g_vk.psx.stBilinear = enable ? 1 : 0;
+}
+
+void PsyX_Vk_GameSetScissor(int enable, int x, int y, int width, int height)
+{
+	VkPsxState* psx = &g_vk.psx;
+	psx->stScissorEnable = enable ? 1 : 0;
+	psx->stScissor[0] = x;
+	psx->stScissor[1] = y;
+	psx->stScissor[2] = width;
+	psx->stScissor[3] = height;
+}
+
+void PsyX_Vk_GameSetViewPort(int x, int y, int width, int height)
+{
+	VkPsxState* psx = &g_vk.psx;
+	psx->stViewport[0] = x;
+	psx->stViewport[1] = y;
+	psx->stViewport[2] = width;
+	psx->stViewport[3] = height;
+}
+
+void PsyX_Vk_GameStoreFrameBuffer(int x, int y, int width, int height)
+{
+	VkPsxState* psx = &g_vk.psx;
+	psx->frameBufferRect[0] = x;
+	psx->frameBufferRect[1] = y;
+	psx->frameBufferRect[2] = width;
+	psx->frameBufferRect[3] = height;
+	psx->frameBufferPending = 1;
+
+	if (!psx->frameBufferWarned)
+	{
+		psx->frameBufferWarned = 1;
+		eprintwarn("PsyX Vulkan: GR_StoreFrameBuffer readback not ported yet (framebuffer textures stay stale)\n");
+	}
+}
+
+void PsyX_Vk_GameClear(int x, int y, int width, int height, unsigned char r, unsigned char g, unsigned char b)
+{
+	// GR_Clear only ever clears the whole on-screen buffer (the rect is applied
+	// by the PSX clip environment through the scissor); the Vulkan pass clear
+	// does the same, so the queued draws are what is left to do here.
+	(void)x; (void)y; (void)width; (void)height; (void)r; (void)g; (void)b;
+	g_vk.psx.clearRequested = 1;
+	g_vk.psx.clearColor[0] = r / 255.0f;
+	g_vk.psx.clearColor[1] = g / 255.0f;
+	g_vk.psx.clearColor[2] = b / 255.0f;
+}
+
+int PsyX_Vk_GameDrawTriangles(int firstVertex, int triangles)
+{
+	VkPsxState* psx = &g_vk.psx;
+	if (!psx->ready || triangles <= 0)
+		return 0;
+	if (psx->drawCount >= PSYX_VK_PSX_MAX_DRAWS)
+	{
+		eprintwarn("PsyX Vulkan: PSX draw list full, dropping draw\n");
+		return 0;
+	}
+	if (firstVertex < 0 || (uint32_t)(firstVertex + triangles * 3) > psx->vertexCount)
+	{
+		eprintwarn("PsyX Vulkan: PSX draw out of range (%d + %d triangles, %u vertices)\n",
+			firstVertex, triangles, psx->vertexCount);
+		return 0;
+	}
+
+	VkPsxDraw* draw = &psx->draws[psx->drawCount++];
+	memset(draw, 0, sizeof(*draw));
+	draw->texFormat = psx->stTexFormat;
+	draw->bilinearFilter = psx->stBilinear;
+	draw->texelSize[0] = psx->stOverrideWidth > 0 ? 1.0f / (float)psx->stOverrideWidth : 1.0f / 256.0f;
+	draw->texelSize[1] = psx->stOverrideHeight > 0 ? 1.0f / (float)psx->stOverrideHeight : 1.0f / 256.0f;
+	draw->overrideAlphaMode = psx->stOverrideAlphaMode;
+	draw->blendMode = psx->stBlendMode;
+	draw->depthTest = psx->stDepth;
+	draw->scissorEnable = psx->stScissorEnable;
+	memcpy(draw->scissor, psx->stScissor, sizeof(draw->scissor));
+	memcpy(draw->viewport, psx->stViewport, sizeof(draw->viewport));
+	draw->textureSet = (psx->stTexture > 0 && psx->stTexture <= PSYX_VK_PSX_MAX_TEXTURES &&
+		psx->textures[psx->stTexture - 1].used)
+		? psx->textures[psx->stTexture - 1].set
+		: VK_NULL_HANDLE;
+	draw->firstVertex = (uint32_t)firstVertex;
+	draw->vertexCount = (uint32_t)(triangles * 3);
+
+	return triangles;
+}
+
+int PsyX_Vk_GameCreateTexture(const unsigned char* rgba, int width, int height, int mipmapped)
+{
+	VkPsxState* psx = &g_vk.psx;
+	if (!psx->ready || !rgba || width <= 0 || height <= 0)
+		return 0;
+
+	int slot = -1;
+	for (int i = 0; i < PSYX_VK_PSX_MAX_TEXTURES; i++)
+	{
+		if (!psx->textures[i].used)
+		{
+			slot = i;
+			break;
+		}
+	}
+	if (slot < 0)
+	{
+		eprinterr("PsyX Vulkan: out of PSX game textures\n");
+		return 0;
+	}
+
+	VkPsxTexture* tex = &psx->textures[slot];
+	memset(tex, 0, sizeof(*tex));
+
+	// Same filtering the OpenGL renderer applies to game RGBA textures.
+	int levels = 1;
+	if (mipmapped)
+	{
+		int w = width;
+		int h = height;
+		while (w > 1 || h > 1)
+		{
+			w = w > 1 ? w / 2 : 1;
+			h = h > 1 ? h / 2 : 1;
+			levels++;
+		}
+	}
+
+	if (!CreateImage2DLevels(width, height, levels, VK_FORMAT_R8G8B8A8_UNORM,
+		VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+		&tex->image, &tex->memory))
+		return 0;
+	if (!CreateImageView2DLevels(tex->image, VK_FORMAT_R8G8B8A8_UNORM, levels, &tex->view))
+	{
+		vkDestroyImage(g_vk.device, tex->image, NULL);
+		vkFreeMemory(g_vk.device, tex->memory, NULL);
+		memset(tex, 0, sizeof(*tex));
+		return 0;
+	}
+
+	const VkDeviceSize stagingSize = (VkDeviceSize)width * height * 4;
+	VkBuffer staging = VK_NULL_HANDLE;
+	VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+	void* stagingMapped = NULL;
+	if (!CreateBuffer(stagingSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		&staging, &stagingMemory, &stagingMapped))
+	{
+		vkDestroyImageView(g_vk.device, tex->view, NULL);
+		vkDestroyImage(g_vk.device, tex->image, NULL);
+		vkFreeMemory(g_vk.device, tex->memory, NULL);
+		memset(tex, 0, sizeof(*tex));
+		return 0;
+	}
+	memcpy(stagingMapped, rgba, (size_t)stagingSize);
+
+	VkCommandBuffer cmd = BeginOneShot();
+	ImageBarrier(cmd, tex->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+
+	VkBufferImageCopy region;
+	memset(&region, 0, sizeof(region));
+	region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	region.imageSubresource.layerCount = 1;
+	region.imageExtent.width = (uint32_t)width;
+	region.imageExtent.height = (uint32_t)height;
+	region.imageExtent.depth = 1;
+	vkCmdCopyBufferToImage(cmd, staging, tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+	// Mirror GR_CreateRGBATextureMipmapped's glGenerateMipmap.
+	for (int level = 1; level < levels; level++)
+	{
+		const int srcW = width >> (level - 1);
+		const int srcH = height >> (level - 1);
+		int dstW = srcW > 1 ? srcW / 2 : 1;
+		int dstH = srcH > 1 ? srcH / 2 : 1;
+
+		ImageBarrier(cmd, tex->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+
+		VkImageBlit blit;
+		memset(&blit, 0, sizeof(blit));
+		blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		blit.srcSubresource.mipLevel = (uint32_t)(level - 1);
+		blit.srcSubresource.layerCount = 1;
+		blit.srcOffsets[1].x = srcW;
+		blit.srcOffsets[1].y = srcH;
+		blit.srcOffsets[1].z = 1;
+		blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		blit.dstSubresource.mipLevel = (uint32_t)level;
+		blit.dstSubresource.layerCount = 1;
+		blit.dstOffsets[1].x = dstW;
+		blit.dstOffsets[1].y = dstH;
+		blit.dstOffsets[1].z = 1;
+		vkCmdBlitImage(cmd, tex->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			1, &blit, VK_FILTER_LINEAR);
+	}
+
+	ImageBarrier(cmd, tex->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+	EndOneShot(cmd);
+
+	vkDestroyBuffer(g_vk.device, staging, NULL);
+	vkFreeMemory(g_vk.device, stagingMemory, NULL);
+
+	// Filtering matches GR_CreateRGBATexture: bilinear when the config asks for
+	// it, clamped addresses either way.
+	VkSamplerCreateInfo samplerInfo;
+	memset(&samplerInfo, 0, sizeof(samplerInfo));
+	samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+	samplerInfo.magFilter = g_cfg_bilinearFiltering ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+	samplerInfo.minFilter = samplerInfo.magFilter;
+	samplerInfo.mipmapMode = (mipmapped && g_cfg_bilinearFiltering)
+		? VK_SAMPLER_MIPMAP_MODE_LINEAR
+		: VK_SAMPLER_MIPMAP_MODE_NEAREST;
+	samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	samplerInfo.maxLod = (float)levels;
+	if (!VkOk(vkCreateSampler(g_vk.device, &samplerInfo, NULL, &tex->sampler), "vkCreateSampler(psx game texture)"))
+	{
+		vkDestroyImageView(g_vk.device, tex->view, NULL);
+		vkDestroyImage(g_vk.device, tex->image, NULL);
+		vkFreeMemory(g_vk.device, tex->memory, NULL);
+		memset(tex, 0, sizeof(*tex));
+		return 0;
+	}
+
+	if (!PsxWriteTextureSet(tex))
+	{
+		vkDestroySampler(g_vk.device, tex->sampler, NULL);
+		vkDestroyImageView(g_vk.device, tex->view, NULL);
+		vkDestroyImage(g_vk.device, tex->image, NULL);
+		vkFreeMemory(g_vk.device, tex->memory, NULL);
+		memset(tex, 0, sizeof(*tex));
+		return 0;
+	}
+
+	tex->used = 1;
+	tex->width = width;
+	tex->height = height;
+	return slot + 1;	// 0 is reserved for "no texture"
+}
+
+void PsyX_Vk_GameDestroyTexture(int texture)
+{
+	VkPsxState* psx = &g_vk.psx;
+	if (texture <= 0 || texture > PSYX_VK_PSX_MAX_TEXTURES)
+		return;
+
+	VkPsxTexture* tex = &psx->textures[texture - 1];
+	if (!tex->used)
+		return;
+
+	if (tex->sampler) vkDestroySampler(g_vk.device, tex->sampler, NULL);
+	if (tex->view) vkDestroyImageView(g_vk.device, tex->view, NULL);
+	if (tex->image) vkDestroyImage(g_vk.device, tex->image, NULL);
+	if (tex->memory) vkFreeMemory(g_vk.device, tex->memory, NULL);
+	memset(tex, 0, sizeof(*tex));
+}
+
+void PsyX_Vk_GameEndFrame(void)
+{
+	eprintinfo("PSXTRACE GameEndFrame draws=%d verts=%u\n", g_vk.psx.drawCount, g_vk.psx.vertexCount);
+	if (!g_vk.initialised || !g_vk.psx.ready)
+		return;
+
+	PsyX_Vk_RenderFrame();
+}
+
+void PsyX_Vk_GameResetDevice(void)
+{
+	// RenderFrame re-creates the swapchain when the drawable size changes, so
+	// a resize needs no explicit reset here.
+}
+
+int PsyX_Vk_GameIsActive(void)
+{
+	return g_vk.initialised && g_vk.gameMode;
+}
+
+SDL_Window* PsyX_Vk_GetSDLWindow(void)
+{
+	return g_vk.window;
+}
+
+static void RecordPsxDraws(void)
+{
+	VkPsxState* psx = &g_vk.psx;
+	if (!psx->ready || psx->drawCount == 0)
+		return;
+
+	// One vertex buffer per frame, as the game uploads it once.
+	const VkDeviceSize offset = 0;
+	vkCmdBindVertexBuffers(g_vk.commandBuffer, 0, 1, &psx->vertexBuffer, &offset);
+
+	const float blendConstants[4] = { 0.5f, 0.5f, 0.5f, 0.25f };
+	vkCmdSetBlendConstants(g_vk.commandBuffer, blendConstants);
+
+	VkDescriptorSet boundSet = VK_NULL_HANDLE;
+
+	for (int i = 0; i < psx->drawCount; i++)
+	{
+		const VkPsxDraw* draw = &psx->draws[i];
+		const VkDescriptorSet set = draw->textureSet ? draw->textureSet : psx->dummySet;
+		const VkPipeline pipeline = (draw->blendMode == 0 && !draw->depthTest)
+			? psx->pipelineNoDepth
+			: psx->pipelines[draw->blendMode];
+
+		vkCmdBindPipeline(g_vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+
+		if (set != boundSet)
+		{
+			vkCmdBindDescriptorSets(g_vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+				psx->layout, 0, 1, &set, 0, NULL);
+			boundSet = set;
+		}
+
+		// GR_SetupClipMode / GR_SetViewPort work in top-left window space; the
+		// viewport flips the y axis to match the OpenGL conventions the game
+		// relies on.
+		// psx.vert already converts GL clip space to Vulkan, so the viewport is
+		// right-side up; only the GL bottom-left origin has to be mapped to
+		// Vulkan's top-left one.
+		VkViewport viewport;
+		viewport.x = (float)draw->viewport[0];
+		viewport.width = (float)(draw->viewport[2] > 0 ? draw->viewport[2] : g_vk.width);
+		viewport.height = (float)(draw->viewport[3] > 0 ? draw->viewport[3] : g_vk.height);
+		viewport.y = (float)g_vk.height - ((float)draw->viewport[1] + viewport.height);
+		viewport.minDepth = 0.0f;
+		viewport.maxDepth = 1.0f;
+		vkCmdSetViewport(g_vk.commandBuffer, 0, 1, &viewport);
+
+		VkRect2D scissor;
+		scissor.offset.x = draw->scissorEnable ? draw->scissor[0] : 0;
+		scissor.offset.y = draw->scissorEnable ? draw->scissor[1] : 0;
+		scissor.extent.width = (uint32_t)(draw->scissorEnable ? draw->scissor[2] : g_vk.width);
+		scissor.extent.height = (uint32_t)(draw->scissorEnable ? draw->scissor[3] : g_vk.height);
+		vkCmdSetScissor(g_vk.commandBuffer, 0, 1, &scissor);
+
+		struct
+		{
+			int texFormat;
+			int bilinearFilter;
+			float texelSize[2];
+			int overrideAlphaMode;
+		} constants;
+		constants.texFormat = draw->texFormat;
+		constants.bilinearFilter = draw->bilinearFilter;
+		constants.texelSize[0] = draw->texelSize[0];
+		constants.texelSize[1] = draw->texelSize[1];
+		constants.overrideAlphaMode = draw->overrideAlphaMode;
+
+		vkCmdPushConstants(g_vk.commandBuffer, psx->layout,
+			VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(constants), &constants);
+
+		vkCmdDraw(g_vk.commandBuffer, draw->vertexCount, 1, draw->firstVertex, 0);
+	}
+}
+
+static float SrgbEncodeFloat(float value)
+{
+	if (value <= 0.0031308f)
+		return value * 12.92f;
+	return 1.055f * powf(value, 1.0f / 2.4f) - 0.055f;
+}
+
+static void ReportAppend(char* report, int size, const char* text)
+{
+	if (!report || size <= 0)
+		return;
+	const size_t length = strlen(report);
+	if (length + 1 >= (size_t)size)
+		return;
+	strncat(report, text, (size_t)size - length - 1);
+}
+
+static void PsxBuildOrtho(float left, float right, float bottom, float top, float znear, float zfar, float* out)
+{
+	memset(out, 0, 16 * sizeof(float));
+	out[0] = 2.0f / (right - left);
+	out[5] = 2.0f / (top - bottom);
+	out[10] = -2.0f / (zfar - znear);
+	out[12] = -(right + left) / (right - left);
+	out[13] = -(top + bottom) / (top - bottom);
+	out[14] = -(zfar + znear) / (zfar - znear);
+	out[15] = 1.0f;
+}
+
+static void PsxFillQuad(float width, float height, float page, float clut, float u, float v, VkPsxVertex* vertices)
+{
+	const float xs[4] = { 0.0f, width, width, 0.0f };
+	const float ys[4] = { 0.0f, 0.0f, height, height };
+	const int order[6] = { 0, 1, 2, 0, 2, 3 };
+
+	for (int i = 0; i < 6; i++)
+	{
+		VkPsxVertex* vertex = &vertices[i];
+		memset(vertex, 0, sizeof(*vertex));
+		vertex->x = xs[order[i]];
+		vertex->y = ys[order[i]];
+		vertex->page = page;
+		vertex->clut = clut;
+		vertex->u = (unsigned char)u;
+		vertex->v = (unsigned char)v;
+		vertex->bright = 1;	// multiplies the vertex colour by 1.0
+		vertex->r = vertex->g = vertex->b = vertex->a = 255;
+	}
+}
+
+static int PsxCheckPixel(const unsigned char* rgba, int width, int height, int x, int y,
+	const float expected[4], int tolerance, const char* label, char* report, int reportSize)
+{
+	const unsigned char* pixel = rgba + ((size_t)y * (size_t)width + (size_t)x) * 4;
+	int worst = 0;
+	for (int c = 0; c < 4; c++)
+	{
+		const int want = (int)(expected[c] * 255.0f + 0.5f);
+		int diff = (int)pixel[c] - want;
+		if (diff < 0)
+			diff = -diff;
+		if (diff > worst)
+			worst = diff;
+	}
+
+	char line[256];
+	snprintf(line, sizeof(line), "%s: got (%u,%u,%u,%u) worst=%d %s\n", label,
+		pixel[0], pixel[1], pixel[2], pixel[3], worst, worst <= tolerance ? "ok" : "FAIL");
+	ReportAppend(report, reportSize, line);
+	return worst <= tolerance;
+}
+
+int PsyX_Vk_GameSelfTest(char* report, int reportSize)
+{
+	if (report && reportSize > 0)
+		report[0] = 0;
+
+	if (!g_vk.initialised || !g_vk.psx.ready)
+	{
+		ReportAppend(report, reportSize, "psx path unavailable\n");
+		return 0;
+	}
+
+	const int width = g_vk.width;
+	const int height = g_vk.height;
+
+	unsigned short* vram = new unsigned short[PSYX_VK_VRAM_WIDTH * PSYX_VK_VRAM_HEIGHT];
+	if (!vram)
+		return 0;
+
+	float ortho[16];
+	PsxBuildOrtho(0.0f, (float)width, (float)height, 0.0f, -1.0f, 1.0f, ortho);
+	PsyX_Vk_GameSetProjection2D(ortho);
+
+	const int tolerance = 3;
+	int failures = 0;
+
+	unsigned char* rgba = new unsigned char[(size_t)width * height * 4];
+	if (!rgba)
+	{
+		delete[] vram;
+		return 0;
+	}
+
+	// Case 1: 16-bit direct colour. VRAM (0,0) = 0x001F, pure red in PSX 5551,
+	// so the shader must decode it to R = 31 << 3 = 248 with alpha 1.
+	memset(vram, 0, sizeof(unsigned short) * PSYX_VK_VRAM_WIDTH * PSYX_VK_VRAM_HEIGHT);
+	vram[0] = 0x001F;
+
+	VkPsxVertex quad[6];
+	PsxFillQuad((float)width, (float)height, 0.0f, 0.0f, 0.0f, 0.0f, quad);
+
+	PsyX_Vk_GameBeginFrame();
+	PsyX_Vk_GameSetVram(vram);
+	PsyX_Vk_GameUpdateVertexBuffer(quad, 6);
+	PsyX_Vk_GameSetBlendMode(PSYX_VK_BLEND_NONE);
+	PsyX_Vk_GameSetTexture(PSYX_VK_TEX_16BIT, 0);
+	PsyX_Vk_GameEnableDepth(0);
+	PsyX_Vk_GameSetBilinear(0);
+	PsyX_Vk_GameSetViewPort(0, 0, width, height);
+	PsyX_Vk_GameSetScissor(0, 0, 0, width, height);
+	PsyX_Vk_GameDrawTriangles(0, 2);
+	PsyX_Vk_RenderFrame();
+
+	int readWidth = 0;
+	int readHeight = 0;
+	if (!PsyX_Vk_ReadbackRgba(rgba, &readWidth, &readHeight))
+	{
+		ReportAppend(report, reportSize, "readback failed\n");
+		delete[] rgba;
+		delete[] vram;
+		return 0;
+	}
+
+	{
+		const float linear = 248.0f / 255.0f;
+		const float channel = g_vk.srgbOutput ? SrgbEncodeFloat(linear) : linear;
+		const float expected[4] = { channel, 0.0f, 0.0f, 1.0f };
+		if (!PsxCheckPixel(rgba, readWidth, readHeight, readWidth / 2, readHeight / 2, expected, tolerance,
+			"16-bit 0x001F", report, reportSize))
+			failures++;
+	}
+
+	// Case 2: 4-bit CLUT. Every nibble of the texture word is 5 (so whichever
+	// nibble the shader picks is 5) and CLUT entry 5 is blue while the rest is
+	// green: matching blue proves the nibble extraction, CLUT row addressing and
+	// the RG8 table all resolve to the right entry.
+	memset(vram, 0, sizeof(unsigned short) * PSYX_VK_VRAM_WIDTH * PSYX_VK_VRAM_HEIGHT);
+	for (int x = 0; x < 16; x++)
+		vram[(8 * PSYX_VK_VRAM_WIDTH) + x] = 0x03E0;	// green
+	vram[(8 * PSYX_VK_VRAM_WIDTH) + 5] = 0x7C00;		// blue
+	for (int x = 0; x < 64; x++)
+		vram[x] = 0x5555;
+
+	PsxFillQuad((float)width, (float)height, 0.0f, 512.0f, 0.0f, 0.0f, quad);
+
+	PsyX_Vk_GameBeginFrame();
+	PsyX_Vk_GameSetVram(vram);
+	PsyX_Vk_GameUpdateVertexBuffer(quad, 6);
+	PsyX_Vk_GameSetBlendMode(PSYX_VK_BLEND_NONE);
+	PsyX_Vk_GameSetTexture(PSYX_VK_TEX_4BIT, 0);
+	PsyX_Vk_GameEnableDepth(0);
+	PsyX_Vk_GameSetBilinear(0);
+	PsyX_Vk_GameSetViewPort(0, 0, width, height);
+	PsyX_Vk_GameSetScissor(0, 0, 0, width, height);
+	PsyX_Vk_GameDrawTriangles(0, 2);
+
+	if (!PsyX_Vk_RenderFrame() || !PsyX_Vk_ReadbackRgba(rgba, &readWidth, &readHeight))
+	{
+		ReportAppend(report, reportSize, "case 2 readback failed\n");
+		failures++;
+	}
+	else
+	{
+		const float linear = 248.0f / 255.0f;
+		const float channel = g_vk.srgbOutput ? SrgbEncodeFloat(linear) : linear;
+		const float expected[4] = { 0.0f, 0.0f, channel, 1.0f };
+		if (!PsxCheckPixel(rgba, readWidth, readHeight, readWidth / 2, readHeight / 2, expected, tolerance,
+			"4-bit CLUT entry 5", report, reportSize))
+			failures++;
+	}
+
+	delete[] rgba;
+	delete[] vram;
+
+	{
+		char line[128];
+		snprintf(line, sizeof(line), "psx self-test: %s\n", failures == 0 ? "PASS" : "FAIL");
+		ReportAppend(report, reportSize, line);
+	}
+
+	// Leave no queued draws behind for the next frame.
+	g_vk.psx.drawCount = 0;
+	g_vk.psx.vertexSize = 0;
+
+	return failures == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Textures
+
+static int UploadTexture(const unsigned char* pixels, int width, int height)
+{
+	if (!pixels || width <= 0 || height <= 0)
+		return -1;
+
+	int slot = -1;
+	for (int i = 0; i < PSYX_VK_MAX_TEXTURES; i++)
+	{
+		if (!g_textures[i].used)
+		{
+			slot = i;
+			break;
+		}
+	}
+	if (slot < 0)
+		return -1;
+
+	VkTexture* texture = &g_textures[slot];
+	memset(texture, 0, sizeof(*texture));
+
+	if (!CreateImage2D((uint32_t)width, (uint32_t)height, VK_FORMAT_R8G8B8A8_UNORM,
+		VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, &texture->image, &texture->memory))
+		return -1;
+
+	const VkDeviceSize size = (VkDeviceSize)width * height * 4;
+	VkBuffer staging = VK_NULL_HANDLE;
+	VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+	void* mapped = NULL;
+	if (!CreateBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		&staging, &stagingMemory, &mapped))
+		return -1;
+
+	memcpy(mapped, pixels, (size_t)size);
+
+	VkCommandBuffer cmd = BeginOneShot();
+	ImageBarrier(cmd, texture->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+
+	VkBufferImageCopy region;
+	memset(&region, 0, sizeof(region));
+	region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	region.imageSubresource.layerCount = 1;
+	region.imageExtent.width = (uint32_t)width;
+	region.imageExtent.height = (uint32_t)height;
+	region.imageExtent.depth = 1;
+	vkCmdCopyBufferToImage(cmd, staging, texture->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+	ImageBarrier(cmd, texture->image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+	EndOneShot(cmd);
+
+	vkDestroyBuffer(g_vk.device, staging, NULL);
+	vkFreeMemory(g_vk.device, stagingMemory, NULL);
+
+	if (!CreateImageView2D(texture->image, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, &texture->view))
+		return -1;
+
+	texture->used = 1;
+	return slot;
+}
+
+// ---------------------------------------------------------------------------
+// Textures and mesh creation
+
+static void UpdateDescriptorSetForMesh(VkMesh* mesh);
+
+static int CreateDummyTextures(void)
+{
+	const unsigned char white[4] = { 255, 255, 255, 255 };
+	const unsigned char black[4] = { 0, 0, 0, 255 };
+	const unsigned char flatNormal[4] = { 128, 128, 255, 255 };
+	const unsigned char neutralMr[4] = { 255, 255, 0, 255 };	// g = roughness 1, b = metallic 0
+
+	const unsigned char* sources[4] = { white, flatNormal, neutralMr, black };
+	for (int i = 0; i < 4; i++)
+	{
+		g_vk.dummyTextures[i] = UploadTexture(sources[i], 1, 1);
+		if (g_vk.dummyTextures[i] < 0)
+			return 0;
+	}
+	return 1;
+}
+
+int PsyX_Vk_CreateTexture(const unsigned char* rgba, int width, int height)
+{
+	if (!g_vk.initialised)
+		return -1;
+	return UploadTexture(rgba, width, height);
+}
+
+void PsyX_Vk_DestroyTexture(int texture)
+{
+	if (texture < 0 || texture >= PSYX_VK_MAX_TEXTURES || !g_textures[texture].used)
+		return;
+
+	vkDeviceWaitIdle(g_vk.device);
+
+	// Drop mesh references first so no descriptor keeps a destroyed view.
+	for (int i = 0; i < PSYX_VK_MAX_MESHES; i++)
+	{
+		if (!g_vk.meshes[i].used)
+			continue;
+
+		int changed = 0;
+		for (int s = 0; s < 4; s++)
+		{
+			if (g_vk.meshes[i].textureSlots[s] == texture)
+			{
+				g_vk.meshes[i].textureSlots[s] = -1;
+				changed = 1;
+			}
+		}
+		if (changed)
+			UpdateDescriptorSetForMesh(&g_vk.meshes[i]);
+	}
+
+	VkTexture* t = &g_textures[texture];
+	if (t->view) vkDestroyImageView(g_vk.device, t->view, NULL);
+	if (t->image) vkDestroyImage(g_vk.device, t->image, NULL);
+	if (t->memory) vkFreeMemory(g_vk.device, t->memory, NULL);
+	memset(t, 0, sizeof(*t));
+}
+
+void PsyX_Vk_SetMeshTexture(int mesh, int slot, int texture)
+{
+	if (mesh < 0 || mesh >= PSYX_VK_MAX_MESHES || !g_vk.meshes[mesh].used)
+		return;
+	if (slot < 0 || slot > 3)
+		return;
+
+	g_vk.meshes[mesh].textureSlots[slot] = texture;
+
+	if (g_vk.meshes[mesh].descriptorSet)
+		UpdateDescriptorSetForMesh(&g_vk.meshes[mesh]);
+}
+
+void PsyX_Vk_SetMeshFactors(int mesh, float metallic, float roughness, float emissiveScale)
+{
+	if (mesh < 0 || mesh >= PSYX_VK_MAX_MESHES || !g_vk.meshes[mesh].used)
+		return;
+
+	g_vk.meshes[mesh].factors[0] = metallic;
+	g_vk.meshes[mesh].factors[1] = roughness;
+	g_vk.meshes[mesh].factors[2] = emissiveScale;
+}
+
+int PsyX_Vk_CreateMesh(const PsyXModernMeshDesc* desc)
+{
+	if (!g_vk.initialised || !desc || !desc->positions || desc->vertexCount <= 0)
+		return -1;
+	if (g_vk.meshCount >= PSYX_VK_MAX_MESHES)
+		return -1;
+
+	int slot = -1;
+	for (int i = 0; i < PSYX_VK_MAX_MESHES; i++)
+	{
+		if (!g_vk.meshes[i].used)
+		{
+			slot = i;
+			break;
+		}
+	}
+	if (slot < 0)
+		return -1;
+
+	VkMesh* mesh = &g_vk.meshes[slot];
+	// The descriptor set is allocated once at initialisation; keep it across
+	// the reset.
+	const VkDescriptorSet descriptorSet = mesh->descriptorSet;
+	memset(mesh, 0, sizeof(*mesh));
+	mesh->descriptorSet = descriptorSet;
+
+	// Normalise to the pipeline's fixed vertex layout.
+	VkVertex* vertices = new VkVertex[desc->vertexCount];
+	for (int i = 0; i < desc->vertexCount; i++)
+	{
+		vertices[i].pos[0] = desc->positions[i * 3 + 0];
+		vertices[i].pos[1] = desc->positions[i * 3 + 1];
+		vertices[i].pos[2] = desc->positions[i * 3 + 2];
+
+		vertices[i].color[0] = vertices[i].color[1] = vertices[i].color[2] = vertices[i].color[3] = 1.0f;
+		if (desc->colors)
+		{
+			for (int c = 0; c < 4; c++)
+				vertices[i].color[c] = (float)desc->colors[i * 4 + c] / 255.0f;
+		}
+
+		vertices[i].normal[0] = 0.0f;
+		vertices[i].normal[1] = 1.0f;
+		vertices[i].normal[2] = 0.0f;
+		if (desc->normals)
+		{
+			vertices[i].normal[0] = desc->normals[i * 3 + 0];
+			vertices[i].normal[1] = desc->normals[i * 3 + 1];
+			vertices[i].normal[2] = desc->normals[i * 3 + 2];
+		}
+
+		vertices[i].uv[0] = 0.0f;
+		vertices[i].uv[1] = 0.0f;
+		if (desc->uvs)
+		{
+			vertices[i].uv[0] = desc->uvs[i * 2 + 0];
+			vertices[i].uv[1] = desc->uvs[i * 2 + 1];
+		}
+
+		// The base colour factor is baked into the vertex colour so the shader
+		// needs only the per-instance tint.
+		if (desc->baseColorFactor)
+		{
+			for (int c = 0; c < 4; c++)
+				vertices[i].color[c] *= desc->baseColorFactor[c];
+		}
+	}
+
+	const VkDeviceSize vertexBytes = (VkDeviceSize)desc->vertexCount * sizeof(VkVertex);
+	void* vertexMapped = NULL;
+	if (!CreateBuffer(vertexBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		&mesh->vertexBuffer, &mesh->vertexMemory, &vertexMapped))
+	{
+		delete[] vertices;
+		return -1;
+	}
+	memcpy(vertexMapped, vertices, (size_t)vertexBytes);
+	delete[] vertices;
+	mesh->vertexCount = desc->vertexCount;
+
+	if (desc->indices && desc->indexCount > 0)
+	{
+		uint32_t* indices = new uint32_t[desc->indexCount];
+		for (int i = 0; i < desc->indexCount; i++)
+			indices[i] = desc->indices[i];
+
+		const VkDeviceSize indexBytes = (VkDeviceSize)desc->indexCount * sizeof(uint32_t);
+		void* indexMapped = NULL;
+		if (!CreateBuffer(indexBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			&mesh->indexBuffer, &mesh->indexMemory, &indexMapped))
+		{
+			delete[] indices;
+			return -1;
+		}
+		memcpy(indexMapped, indices, (size_t)indexBytes);
+		delete[] indices;
+		mesh->indexCount = desc->indexCount;
+	}
+
+	// Textures are Vulkan-owned and assigned through PsyX_Vk_SetMeshTexture;
+	// the OpenGL handles in the shared descriptor are not portable.
+	for (int i = 0; i < 4; i++)
+		mesh->textureSlots[i] = -1;
+
+	mesh->factors[0] = desc->metallicFactor;
+	mesh->factors[1] = desc->roughnessFactor;
+	mesh->factors[2] = desc->emissiveFactor ? desc->emissiveFactor[0] : 0.0f;
+	if (mesh->factors[2] < 0.0f) mesh->factors[2] = 0.0f;
+
+	mesh->world[0] = mesh->world[5] = mesh->world[10] = mesh->world[15] = 1.0f;
+	mesh->color[0] = mesh->color[1] = mesh->color[2] = mesh->color[3] = 1.0f;
+	mesh->visible = 1;
+
+	mesh->used = 1;
+	g_vk.meshCount++;
+	g_vk.info.meshCount = g_vk.meshCount;
+
+	UpdateDescriptorSetForMesh(mesh);
+	return slot;
+}
+
+void PsyX_Vk_DestroyMesh(int mesh)
+{
+	if (mesh < 0 || mesh >= PSYX_VK_MAX_MESHES || !g_vk.meshes[mesh].used)
+		return;
+
+	VkMesh* m = &g_vk.meshes[mesh];
+	vkDeviceWaitIdle(g_vk.device);
+
+	if (m->vertexBuffer) vkDestroyBuffer(g_vk.device, m->vertexBuffer, NULL);
+	if (m->vertexMemory) vkFreeMemory(g_vk.device, m->vertexMemory, NULL);
+	if (m->indexBuffer) vkDestroyBuffer(g_vk.device, m->indexBuffer, NULL);
+	if (m->indexMemory) vkFreeMemory(g_vk.device, m->indexMemory, NULL);
+
+	// Textures live in the shared table; release them through
+	// PsyX_Vk_DestroyTexture so any other mesh reference is cleared too.
+
+	memset(m, 0, sizeof(*m));
+	g_vk.meshCount--;
+	g_vk.info.meshCount = g_vk.meshCount;
+}
+
+void PsyX_Vk_SetInstance(int mesh, const float worldMatrix[16], const float color[4], int visible)
+{
+	if (mesh < 0 || mesh >= PSYX_VK_MAX_MESHES || !g_vk.meshes[mesh].used)
+		return;
+
+	if (worldMatrix)
+		memcpy(g_vk.meshes[mesh].world, worldMatrix, sizeof(g_vk.meshes[mesh].world));
+	if (color)
+		memcpy(g_vk.meshes[mesh].color, color, sizeof(g_vk.meshes[mesh].color));
+	g_vk.meshes[mesh].visible = visible != 0;
+}
+
+void PsyX_Vk_SetCamera(const float view[16], const float proj[16], const float cameraPosition[3])
+{
+	if (!g_vk.uboMapped)
+		return;
+
+	if (view)
+		memcpy(g_vk.uboMapped->view, view, sizeof(g_vk.uboMapped->view));
+	if (proj)
+		memcpy(g_vk.uboMapped->proj, proj, sizeof(g_vk.uboMapped->proj));
+	if (cameraPosition)
+	{
+		g_vk.uboMapped->cameraPos[0] = cameraPosition[0];
+		g_vk.uboMapped->cameraPos[1] = cameraPosition[1];
+		g_vk.uboMapped->cameraPos[2] = cameraPosition[2];
+		g_vk.uboMapped->cameraPos[3] = 1.0f;
+	}
+}
+
+void PsyX_Vk_SetLights(const PsyXModernLightSet* lights)
+{
+	if (lights)
+		g_vk.lights = *lights;
+}
+
+void PsyX_Vk_SetOverlayText(const char* text)
+{
+	if (!text)
+	{
+		g_vk.overlayText[0] = '\0';
+		return;
+	}
+	strncpy(g_vk.overlayText, text, sizeof(g_vk.overlayText) - 1);
+	g_vk.overlayText[sizeof(g_vk.overlayText) - 1] = '\0';
+}
+
+// ---------------------------------------------------------------------------
+// Frame rendering
+
+static void UpdateSceneUbo(void)
+{
+	VkSceneUbo* ubo = g_vk.uboMapped;
+	if (!ubo)
+		return;
+
+	ubo->cameraPos[0] = ubo->cameraPos[0];
+	ubo->cameraPos[3] = 1.0f;
+
+	const float ambient = g_vk.lights.ambient[0];
+	ubo->ambientExposure[0] = g_vk.lights.ambient[0];
+	ubo->ambientExposure[1] = g_vk.lights.ambient[1];
+	ubo->ambientExposure[2] = g_vk.lights.ambient[2];
+	ubo->ambientExposure[3] = g_vk.lights.exposure > 0.0f ? g_vk.lights.exposure : 1.0f;
+	(void)ambient;
+
+	ubo->shadowParams[0] = g_vk.lights.shadowsEnabled ? 1.0f : 0.0f;
+	ubo->shadowParams[1] = 1.0f / (float)kShadowSize;
+	ubo->shadowParams[2] = 0.45f;
+	ubo->shadowParams[3] = g_vk.lights.aoEnabled ? 1.0f : 0.0f;
+
+	ubo->lightInfo[0] = (float)g_vk.lights.count;
+	ubo->lightInfo[1] = g_vk.srgbOutput ? 1.0f : 0.0f;
+
+	const float dir[3] = { 0.0f, 1.0f, 0.0f };
+	const float extent = g_vk.lights.shadowExtent > 0.0f ? g_vk.lights.shadowExtent : 4000.0f;
+
+	int lightCount = g_vk.lights.count;
+	if (lightCount < 0) lightCount = 0;
+	if (lightCount > PSYX_VK_MAX_LIGHTS) lightCount = PSYX_VK_MAX_LIGHTS;
+
+	for (int i = 0; i < PSYX_VK_MAX_LIGHTS; i++)
+	{
+		VkLightStd140* out = &ubo->lights[i];
+		memset(out, 0, sizeof(*out));
+
+		if (i >= lightCount)
+			continue;
+
+		const PsyXModernLight* light = &g_vk.lights.lights[i];
+		out->posRange[0] = light->position[0];
+		out->posRange[1] = light->position[1];
+		out->posRange[2] = light->position[2];
+		out->posRange[3] = light->range > 0.0f ? light->range : 1000.0f;
+
+		out->dirType[0] = light->direction[0];
+		out->dirType[1] = light->direction[1];
+		out->dirType[2] = light->direction[2];
+		out->dirType[3] = (float)light->type;
+
+		out->color[0] = light->color[0] * light->intensity;
+		out->color[1] = light->color[1] * light->intensity;
+		out->color[2] = light->color[2] * light->intensity;
+	}
+
+	// Shadow matrix: orthographic light volume around the shadow centre.
+	if (lightCount > 0)
+	{
+		const PsyXModernLight* sun = NULL;
+		for (int i = 0; i < lightCount; i++)
+		{
+			if (g_vk.lights.lights[i].type == 0)
+			{
+				sun = &g_vk.lights.lights[i];
+				break;
+			}
+		}
+
+		float sunDir[3] = { 0.35f, 0.8f, 0.45f };
+		if (sun)
+		{
+			sunDir[0] = sun->direction[0];
+			sunDir[1] = sun->direction[1];
+			sunDir[2] = sun->direction[2];
+		}
+		float length = sqrtf(sunDir[0] * sunDir[0] + sunDir[1] * sunDir[1] + sunDir[2] * sunDir[2]);
+		length = length > 1e-5f ? length : 1.0f;
+		sunDir[0] /= length; sunDir[1] /= length; sunDir[2] /= length;
+
+		const float* c = g_vk.lights.shadowCenter;
+		const float eye[3] = { c[0] + sunDir[0] * extent * 2.0f, c[1] + sunDir[1] * extent * 2.0f, c[2] + sunDir[2] * extent * 2.0f };
+
+		// Reuse the OpenGL path's look-at/ortho construction (column-major).
+		float f[3] = { c[0] - eye[0], c[1] - eye[1], c[2] - eye[2] };
+		float fl = sqrtf(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+		fl = fl > 1e-5f ? fl : 1.0f;
+		f[0] /= fl; f[1] /= fl; f[2] /= fl;
+
+		const int vertical = (sunDir[1] > 0.95f || sunDir[1] < -0.95f);
+		const float up[3] = { 0.0f, vertical ? 0.0f : 1.0f, vertical ? 1.0f : 0.0f };
+
+		float s[3] = { f[1] * up[2] - f[2] * up[1], f[2] * up[0] - f[0] * up[2], f[0] * up[1] - f[1] * up[0] };
+		float sl = sqrtf(s[0] * s[0] + s[1] * s[1] + s[2] * s[2]);
+		sl = sl > 1e-5f ? sl : 1.0f;
+		s[0] /= sl; s[1] /= sl; s[2] /= sl;
+
+		const float u[3] = { s[1] * f[2] - s[2] * f[1], s[2] * f[0] - s[0] * f[2], s[0] * f[1] - s[1] * f[0] };
+
+		float lightView[16];
+		lightView[0] = s[0]; lightView[4] = s[1]; lightView[8] = s[2]; lightView[12] = -(s[0] * eye[0] + s[1] * eye[1] + s[2] * eye[2]);
+		lightView[1] = u[0]; lightView[5] = u[1]; lightView[9] = u[2]; lightView[13] = -(u[0] * eye[0] + u[1] * eye[1] + u[2] * eye[2]);
+		lightView[2] = -f[0]; lightView[6] = -f[1]; lightView[10] = -f[2]; lightView[14] = (f[0] * eye[0] + f[1] * eye[1] + f[2] * eye[2]);
+		lightView[3] = 0.0f; lightView[7] = 0.0f; lightView[11] = 0.0f; lightView[15] = 1.0f;
+
+		// Orthographic projection with Vulkan's [0,1] depth convention.
+		float lightProj[16];
+		const float nearZ = 0.05f;
+		const float farZ = extent * 4.0f;
+		memset(lightProj, 0, sizeof(lightProj));
+		lightProj[0] = 2.0f / (2.0f * extent);
+		lightProj[5] = 2.0f / (2.0f * extent);
+		lightProj[10] = 1.0f / (nearZ - farZ);
+		lightProj[14] = nearZ / (nearZ - farZ);
+		lightProj[15] = 1.0f;
+
+		MulMatrix4(lightProj, lightView, ubo->shadowMatrix);
+	}
+	else
+	{
+		memset(ubo->shadowMatrix, 0, sizeof(ubo->shadowMatrix));
+	}
+	(void)dir;
+}
+
+static void UpdateDescriptorSetForMesh(VkMesh* mesh)
+{
+	VkDescriptorBufferInfo bufferInfo;
+	memset(&bufferInfo, 0, sizeof(bufferInfo));
+	bufferInfo.buffer = g_vk.uboBuffer;
+	bufferInfo.offset = 0;
+	bufferInfo.range = sizeof(VkSceneUbo);
+
+	VkDescriptorImageInfo shadowInfo;
+	memset(&shadowInfo, 0, sizeof(shadowInfo));
+	shadowInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	shadowInfo.imageView = g_vk.shadowView;
+	shadowInfo.sampler = g_vk.shadowSampler;
+
+	VkImageView defaultViews[4];
+	for (int i = 0; i < 4; i++)
+	{
+		const int dummy = g_vk.dummyTextures[i];
+		defaultViews[i] = (dummy >= 0 && g_textures[dummy].used) ? g_textures[dummy].view : VK_NULL_HANDLE;
+	}
+
+	VkDescriptorImageInfo materialInfos[4];
+	memset(materialInfos, 0, sizeof(materialInfos));
+	for (int i = 0; i < 4; i++)
+	{
+		VkImageView view = defaultViews[i];
+		const int slot = mesh->textureSlots[i];
+		if (slot >= 0 && slot < PSYX_VK_MAX_TEXTURES && g_textures[slot].used)
+			view = g_textures[slot].view;
+
+		materialInfos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		materialInfos[i].imageView = view;
+		materialInfos[i].sampler = g_vk.textureSampler;
+	}
+
+	VkWriteDescriptorSet writes[6];
+	memset(writes, 0, sizeof(writes));
+
+	writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	writes[0].dstSet = mesh->descriptorSet;
+	writes[0].dstBinding = 0;
+	writes[0].descriptorCount = 1;
+	writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	writes[0].pBufferInfo = &bufferInfo;
+
+	writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	writes[1].dstSet = mesh->descriptorSet;
+	writes[1].dstBinding = 1;
+	writes[1].descriptorCount = 1;
+	writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	writes[1].pImageInfo = &shadowInfo;
+
+	for (int i = 0; i < 4; i++)
+	{
+		writes[2 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[2 + i].dstSet = mesh->descriptorSet;
+		writes[2 + i].dstBinding = (uint32_t)(2 + i);
+		writes[2 + i].descriptorCount = 1;
+		writes[2 + i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		writes[2 + i].pImageInfo = &materialInfos[i];
+	}
+
+	vkUpdateDescriptorSets(g_vk.device, 6, writes, 0, NULL);
+}
+
+int PsyX_Vk_RenderFrame(void)
+{
+	if (!g_vk.initialised)
+		return 0;
+
+	if (g_vk.gameMode)
+	{
+		// The game owns the SDL event pump (keyboard, pad, resize, quit); the
+		// backend only has to notice a new drawable size. Consuming events here
+		// would starve the game's input handling.
+		int w = 0, h = 0;
+		SDL_Vulkan_GetDrawableSize(g_vk.window, &w, &h);
+		if (w > 0 && h > 0 && (w != g_vk.windowWidth || h != g_vk.windowHeight))
+		{
+			g_vk.windowWidth = w;
+			g_vk.windowHeight = h;
+			g_vk.resizePending = 1;
+		}
+	}
+	else
+	{
+		SDL_Event event;
+		while (SDL_PollEvent(&event))
+		{
+			if (event.type == SDL_QUIT)
+				return 0;
+			if (event.type == SDL_WINDOWEVENT)
+			{
+				if (event.window.event == SDL_WINDOWEVENT_CLOSE)
+					return 0;
+				if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
+					event.window.event == SDL_WINDOWEVENT_RESIZED)
+				{
+					int w = 0, h = 0;
+					SDL_Vulkan_GetDrawableSize(g_vk.window, &w, &h);
+					if (w > 0 && h > 0)
+					{
+						g_vk.windowWidth = w;
+						g_vk.windowHeight = h;
+						g_vk.resizePending = 1;
+					}
+				}
+			}
+
+			if (g_vk.imguiActive)
+				ImGui_ImplSDL2_ProcessEvent(&event);
+		}
+
+		// Loader-independent quit path.
+		const Uint8* keys = SDL_GetKeyboardState(NULL);
+		if (keys && keys[SDL_SCANCODE_ESCAPE])
+			return 0;
+	}
+
+	if (g_vk.resizePending)
+	{
+		g_vk.resizePending = 0;
+		vkDeviceWaitIdle(g_vk.device);
+		DestroySwapchain();
+		if (!CreateSwapchain())
+			return 1;	// try again next frame
+	}
+
+	if (!VkOk(vkWaitForFences(g_vk.device, 1, &g_vk.frameFence, VK_TRUE, UINT64_MAX), "vkWaitForFences"))
+		return 0;
+	vkResetFences(g_vk.device, 1, &g_vk.frameFence);
+
+	uint32_t imageIndex = 0;
+	VkResult acquire = vkAcquireNextImageKHR(g_vk.device, g_vk.swapchain, UINT64_MAX,
+		g_vk.imageAvailable, VK_NULL_HANDLE, &imageIndex);
+	if (acquire == VK_ERROR_OUT_OF_DATE_KHR)
+	{
+		vkDeviceWaitIdle(g_vk.device);
+		DestroySwapchain();
+		CreateSwapchain();
+		return 1;
+	}
+	if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR)
+	{
+		eprinterr("PsyX Vulkan: acquire failed (%s)\n", VkResultName(acquire));
+		return 0;
+	}
+	if (imageIndex >= g_vk.swapchainImageCount)
+		return 1;
+
+	UpdateSceneUbo();
+
+	// Command buffer.
+	vkResetCommandBuffer(g_vk.commandBuffer, 0);
+	VkCommandBufferBeginInfo begin;
+	memset(&begin, 0, sizeof(begin));
+	begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	vkBeginCommandBuffer(g_vk.commandBuffer, &begin);
+
+	// Shadow pass.
+	ImageBarrier(g_vk.commandBuffer, g_vk.shadowImage, VK_IMAGE_ASPECT_DEPTH_BIT,
+		VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+		VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+
+	VkClearValue shadowClear;
+	memset(&shadowClear, 0, sizeof(shadowClear));
+	shadowClear.depthStencil.depth = 1.0f;
+
+	VkRenderPassBeginInfo shadowBegin;
+	memset(&shadowBegin, 0, sizeof(shadowBegin));
+	shadowBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	shadowBegin.renderPass = g_vk.shadowRenderPass;
+	shadowBegin.framebuffer = g_vk.shadowFramebuffer;
+	shadowBegin.renderArea.extent.width = (uint32_t)kShadowSize;
+	shadowBegin.renderArea.extent.height = (uint32_t)kShadowSize;
+	shadowBegin.clearValueCount = 1;
+	shadowBegin.pClearValues = &shadowClear;
+
+	vkCmdBeginRenderPass(g_vk.commandBuffer, &shadowBegin, VK_SUBPASS_CONTENTS_INLINE);
+
+	VkViewport shadowViewport;
+	memset(&shadowViewport, 0, sizeof(shadowViewport));
+	shadowViewport.width = (float)kShadowSize;
+	shadowViewport.height = (float)kShadowSize;
+	shadowViewport.maxDepth = 1.0f;
+	vkCmdSetViewport(g_vk.commandBuffer, 0, 1, &shadowViewport);
+
+	VkRect2D shadowScissor;
+	memset(&shadowScissor, 0, sizeof(shadowScissor));
+	shadowScissor.extent.width = (uint32_t)kShadowSize;
+	shadowScissor.extent.height = (uint32_t)kShadowSize;
+	vkCmdSetScissor(g_vk.commandBuffer, 0, 1, &shadowScissor);
+
+	int drawCalls = 0;
+	if (g_vk.lights.shadowsEnabled)
+	{
+		vkCmdBindPipeline(g_vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.shadowPipeline);
+
+		for (int i = 0; i < PSYX_VK_MAX_MESHES; i++)
+		{
+			VkMesh* mesh = &g_vk.meshes[i];
+			if (!mesh->used || !mesh->visible || mesh->vertexCount == 0)
+				continue;
+
+			float lightWorld[16];
+			MulMatrix4(g_vk.uboMapped->shadowMatrix, mesh->world, lightWorld);
+
+			vkCmdPushConstants(g_vk.commandBuffer, g_vk.shadowPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, lightWorld);
+
+			VkDeviceSize offset = 0;
+			vkCmdBindVertexBuffers(g_vk.commandBuffer, 0, 1, &mesh->vertexBuffer, &offset);
+			if (mesh->indexCount > 0)
+			{
+				vkCmdBindIndexBuffer(g_vk.commandBuffer, mesh->indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+				vkCmdDrawIndexed(g_vk.commandBuffer, (uint32_t)mesh->indexCount, 1, 0, 0, 0);
+			}
+			else
+			{
+				vkCmdDraw(g_vk.commandBuffer, (uint32_t)mesh->vertexCount, 1, 0, 0);
+			}
+			drawCalls++;
+		}
+	}
+
+	// The render pass moves the shadow map to SHADER_READ_ONLY_OPTIMAL.
+	vkCmdEndRenderPass(g_vk.commandBuffer);
+	if (g_vk.frameIndex == 0)
+	{
+		char line[128];
+		snprintf(line, sizeof(line), "frame: shadow pass recorded draws=%d", drawCalls);
+		VkStage(line);
+	}
+
+	// Main pass. In game mode the clear colour comes from the PSX draw
+	// environment (GR_Clear), exactly like glClearColor/glClear.
+	VkClearValue clears[2];
+	memset(clears, 0, sizeof(clears));
+	if (g_vk.gameMode)
+	{
+		clears[0].color.float32[0] = g_vk.psx.clearColor[0];
+		clears[0].color.float32[1] = g_vk.psx.clearColor[1];
+		clears[0].color.float32[2] = g_vk.psx.clearColor[2];
+		clears[0].color.float32[3] = 1.0f;
+	}
+	else
+	{
+		clears[0].color.float32[0] = 0.42f;
+		clears[0].color.float32[1] = 0.58f;
+		clears[0].color.float32[2] = 0.78f;
+		clears[0].color.float32[3] = 1.0f;
+	}
+	clears[1].depthStencil.depth = 1.0f;
+
+	VkRenderPassBeginInfo mainBegin;
+	memset(&mainBegin, 0, sizeof(mainBegin));
+	mainBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	mainBegin.renderPass = g_vk.mainRenderPass;
+	mainBegin.framebuffer = g_vk.framebuffers[imageIndex];
+	mainBegin.renderArea.extent.width = (uint32_t)g_vk.width;
+	mainBegin.renderArea.extent.height = (uint32_t)g_vk.height;
+	mainBegin.clearValueCount = 2;
+	mainBegin.pClearValues = clears;
+
+	vkCmdBeginRenderPass(g_vk.commandBuffer, &mainBegin, VK_SUBPASS_CONTENTS_INLINE);
+
+	VkViewport viewport;
+	memset(&viewport, 0, sizeof(viewport));
+	viewport.width = (float)g_vk.width;
+	viewport.height = (float)g_vk.height;
+	viewport.maxDepth = 1.0f;
+	vkCmdSetViewport(g_vk.commandBuffer, 0, 1, &viewport);
+
+	VkRect2D scissor;
+	memset(&scissor, 0, sizeof(scissor));
+	scissor.extent.width = (uint32_t)g_vk.width;
+	scissor.extent.height = (uint32_t)g_vk.height;
+	vkCmdSetScissor(g_vk.commandBuffer, 0, 1, &scissor);
+
+	// The emulated PSX game image goes down first; the modern meshes and the
+	// overlay draw on top of it.
+	RecordPsxDraws();
+	drawCalls += g_vk.psx.drawCount;
+
+	vkCmdBindPipeline(g_vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.pbrPipeline);
+
+	for (int i = 0; i < PSYX_VK_MAX_MESHES; i++)
+	{
+		VkMesh* mesh = &g_vk.meshes[i];
+		if (!mesh->used || !mesh->visible || mesh->vertexCount == 0 || !mesh->descriptorSet)
+			continue;
+
+		float push[24];
+		memcpy(push, mesh->world, sizeof(mesh->world));
+		memcpy(push + 16, mesh->color, sizeof(mesh->color));
+		push[20] = mesh->factors[0];
+		push[21] = mesh->factors[1];
+		push[22] = mesh->factors[2];
+		push[23] = 0.0f;
+
+		vkCmdBindDescriptorSets(g_vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+			g_vk.pipelineLayout, 0, 1, &mesh->descriptorSet, 0, NULL);
+		vkCmdPushConstants(g_vk.commandBuffer, g_vk.pipelineLayout,
+			VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 96, push);
+
+		VkDeviceSize offset = 0;
+		vkCmdBindVertexBuffers(g_vk.commandBuffer, 0, 1, &mesh->vertexBuffer, &offset);
+		if (mesh->indexCount > 0)
+		{
+			vkCmdBindIndexBuffer(g_vk.commandBuffer, mesh->indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+			vkCmdDrawIndexed(g_vk.commandBuffer, (uint32_t)mesh->indexCount, 1, 0, 0, 0);
+		}
+		else
+		{
+			vkCmdDraw(g_vk.commandBuffer, (uint32_t)mesh->vertexCount, 1, 0, 0);
+		}
+	}
+
+	if (g_vk.frameIndex == 0)
+	{
+		char line[128];
+		snprintf(line, sizeof(line), "frame: main pass recorded draws=%d", drawCalls - g_vk.lastDrawCalls);
+		VkStage(line);
+	}
+
+	// Overlay.
+	if (g_vk.imguiActive)
+	{
+		if (g_vk.frameIndex == 0)
+			VkStage("imgui: newframe");
+		ImGui_ImplSDL2_NewFrame();
+		// The renderer hook builds the font atlas on the first frame.
+		ImGui_ImplVulkan_NewFrame();
+		ImGui::NewFrame();
+		if (g_vk.gameMode)
+		{
+			// The game contributes its own windows (the developer graphics
+			// panel) into the frame the backend owns.
+			PsyX_InvokeRenderOverlayHandler();
+		}
+		else
+		{
+			ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_Always);
+			ImGui::SetNextWindowSize(ImVec2(430, 0), ImGuiCond_Always);
+			ImGui::Begin("Vulkan fixture", NULL, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize);
+			ImGui::TextUnformatted(g_vk.overlayText);
+			ImGui::Separator();
+			ImGui::Text("API %u.%u.%u  %s", VK_VERSION_MAJOR(g_vk.apiVersion), VK_VERSION_MINOR(g_vk.apiVersion), VK_VERSION_PATCH(g_vk.apiVersion), g_vk.info.deviceName);
+			ImGui::Text("%.1f FPS  %d meshes  %d draws", g_vk.lastFps, g_vk.meshCount, drawCalls);
+			ImGui::End();
+		}
+		if (g_vk.frameIndex == 0)
+			VkStage("imgui: widgets");
+		ImGui::Render();
+		if (g_vk.frameIndex == 0)
+			VkStage("imgui: render");
+		ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), g_vk.commandBuffer, VK_NULL_HANDLE);
+		if (g_vk.frameIndex == 0)
+			VkStage("imgui: renderdrawdata");
+	}
+
+	vkCmdEndRenderPass(g_vk.commandBuffer);
+
+	// Readback copy.
+	ImageBarrier(g_vk.commandBuffer, g_vk.swapchainImages[imageIndex], VK_IMAGE_ASPECT_COLOR_BIT,
+		VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+
+	VkBufferImageCopy copy;
+	memset(&copy, 0, sizeof(copy));
+	copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	copy.imageSubresource.layerCount = 1;
+	copy.imageExtent.width = (uint32_t)g_vk.width;
+	copy.imageExtent.height = (uint32_t)g_vk.height;
+	copy.imageExtent.depth = 1;
+	vkCmdCopyImageToBuffer(g_vk.commandBuffer, g_vk.swapchainImages[imageIndex],
+		VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_vk.readbackBuffer, 1, &copy);
+
+	ImageBarrier(g_vk.commandBuffer, g_vk.swapchainImages[imageIndex], VK_IMAGE_ASPECT_COLOR_BIT,
+		VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+		VK_ACCESS_TRANSFER_READ_BIT, 0);
+
+	if (g_vk.frameIndex == 0)
+		VkStage("frame: imgui recorded");
+
+	vkEndCommandBuffer(g_vk.commandBuffer);
+
+	VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	VkSubmitInfo submit;
+	memset(&submit, 0, sizeof(submit));
+	submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	submit.waitSemaphoreCount = 1;
+	submit.pWaitSemaphores = &g_vk.imageAvailable;
+	submit.pWaitDstStageMask = &waitStage;
+	submit.commandBufferCount = 1;
+	submit.pCommandBuffers = &g_vk.commandBuffer;
+	submit.signalSemaphoreCount = 1;
+	submit.pSignalSemaphores = &g_vk.renderFinished[imageIndex];
+
+	if (!VkOk(vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.frameFence), "vkQueueSubmit"))
+		return 0;
+
+	VkPresentInfoKHR present;
+	memset(&present, 0, sizeof(present));
+	present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+	present.waitSemaphoreCount = 1;
+	present.pWaitSemaphores = &g_vk.renderFinished[imageIndex];
+	present.swapchainCount = 1;
+	present.pSwapchains = &g_vk.swapchain;
+	present.pImageIndices = &imageIndex;
+
+	VkResult presentResult = vkQueuePresentKHR(g_vk.queue, &present);
+	if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR)
+	{
+		g_vk.resizePending = 1;
+	}
+	else if (presentResult != VK_SUCCESS)
+	{
+		eprinterr("PsyX Vulkan: present failed (%s)\n", VkResultName(presentResult));
+		return 0;
+	}
+
+	if (g_vk.frameIndex == 0)
+		VkStage("frame: presented");
+
+	g_vk.lastDrawCalls = drawCalls;
+	g_vk.frameIndex++;
+	g_vk.info.drawCalls = drawCalls;
+
+	// Simple FPS counter.
+	{
+		static Uint32 lastTicks = 0;
+		Uint32 now = SDL_GetTicks();
+		if (lastTicks != 0)
+		{
+			const float delta = (float)(now - lastTicks) * 0.001f;
+			if (delta > 0.0f)
+				g_vk.lastFps = g_vk.lastFps * 0.9 + (1.0 / delta) * 0.1;
+		}
+		lastTicks = now;
+	}
+
+	return 1;
+}
+
+int PsyX_Vk_ReadbackRgba(unsigned char* rgba, int* width, int* height)
+{
+	if (!g_vk.initialised || !rgba || !g_vk.readbackMapped)
+		return 0;
+
+	vkDeviceWaitIdle(g_vk.device);
+
+	const int w = g_vk.width;
+	const int h = g_vk.height;
+	for (int y = 0; y < h; y++)
+	{
+		// Vulkan stores row 0 at the top of the presented image; keep that
+		// order so consumers (SDL surfaces, BMP writers) get a natural
+		// top-down RGBA image.
+		const unsigned char* src = g_vk.readbackMapped + (size_t)y * w * 4;
+		unsigned char* dst = rgba + (size_t)y * w * 4;
+
+		if (g_vk.swapchainFormat == VK_FORMAT_B8G8R8A8_SRGB || g_vk.swapchainFormat == VK_FORMAT_B8G8R8A8_UNORM)
+		{
+			for (int x = 0; x < w; x++)
+			{
+				dst[x * 4 + 0] = src[x * 4 + 2];
+				dst[x * 4 + 1] = src[x * 4 + 1];
+				dst[x * 4 + 2] = src[x * 4 + 0];
+				dst[x * 4 + 3] = 255;
+			}
+		}
+		else
+		{
+			for (int x = 0; x < w; x++)
+			{
+				dst[x * 4 + 0] = src[x * 4 + 0];
+				dst[x * 4 + 1] = src[x * 4 + 1];
+				dst[x * 4 + 2] = src[x * 4 + 2];
+				dst[x * 4 + 3] = 255;
+			}
+		}
+	}
+
+	if (width) *width = w;
+	if (height) *height = h;
+	return 1;
+}
+
+void PsyX_Vk_GetInfo(PsyXVkInfo* info)
+{
+	if (info)
+		*info = g_vk.info;
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+
+static int CreateInstance()
+{
+	LoadGlobalFunctions();
+	if (!vkCreateInstance)
+	{
+		eprinterr("PsyX Vulkan: vkCreateInstance not resolvable\n");
+		return 0;
+	}
+
+	uint32_t loaderVersion = VK_API_VERSION_1_0;
+	if (vkEnumerateInstanceVersion)
+		vkEnumerateInstanceVersion(&loaderVersion);
+
+	// Request the newest API the loader supports, clamped to the headers.
+	uint32_t requested = VK_API_VERSION_1_4;
+	if (loaderVersion < requested)
+		requested = loaderVersion;
+	if (requested < VK_API_VERSION_1_1)
+		requested = VK_API_VERSION_1_1;
+	g_vk.apiVersion = requested;
+
+	unsigned int extensionCount = 0;
+	if (!SDL_Vulkan_GetInstanceExtensions(g_vk.window, &extensionCount, NULL))
+	{
+		eprinterr("PsyX Vulkan: SDL_Vulkan_GetInstanceExtensions failed (%s)\n", SDL_GetError());
+		return 0;
+	}
+
+	const char* extensions[8];
+	if (extensionCount > 8)
+		extensionCount = 8;
+	SDL_Vulkan_GetInstanceExtensions(g_vk.window, &extensionCount, extensions);
+
+	const char* layerNames[1] = { "VK_LAYER_KHRONOS_validation" };
+	uint32_t layerCount = 0;
+	vkEnumerateInstanceLayerProperties(&layerCount, NULL);
+	VkLayerProperties availableLayers[64];
+	uint32_t useLayers = 0;
+	if (layerCount > 0 && layerCount <= 64)
+	{
+		vkEnumerateInstanceLayerProperties(&layerCount, availableLayers);
+		for (uint32_t i = 0; i < layerCount; i++)
+		{
+			if (strcmp(availableLayers[i].layerName, layerNames[0]) == 0)
+			{
+				useLayers = 1;
+				break;
+			}
+		}
+	}
+
+	VkApplicationInfo application;
+	memset(&application, 0, sizeof(application));
+	application.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+	application.pApplicationName = "REDRIVER2-Plus Vulkan fixture";
+	application.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
+	application.pEngineName = "PsyCross";
+	application.engineVersion = VK_MAKE_VERSION(1, 0, 0);
+	application.apiVersion = requested;
+
+	VkInstanceCreateInfo createInfo;
+	memset(&createInfo, 0, sizeof(createInfo));
+	createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+	createInfo.pApplicationInfo = &application;
+	createInfo.enabledExtensionCount = extensionCount;
+	createInfo.ppEnabledExtensionNames = extensions;
+	createInfo.enabledLayerCount = useLayers;
+	createInfo.ppEnabledLayerNames = useLayers ? layerNames : NULL;
+
+	if (!VkOk(vkCreateInstance(&createInfo, NULL, &g_vk.instance), "vkCreateInstance"))
+		return 0;
+
+	LoadInstanceFunctions();
+
+	if (useLayers)
+		eprintinfo("PsyX Vulkan: validation layer enabled\n");
+
+	return 1;
+}
+
+static int PickPhysicalDevice()
+{
+	uint32_t count = 0;
+	if (!VkOk(vkEnumeratePhysicalDevices(g_vk.instance, &count, NULL), "vkEnumeratePhysicalDevices") || count == 0)
+	{
+		eprinterr("PsyX Vulkan: no physical devices\n");
+		return 0;
+	}
+
+	VkPhysicalDevice devices[16];
+	if (count > 16)
+		count = 16;
+	vkEnumeratePhysicalDevices(g_vk.instance, &count, devices);
+
+	int best = -1;
+	int bestScore = -1;
+
+	for (uint32_t i = 0; i < count; i++)
+	{
+		VkPhysicalDeviceProperties properties;
+		vkGetPhysicalDeviceProperties(devices[i], &properties);
+
+		uint32_t familyCount = 0;
+		vkGetPhysicalDeviceQueueFamilyProperties(devices[i], &familyCount, NULL);
+		if (familyCount == 0)
+			continue;
+
+		VkQueueFamilyProperties families[32];
+		if (familyCount > 32)
+			familyCount = 32;
+		vkGetPhysicalDeviceQueueFamilyProperties(devices[i], &familyCount, families);
+
+		int graphicsFamily = -1;
+		for (uint32_t f = 0; f < familyCount; f++)
+		{
+			VkBool32 present = VK_FALSE;
+			vkGetPhysicalDeviceSurfaceSupportKHR(devices[i], f, g_vk.surface, &present);
+			if ((families[f].queueFlags & VK_QUEUE_GRAPHICS_BIT) && present)
+			{
+				graphicsFamily = (int)f;
+				break;
+			}
+		}
+		if (graphicsFamily < 0)
+			continue;
+
+		int score = (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) ? 100 : 10;
+		score += (int)(properties.apiVersion >> 22);
+
+		if (score > bestScore)
+		{
+			bestScore = score;
+			best = (int)i;
+			g_vk.queueFamily = (uint32_t)graphicsFamily;
+		}
+	}
+
+	if (best < 0)
+	{
+		eprinterr("PsyX Vulkan: no device with graphics+present queue\n");
+		return 0;
+	}
+
+	g_vk.physicalDevice = devices[best];
+	vkGetPhysicalDeviceMemoryProperties(g_vk.physicalDevice, &g_vk.memoryProperties);
+
+	VkPhysicalDeviceProperties properties;
+	vkGetPhysicalDeviceProperties(g_vk.physicalDevice, &properties);
+	strncpy(g_vk.info.deviceName, properties.deviceName, sizeof(g_vk.info.deviceName) - 1);
+
+	eprintinfo("PsyX Vulkan: device '%s' API %u.%u.%u\n", properties.deviceName,
+		VK_VERSION_MAJOR(properties.apiVersion), VK_VERSION_MINOR(properties.apiVersion), VK_VERSION_PATCH(properties.apiVersion));
+
+	return 1;
+}
+
+static int CreateDevice()
+{
+	const char* extensions[1] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+
+	float priority = 1.0f;
+	VkDeviceQueueCreateInfo queueInfo;
+	memset(&queueInfo, 0, sizeof(queueInfo));
+	queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+	queueInfo.queueFamilyIndex = g_vk.queueFamily;
+	queueInfo.queueCount = 1;
+	queueInfo.pQueuePriorities = &priority;
+
+	VkDeviceCreateInfo createInfo;
+	memset(&createInfo, 0, sizeof(createInfo));
+	createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+	createInfo.queueCreateInfoCount = 1;
+	createInfo.pQueueCreateInfos = &queueInfo;
+	createInfo.enabledExtensionCount = 1;
+	createInfo.ppEnabledExtensionNames = extensions;
+
+	if (!VkOk(vkCreateDevice(g_vk.physicalDevice, &createInfo, NULL, &g_vk.device), "vkCreateDevice"))
+		return 0;
+
+	vkGetDeviceQueue(g_vk.device, g_vk.queueFamily, 0, &g_vk.queue);
+	return 1;
+}
+
+static int CreateShadowResources(void)
+{
+	if (!CreateImage2D((uint32_t)kShadowSize, (uint32_t)kShadowSize, VK_FORMAT_D32_SFLOAT,
+		VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+		&g_vk.shadowImage, &g_vk.shadowMemory))
+		return 0;
+
+	if (!CreateImageView2D(g_vk.shadowImage, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT, &g_vk.shadowView))
+		return 0;
+
+	VkSamplerCreateInfo sampler;
+	memset(&sampler, 0, sizeof(sampler));
+	sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+	sampler.magFilter = VK_FILTER_NEAREST;
+	sampler.minFilter = VK_FILTER_NEAREST;
+	sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+	sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	sampler.maxLod = 1.0f;
+
+	if (!VkOk(vkCreateSampler(g_vk.device, &sampler, NULL, &g_vk.shadowSampler), "vkCreateSampler(shadow)"))
+		return 0;
+
+	VkFramebufferCreateInfo framebuffer;
+	memset(&framebuffer, 0, sizeof(framebuffer));
+	framebuffer.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+	framebuffer.renderPass = g_vk.shadowRenderPass;
+	framebuffer.attachmentCount = 1;
+	framebuffer.pAttachments = &g_vk.shadowView;
+	framebuffer.width = (uint32_t)kShadowSize;
+	framebuffer.height = (uint32_t)kShadowSize;
+	framebuffer.layers = 1;
+
+	if (!VkOk(vkCreateFramebuffer(g_vk.device, &framebuffer, NULL, &g_vk.shadowFramebuffer), "vkCreateFramebuffer(shadow)"))
+		return 0;
+
+	// Texture sampler for materials.
+	memset(&sampler, 0, sizeof(sampler));
+	sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+	sampler.magFilter = VK_FILTER_LINEAR;
+	sampler.minFilter = VK_FILTER_LINEAR;
+	sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+	sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+	sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+	sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+	sampler.maxLod = 1.0f;
+
+	if (!VkOk(vkCreateSampler(g_vk.device, &sampler, NULL, &g_vk.textureSampler), "vkCreateSampler(material)"))
+		return 0;
+
+	g_vk.info.shadowMapSize = kShadowSize;
+	return 1;
+}
+
+static int CreateSceneResources(void)
+{
+	if (!CreateBuffer(sizeof(VkSceneUbo), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		&g_vk.uboBuffer, &g_vk.uboMemory, (void**)&g_vk.uboMapped))
+		return 0;
+
+	memset(g_vk.uboMapped, 0, sizeof(VkSceneUbo));
+	// Identity defaults.
+	g_vk.uboMapped->view[0] = g_vk.uboMapped->view[5] = g_vk.uboMapped->view[10] = g_vk.uboMapped->view[15] = 1.0f;
+	g_vk.uboMapped->proj[0] = g_vk.uboMapped->proj[5] = g_vk.uboMapped->proj[10] = g_vk.uboMapped->proj[15] = 1.0f;
+	g_vk.uboMapped->ambientExposure[3] = 1.0f;
+	g_vk.uboMapped->lightInfo[1] = (float)(g_vk.srgbOutput ? 1 : 0);
+
+	return 1;
+}
+
+int PsyX_Vk_Initialise(const PsyXVkConfig* config)
+{
+	VkStage("initialise: enter");
+	if (g_vk.initialised)
+		return 1;
+	if (!PsyX_Vk_IsSupported())
+		return 0;
+
+	const int width = config && config->width > 0 ? config->width : 1280;
+	const int height = config && config->height > 0 ? config->height : 720;
+	const char* title = config && config->title ? config->title : "REDRIVER2 - Vulkan fixture";
+	g_vk.gameMode = (config && config->gameMode) ? 1 : 0;
+
+	if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0)
+	{
+		eprinterr("PsyX Vulkan: SDL video init failed (%s)\n", SDL_GetError());
+		return 0;
+	}
+
+	g_vk.window = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+		width, height, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_SHOWN);
+	if (!g_vk.window)
+	{
+		eprinterr("PsyX Vulkan: SDL_CreateWindow failed (%s)\n", SDL_GetError());
+		return 0;
+	}
+
+	SDL_Vulkan_GetDrawableSize(g_vk.window, &g_vk.windowWidth, &g_vk.windowHeight);
+	VkStage("initialise: window");
+
+	if (!CreateInstance())
+		return 0;
+	VkStage("initialise: instance");
+
+	if (!SDL_Vulkan_CreateSurface(g_vk.window, g_vk.instance, &g_vk.surface))
+	{
+		eprinterr("PsyX Vulkan: SDL_Vulkan_CreateSurface failed (%s)\n", SDL_GetError());
+		return 0;
+	}
+	VkStage("initialise: surface");
+
+	if (!PickPhysicalDevice())
+		return 0;
+	VkStage("initialise: physical device");
+
+	if (!CreateDevice())
+		return 0;
+	VkStage("initialise: device");
+
+	VkCommandPoolCreateInfo poolInfo;
+	memset(&poolInfo, 0, sizeof(poolInfo));
+	poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+	poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+	poolInfo.queueFamilyIndex = g_vk.queueFamily;
+	if (!VkOk(vkCreateCommandPool(g_vk.device, &poolInfo, NULL, &g_vk.commandPool), "vkCreateCommandPool"))
+		return 0;
+
+	VkCommandBufferAllocateInfo allocate;
+	memset(&allocate, 0, sizeof(allocate));
+	allocate.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	allocate.commandPool = g_vk.commandPool;
+	allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	allocate.commandBufferCount = 1;
+	if (!VkOk(vkAllocateCommandBuffers(g_vk.device, &allocate, &g_vk.commandBuffer), "vkAllocateCommandBuffers"))
+		return 0;
+
+	VkFenceCreateInfo fenceInfo;
+	memset(&fenceInfo, 0, sizeof(fenceInfo));
+	fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+	fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+	if (!VkOk(vkCreateFence(g_vk.device, &fenceInfo, NULL, &g_vk.frameFence), "vkCreateFence"))
+		return 0;
+
+	VkSemaphoreCreateInfo semaphoreInfo;
+	memset(&semaphoreInfo, 0, sizeof(semaphoreInfo));
+	semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+	if (!VkOk(vkCreateSemaphore(g_vk.device, &semaphoreInfo, NULL, &g_vk.imageAvailable), "vkCreateSemaphore"))
+		return 0;
+	for (int i = 0; i < 8; i++)
+	{
+		if (!VkOk(vkCreateSemaphore(g_vk.device, &semaphoreInfo, NULL, &g_vk.renderFinished[i]), "vkCreateSemaphore"))
+			return 0;
+	}
+
+	// Negotiate the surface format first: the main render pass declares its
+	// colour attachment with it, and a VK_FORMAT_UNDEFINED attachment
+	// silently discards every draw recorded into that pass.
+	if (!QuerySwapchainFormat())
+		return 0;
+	VkStage("initialise: surface format");
+
+	if (!CreateRenderPasses())
+		return 0;
+	VkStage("initialise: render passes");
+
+	if (!CreateShadowResources())
+		return 0;
+	VkStage("initialise: shadow resources");
+
+	if (!CreatePipelines())
+		return 0;
+	VkStage("initialise: pipelines");
+
+	// The swapchain depends on the main render pass.
+	if (!CreateSwapchain())
+		return 0;
+	VkStage("initialise: swapchain");
+
+	if (!CreateSceneResources())
+		return 0;
+	VkStage("initialise: scene resources");
+
+	if (!CreateDummyTextures())
+		return 0;
+	VkStage("initialise: dummy textures");
+
+	// The emulated PSX path is additive: the modern scene must keep working if
+	// it cannot be created, so a failure only disables that path.
+	if (CreatePsxResources())
+		VkStage("initialise: psx resources");
+	else
+	{
+		VkStage("initialise: psx resources failed");
+		g_vk.psx.failed = 1;
+		DestroyPsxResources();
+	}
+
+	// Allocate and wire one descriptor set per mesh slot.
+	VkDescriptorSetLayout layouts[PSYX_VK_MAX_MESHES];
+	for (int i = 0; i < PSYX_VK_MAX_MESHES; i++)
+		layouts[i] = g_vk.descriptorSetLayout;
+
+	VkDescriptorSetAllocateInfo setAllocate;
+	memset(&setAllocate, 0, sizeof(setAllocate));
+	setAllocate.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	setAllocate.descriptorPool = g_vk.descriptorPool;
+	setAllocate.descriptorSetCount = PSYX_VK_MAX_MESHES;
+	setAllocate.pSetLayouts = layouts;
+	VkDescriptorSet sets[PSYX_VK_MAX_MESHES];
+	if (!VkOk(vkAllocateDescriptorSets(g_vk.device, &setAllocate, sets), "vkAllocateDescriptorSets"))
+		return 0;
+	for (int i = 0; i < PSYX_VK_MAX_MESHES; i++)
+		g_vk.meshes[i].descriptorSet = sets[i];
+
+	VkStage("initialise: descriptors");
+
+	g_vk.initialised = 1;
+	g_vk.info.initialised = 1;
+	g_vk.info.width = g_vk.width;
+	g_vk.info.height = g_vk.height;
+	g_vk.info.vulkanApiVersion = (int)g_vk.apiVersion;
+	g_vk.info.imguiActive = 0;
+	VkStage("initialise: core ready");
+
+#ifdef PSYX_VK_IMGUI
+	if (!config || config->enableImGui)
+	{
+		IMGUI_CHECKVERSION();
+		ImGui::CreateContext();
+		ImGui::StyleColorsDark();
+		ImGui_ImplSDL2_InitForVulkan(g_vk.window);
+
+		// With IMGUI_IMPL_VULKAN_NO_PROTOTYPES the backend resolves every
+		// Vulkan entry point through this loader and refuses to initialise if
+		// one is missing, so log the failing name.
+		const bool functionsLoaded = ImGui_ImplVulkan_LoadFunctions(g_vk.apiVersion,
+			[](const char* functionName, void* userData) -> PFN_vkVoidFunction
+			{
+				(void)userData;
+				PFN_vkVoidFunction function = g_gipa(g_vk.instance, functionName);
+				if (!function)
+					function = g_gipa(NULL, functionName);
+				if (!function)
+				{
+					char line[192];
+					snprintf(line, sizeof(line), "imgui loader: missing %s", functionName);
+					VkStage(line);
+				}
+				return function;
+			}, NULL);
+		VkStage(functionsLoaded ? "imgui loader: ok" : "imgui loader: failed");
+
+		ImGui_ImplVulkan_InitInfo initInfo;
+		memset(&initInfo, 0, sizeof(initInfo));
+		initInfo.ApiVersion = g_vk.apiVersion;
+		initInfo.Instance = g_vk.instance;
+		initInfo.PhysicalDevice = g_vk.physicalDevice;
+		initInfo.Device = g_vk.device;
+		initInfo.QueueFamily = g_vk.queueFamily;
+		initInfo.Queue = g_vk.queue;
+		initInfo.DescriptorPoolSize = 8;
+		initInfo.RenderPass = g_vk.mainRenderPass;
+		initInfo.MinImageCount = g_vk.swapchainImageCount < 2 ? 2 : g_vk.swapchainImageCount;
+		initInfo.ImageCount = g_vk.swapchainImageCount;
+		initInfo.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+
+		if (ImGui_ImplVulkan_Init(&initInfo))
+		{
+			g_vk.imguiActive = 1;
+			g_vk.info.imguiActive = 1;
+			VkStage("initialise: imgui ready");
+		}
+		else
+		{
+			VkStage("initialise: imgui failed");
+		}
+	}
+#endif
+
+	VkStage("initialise: done");
+	return 1;
+}
+
+void PsyX_Vk_Shutdown(void)
+{
+	if (!g_vk.initialised)
+		return;
+
+	vkDeviceWaitIdle(g_vk.device);
+
+#ifdef PSYX_VK_IMGUI
+	if (g_vk.imguiActive)
+	{
+		ImGui_ImplVulkan_Shutdown();
+		ImGui_ImplSDL2_Shutdown();
+		ImGui::DestroyContext();
+		g_vk.imguiActive = 0;
+	}
+#endif
+
+	DestroyPsxResources();
+
+	for (int i = 0; i < PSYX_VK_MAX_MESHES; i++)
+	{
+		if (g_vk.meshes[i].used)
+			PsyX_Vk_DestroyMesh(i);
+	}
+
+	if (g_vk.uboBuffer) vkDestroyBuffer(g_vk.device, g_vk.uboBuffer, NULL);
+	if (g_vk.uboMemory) vkFreeMemory(g_vk.device, g_vk.uboMemory, NULL);
+
+	for (int i = 0; i < PSYX_VK_MAX_TEXTURES; i++)
+	{
+		if (!g_textures[i].used)
+			continue;
+		if (g_textures[i].view) vkDestroyImageView(g_vk.device, g_textures[i].view, NULL);
+		if (g_textures[i].image) vkDestroyImage(g_vk.device, g_textures[i].image, NULL);
+		if (g_textures[i].memory) vkFreeMemory(g_vk.device, g_textures[i].memory, NULL);
+	}
+
+	if (g_vk.textureSampler) vkDestroySampler(g_vk.device, g_vk.textureSampler, NULL);
+	if (g_vk.shadowSampler) vkDestroySampler(g_vk.device, g_vk.shadowSampler, NULL);
+	if (g_vk.shadowFramebuffer) vkDestroyFramebuffer(g_vk.device, g_vk.shadowFramebuffer, NULL);
+	if (g_vk.shadowView) vkDestroyImageView(g_vk.device, g_vk.shadowView, NULL);
+	if (g_vk.shadowImage) vkDestroyImage(g_vk.device, g_vk.shadowImage, NULL);
+	if (g_vk.shadowMemory) vkFreeMemory(g_vk.device, g_vk.shadowMemory, NULL);
+
+	if (g_vk.readbackBuffer) vkDestroyBuffer(g_vk.device, g_vk.readbackBuffer, NULL);
+	if (g_vk.readbackMemory) vkFreeMemory(g_vk.device, g_vk.readbackMemory, NULL);
+	g_vk.readbackMapped = NULL;
+
+	if (g_vk.pbrPipeline) vkDestroyPipeline(g_vk.device, g_vk.pbrPipeline, NULL);
+	if (g_vk.shadowPipeline) vkDestroyPipeline(g_vk.device, g_vk.shadowPipeline, NULL);
+	if (g_vk.pipelineLayout) vkDestroyPipelineLayout(g_vk.device, g_vk.pipelineLayout, NULL);
+	if (g_vk.shadowPipelineLayout) vkDestroyPipelineLayout(g_vk.device, g_vk.shadowPipelineLayout, NULL);
+	if (g_vk.descriptorPool) vkDestroyDescriptorPool(g_vk.device, g_vk.descriptorPool, NULL);
+	if (g_vk.descriptorSetLayout) vkDestroyDescriptorSetLayout(g_vk.device, g_vk.descriptorSetLayout, NULL);
+	if (g_vk.mainRenderPass) vkDestroyRenderPass(g_vk.device, g_vk.mainRenderPass, NULL);
+	if (g_vk.shadowRenderPass) vkDestroyRenderPass(g_vk.device, g_vk.shadowRenderPass, NULL);
+
+	DestroySwapchainResources();
+	DestroySwapchain();
+
+	if (g_vk.frameFence) vkDestroyFence(g_vk.device, g_vk.frameFence, NULL);
+	if (g_vk.imageAvailable) vkDestroySemaphore(g_vk.device, g_vk.imageAvailable, NULL);
+	for (int i = 0; i < 8; i++)
+	{
+		if (g_vk.renderFinished[i])
+			vkDestroySemaphore(g_vk.device, g_vk.renderFinished[i], NULL);
+	}
+	if (g_vk.commandPool) vkDestroyCommandPool(g_vk.device, g_vk.commandPool, NULL);
+
+	if (g_vk.device) vkDestroyDevice(g_vk.device, NULL);
+	if (g_vk.surface) vkDestroySurfaceKHR(g_vk.instance, g_vk.surface, NULL);
+	if (g_vk.instance) vkDestroyInstance(g_vk.instance, NULL);
+
+	if (g_vk.window)
+	{
+		SDL_DestroyWindow(g_vk.window);
+		g_vk.window = NULL;
+	}
+
+	memset(&g_vk, 0, sizeof(g_vk));
+	g_vk.info.initialised = 0;
+}
+
+#else // platform without Vulkan
+
+int PsyX_Vk_IsSupported(void) { return 0; }
+int PsyX_Vk_Initialise(const PsyXVkConfig* config) { (void)config; return 0; }
+void PsyX_Vk_Shutdown(void) {}
+int PsyX_Vk_CreateMesh(const PsyXModernMeshDesc* desc) { (void)desc; return -1; }
+void PsyX_Vk_DestroyMesh(int mesh) { (void)mesh; }
+void PsyX_Vk_SetInstance(int mesh, const float worldMatrix[16], const float color[4], int visible)
+{
+	(void)mesh; (void)worldMatrix; (void)color; (void)visible;
+}
+void PsyX_Vk_SetCamera(const float view[16], const float proj[16], const float cameraPosition[3])
+{
+	(void)view; (void)proj; (void)cameraPosition;
+}
+void PsyX_Vk_SetLights(const PsyXModernLightSet* lights) { (void)lights; }
+int PsyX_Vk_RenderFrame(void) { return 0; }
+int PsyX_Vk_ReadbackRgba(unsigned char* rgba, int* width, int* height)
+{
+	(void)rgba; (void)width; (void)height; return 0;
+}
+void PsyX_Vk_GetInfo(PsyXVkInfo* info) { if (info) memset(info, 0, sizeof(*info)); }
+void PsyX_Vk_SetOverlayText(const char* text) { (void)text; }
+void PsyX_Vk_GameBeginFrame(void) {}
+void PsyX_Vk_GameSetVram(const unsigned short* vram) { (void)vram; }
+void PsyX_Vk_GameSetProjection2D(const float projection[16]) { (void)projection; }
+void PsyX_Vk_GameSetProjection3D(const float projection[16]) { (void)projection; }
+void PsyX_Vk_GameUpdateVertexBuffer(const void* vertices, int vertexCount) { (void)vertices; (void)vertexCount; }
+void PsyX_Vk_GameSetBlendMode(int blendMode) { (void)blendMode; }
+void PsyX_Vk_GameSetTexture(int texFormat, int texture) { (void)texFormat; (void)texture; }
+void PsyX_Vk_GameSetOverrideTextureSize(int width, int height) { (void)width; (void)height; }
+void PsyX_Vk_GameSetOverrideAlphaMode(int mode) { (void)mode; }
+void PsyX_Vk_GameSetStencilMode(int drawPrimMode) { (void)drawPrimMode; }
+void PsyX_Vk_GameEnableDepth(int enable) { (void)enable; }
+void PsyX_Vk_GameSetBilinear(int enable) { (void)enable; }
+void PsyX_Vk_GameSetScissor(int enable, int x, int y, int width, int height)
+{
+	(void)enable; (void)x; (void)y; (void)width; (void)height;
+}
+void PsyX_Vk_GameSetViewPort(int x, int y, int width, int height) { (void)x; (void)y; (void)width; (void)height; }
+void PsyX_Vk_GameStoreFrameBuffer(int x, int y, int width, int height) { (void)x; (void)y; (void)width; (void)height; }
+void PsyX_Vk_GameClear(int x, int y, int width, int height, unsigned char r, unsigned char g, unsigned char b)
+{
+	(void)x; (void)y; (void)width; (void)height; (void)r; (void)g; (void)b;
+}
+int PsyX_Vk_GameDrawTriangles(int firstVertex, int triangles) { (void)firstVertex; (void)triangles; return 0; }
+int PsyX_Vk_GameCreateTexture(const unsigned char* rgba, int width, int height, int mipmapped)
+{
+	(void)rgba; (void)width; (void)height; (void)mipmapped;
+	return 0;
+}
+void PsyX_Vk_GameDestroyTexture(int texture) { (void)texture; }
+void PsyX_Vk_GameEndFrame(void) {}
+void PsyX_Vk_GameResetDevice(void) {}
+int PsyX_Vk_GameIsActive(void) { return 0; }
+SDL_Window* PsyX_Vk_GetSDLWindow(void) { return NULL; }
+int PsyX_Vk_GameSelfTest(char* report, int reportSize)
+{
+	if (report && reportSize > 0)
+		report[0] = 0;
+	return 0;
+}
+
+#endif // platform without Vulkan

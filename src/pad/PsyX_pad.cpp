@@ -198,7 +198,7 @@ void PsyX_Pad_InternalPadUpdates()
 	if (g_padCommEnable == 0)
 		return;
 
-	kbInputs = PsyX_Pad_UpdateKeyboardInput();
+	kbInputs = (g_cfg_inputCapture & PSYX_INPUT_CAPTURE_KEYBOARD) ? 0xffff : PsyX_Pad_UpdateKeyboardInput();
 
 	for (int i = 0; i < MAX_CONTROLLERS; i++)
 	{
@@ -208,7 +208,9 @@ void PsyX_Pad_InternalPadUpdates()
 		{
 			pad = (LPPADRAW)controller->padData;
 
-			PsyX_Pad_UpdateGameControllerInput(controller->gc, pad);
+			PsyX_Pad_UpdateGameControllerInput(
+				(g_cfg_inputCapture & PSYX_INPUT_CAPTURE_GAMEPAD) ? NULL : controller->gc,
+				pad);
 
 			ushort test = *(u_short*)pad->buttons;
 

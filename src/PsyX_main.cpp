@@ -23,6 +23,7 @@
 #include <SDL.h>
 
 #include "PsyX/PsyX_render.h"
+#include "PsyX/PsyX_vk.h"
 
 #ifdef _WIN32
 #include <pla.h>
@@ -45,10 +46,26 @@ int g_enableSwapInterval = 1;
 int g_skipSwapInterval = 0;
 timerCtx_t g_vblTimer;
 
+static int g_renderBackend = PSYX_BACKEND_OPENGL;
+
+void PsyX_SetRenderBackend(int backend)
+{
+	g_renderBackend = backend;
+}
+
+int PsyX_GetRenderBackend(void)
+{
+	return g_renderBackend;
+}
+
 int							g_cfg_swapInterval = 0;
 PsyXKeyboardMapping			g_cfg_keyboardMapping;
 PsyXControllerMapping		g_cfg_controllerMapping;
 GameOnTextInputHandler		g_cfg_gameOnTextInput = NULL;
+PsyXSDLEventHandlerFunc		g_cfg_sdlEventHandler = NULL;
+PsyXRenderOverlayHandlerFunc	g_cfg_renderOverlayHandler = NULL;
+int							g_cfg_inputCapture = 0;
+int							g_cfg_overrideProportionalAlpha = 0;
 
 GameDebugKeysHandlerFunc	g_dbg_gameDebugKeys = NULL;
 GameDebugMouseHandlerFunc	g_dbg_gameDebugMouse = NULL;
@@ -630,7 +647,41 @@ void PsyX_Initialise(char* appName, int width, int height, int fullscreen)
 		return;
 	}
 	
-	if (!GR_InitialiseRender(windowNameStr, width, height, fullscreen))
+	if (g_renderBackend == PSYX_BACKEND_VULKAN)
+	{
+		// The Vulkan backend owns the window, the swapchain and the ImGui
+		// context. The GL renderer is not initialised at all, so the GR_*
+		// calls made by the game are redirected by PsyX_render.cpp.
+		PsyXVkConfig vkConfig;
+		memset(&vkConfig, 0, sizeof(vkConfig));
+		vkConfig.width = width;
+		vkConfig.height = height;
+		vkConfig.title = windowNameStr;
+		vkConfig.enableImGui = 1;
+		vkConfig.gameMode = 1;
+
+		if (!PsyX_Vk_Initialise(&vkConfig))
+		{
+			// No Vulkan loader/device: keep the game running on OpenGL rather
+			// than refusing to start.
+			eprintwarn("Vulkan backend unavailable, falling back to OpenGL\n");
+			PsyX_SetRenderBackend(PSYX_BACKEND_OPENGL);
+		}
+		else
+		{
+			// Input, screenshots and the developer panel all go through this
+			// window.
+			g_window = PsyX_Vk_GetSDLWindow();
+
+			// GR_InitialiseRender normally publishes the window size; the
+			// projection, viewport and scissor maths all read it, so a 0x0
+			// window would produce NaN matrices and draw nothing.
+			if (g_window)
+				SDL_GetWindowSize(g_window, &g_windowWidth, &g_windowHeight);
+		}
+	}
+
+	if (g_renderBackend != PSYX_BACKEND_VULKAN && !GR_InitialiseRender(windowNameStr, width, height, fullscreen))
 	{
 		eprinterr("Failed to Intialise Window\n");
 		PsyX_Shutdown();
@@ -644,7 +695,7 @@ void PsyX_Initialise(char* appName, int width, int height, int fullscreen)
 		return;
 	}
 
-	if (!GR_InitialisePSX())
+	if (g_renderBackend != PSYX_BACKEND_VULKAN && !GR_InitialisePSX())
 	{
 		eprinterr("Failed to Intialise PSX.\n");
 		PsyX_Shutdown();
@@ -663,6 +714,32 @@ void PsyX_Initialise(char* appName, int width, int height, int fullscreen)
 void PsyX_GetScreenSize(int* screenWidth, int* screenHeight)
 {
 	SDL_GetWindowSize(g_window, screenWidth, screenHeight);
+}
+
+SDL_Window* PsyX_GetSDLWindow(void)
+{
+	return g_window;
+}
+
+void PsyX_SetSDLEventHandler(PsyXSDLEventHandlerFunc handler)
+{
+	g_cfg_sdlEventHandler = handler;
+}
+
+void PsyX_InvokeRenderOverlayHandler(void)
+{
+	if (g_cfg_renderOverlayHandler)
+		g_cfg_renderOverlayHandler();
+}
+
+void PsyX_SetRenderOverlayHandler(PsyXRenderOverlayHandlerFunc handler)
+{
+	g_cfg_renderOverlayHandler = handler;
+}
+
+void PsyX_SetInputCapture(int captureFlags)
+{
+	g_cfg_inputCapture = captureFlags;
 }
 
 void PsyX_SetCursorPosition(int x, int y)
@@ -688,6 +765,8 @@ void PsyX_Sys_DoPollEvent()
 	SDL_Event event;
 	while (SDL_PollEvent(&event))
 	{
+		const int eventConsumed = g_cfg_sdlEventHandler && g_cfg_sdlEventHandler(&event);
+
 		switch (event.type)
 		{
 			case SDL_CONTROLLERDEVICEADDED:
@@ -713,13 +792,16 @@ void PsyX_Sys_DoPollEvent()
 				}
 				break;
 			case SDL_MOUSEMOTION:
-
-				PsyX_Sys_DoDebugMouseMotion(event.motion.x, event.motion.y, event.motion.xrel, event.motion.yrel);
+				if (!eventConsumed)
+					PsyX_Sys_DoDebugMouseMotion(event.motion.x, event.motion.y, event.motion.xrel, event.motion.yrel);
 				break;
 			case SDL_KEYDOWN:
 			case SDL_KEYUP:
 			{
 				int nKey = event.key.keysym.scancode;
+
+				if (eventConsumed)
+					break;
 
 				if (nKey == SDL_SCANCODE_RALT)
 				{
@@ -757,7 +839,7 @@ void PsyX_Sys_DoPollEvent()
 			}
 			case SDL_TEXTINPUT:
 			{
-				if(g_cfg_gameOnTextInput)
+				if(!eventConsumed && g_cfg_gameOnTextInput)
 					(g_cfg_gameOnTextInput)(event.text.text);
 				break;
 			}			
@@ -801,6 +883,7 @@ char PsyX_BeginScene()
 	}
 
 	GR_BeginScene();
+	PsyX_ResetRenderStats();
 
 	if (activeDrawEnv.isbg)
 	{
@@ -839,7 +922,20 @@ void PsyX_EndScene()
 	
 	GR_StoreFrameBuffer(activeDispEnv.disp.x, activeDispEnv.disp.y, activeDispEnv.disp.w, activeDispEnv.disp.h);
 
-	GR_SwapWindow();
+	if (g_renderBackend == PSYX_BACKEND_VULKAN)
+	{
+		// The overlay is contributed inside the Vulkan frame, between
+		// ImGui::NewFrame and ImGui::Render, and GR_SwapWindow submits and
+		// presents that frame.
+		GR_SwapWindow();
+	}
+	else
+	{
+		if (g_cfg_renderOverlayHandler)
+			g_cfg_renderOverlayHandler();
+
+		GR_SwapWindow();
+	}
 	
 	SDL_Delay(0);
 }
@@ -847,18 +943,46 @@ void PsyX_EndScene()
 #if !defined(__EMSCRIPTEN__) && !defined(__ANDROID__)
 void PsyX_TakeScreenshot()
 {
-	u_char* pixels = (u_char*)malloc(g_windowWidth * g_windowHeight * 4);
-	
+	const int width = g_windowWidth;
+	const int height = g_windowHeight;
+	const int stride = width * 4;
+
+	if (width <= 0 || height <= 0)
+		return;
+
+	u_char* pixels = (u_char*)malloc((size_t)stride * height);
+	if (!pixels)
+		return;
+
 #if defined(RENDERER_OGL)
-	glReadPixels(0, 0, g_windowWidth, g_windowHeight, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
+	glReadPixels(0, 0, width, height, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
 #elif defined(RENDERER_OGLES)
-	glReadPixels(0, 0, g_windowWidth, g_windowHeight, GL_RGBA, GL_UNSIGNED_BYTE, pixels);	// FIXME: is that correct format?
+	glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);	// FIXME: is that correct format?
 #endif
 
-	SDL_Surface* surface = SDL_CreateRGBSurfaceFrom(pixels, g_windowWidth, g_windowHeight, 8 * 4, g_windowWidth * 4, 0, 0, 0, 0);
+	// glReadPixels returns bottom-up rows; SDL_SaveBMP expects top-down.
+	u_char* swapRow = (u_char*)malloc(stride);
+	if (swapRow)
+	{
+		for (int y = 0; y < height / 2; ++y)
+		{
+			u_char* top = pixels + (size_t)y * stride;
+			u_char* bottom = pixels + (size_t)(height - 1 - y) * stride;
+			memcpy(swapRow, top, stride);
+			memcpy(top, bottom, stride);
+			memcpy(bottom, swapRow, stride);
+		}
 
-	SDL_SaveBMP(surface, "SCREENSHOT.BMP");
-	SDL_FreeSurface(surface);
+		free(swapRow);
+	}
+
+	SDL_Surface* surface = SDL_CreateRGBSurfaceFrom(pixels, width, height, 8 * 4, stride, 0, 0, 0, 0);
+
+	if (surface)
+	{
+		SDL_SaveBMP(surface, "SCREENSHOT.BMP");
+		SDL_FreeSurface(surface);
+	}
 
 	free(pixels);
 }
@@ -1027,10 +1151,20 @@ void PsyX_Shutdown()
 		SDL_DestroyMutex(g_intrMutex);
 	}
 
-	SDL_DestroyWindow(g_window);
-	g_window = NULL;
+	if (g_renderBackend == PSYX_BACKEND_VULKAN)
+	{
+		// The Vulkan backend destroys the window it created.
+		PsyX_Vk_Shutdown();
+		g_window = NULL;
+	}
+	else
+	{
+		SDL_DestroyWindow(g_window);
+		g_window = NULL;
 
-	GR_Shutdown();
+		GR_Shutdown();
+	}
+
 	SDL_QuitSubSystem(SDL_INIT_GAMECONTROLLER);
 
 	SDL_Quit();

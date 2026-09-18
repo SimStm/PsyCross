@@ -166,6 +166,12 @@ void pure_call_handler()
 
 void InstallExceptionHandler()
 {
+	// Under a debugger the minidump dialog would swallow the first-chance
+	// exception and hide the failing call stack, so leave the default handler
+	// in place and let the debugger break.
+	if (IsDebuggerPresent())
+		return;
+
 	oldHandler = SetUnhandledExceptionFilter(unhandled_handler);
 
 	oldPureCall = _get_purecall_handler();

@@ -189,6 +189,7 @@ extern void			GR_UpdateVRAM();
 extern void			GR_ReadFramebufferDataToVRAM();
 
 extern TextureID	GR_CreateRGBATexture(int width, int height, u_char* data /*= nullptr*/);
+extern TextureID	GR_CreateRGBATextureMipmapped(int width, int height, u_char* data /*= nullptr*/);
 extern ShaderID		GR_Shader_Compile(const char* source, int isPsxShader);
 
 extern void			GR_SetShader(const ShaderID shader);
@@ -205,6 +206,9 @@ extern void			GR_SetupClipMode(const RECT16* clipRect, int enable);
 extern void			GR_SetViewPort(int x, int y, int width, int height);
 extern void			GR_SetTexture(TextureID texture, TexFormat texFormat);
 extern void			GR_SetOverrideTextureSize(int width, int height);
+/* Override alpha policy for the current draw: 0 = not an override, 1 = binary
+   0.5 cutout (compatibility), 2 = proportional (only alpha 0 is a hole). */
+extern void			GR_SetOverrideAlphaMode(int mode);
 extern void			GR_SetWireframe(int enable);
 
 extern void			GR_DestroyTexture(TextureID texture);

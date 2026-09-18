@@ -22,6 +22,8 @@ extern int g_GPUDisabledState;
 
 void ClearSplits();
 void DrawAllSplits();
+void PsyX_ResetRenderStats();
+void PsyX_RecordRenderStats();
 
 extern void ParsePrimitivesLinkedList(u_long* p, int singlePrimitive);
 
