@@ -144,10 +144,21 @@ void PsyX_Vk_GameSetViewPort(int x, int y, int width, int height);
 /* Clears the presented image (PSX framebuffer clear). */
 void PsyX_Vk_GameClear(int x, int y, int width, int height, unsigned char r, unsigned char g, unsigned char b);
 
-/* Records the back-buffer -> VRAM screen-area blit rectangle. The GPU readback
-   itself is not ported yet; the rect is kept so the copy can be added later
-   without changing the GR_* layer. */
+/* Records the back-buffer -> VRAM screen-area blit rectangle (GR_StoreFrameBuffer).
+   The copy itself runs once the frame has been presented, when the renderer
+   consumes it through PsyX_Vk_TakeStoredFrameBuffer. */
 void PsyX_Vk_GameStoreFrameBuffer(int x, int y, int width, int height);
+
+/* Consumes a pending PsyX_Vk_GameStoreFrameBuffer request after the presented
+   frame is available. On success it returns 1 and fills:
+     - rgba: pointer into the backend-owned readback buffer, valid until the
+       next frame is submitted (top-left origin, `stride` bytes per row);
+     - stride/srcWidth/srcHeight: the presented image layout;
+     - bgra: 1 when the byte order is B,G,R,A (B8G8R8A8), 0 for R,G,B,A;
+     - x/y/width/height: the PSX VRAM destination rectangle.
+   Returns 0 when nothing is pending or the readback is unavailable. */
+int  PsyX_Vk_TakeStoredFrameBuffer(const unsigned char** rgba, int* stride,
+	int* srcWidth, int* srcHeight, int* bgra, int* x, int* y, int* width, int* height);
 
 /* Queues a triangle list drawing `triangles` triangles from the uploaded
    vertex buffer, starting at vertex `firstVertex`. Returns queued triangles. */

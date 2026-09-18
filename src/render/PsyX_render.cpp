@@ -498,6 +498,7 @@ void GR_BeginScene()
 	if (GR_UseVulkan())
 	{
 		PsyX_Vk_GameBeginFrame();
+		GR_VkMirrorFrameToVRAM();
 		GR_UpdateVRAM();
 		GR_SetViewPort(0, 0, g_windowWidth, g_windowHeight);
 		return;
@@ -1692,6 +1693,66 @@ void GR_ReadFramebufferDataToVRAM()
 #endif
 }
 
+// The Vulkan backend presents into its swapchain, so the on-screen image lives
+// outside VRAM. Mirror the last presented frame back into the PSX VRAM portrait
+// at the display rect - the equivalent of the GL StoreFrameBuffer/readback pair -
+// so VRAM consumers such as the lens flare's DR_MOVE/StoreImage sample the
+// frame. Called at the start of a scene, once the presented frame's fence has
+// been waited.
+void GR_VkMirrorFrameToVRAM()
+{
+	const unsigned char* rgba = NULL;
+	int stride = 0, srcWidth = 0, srcHeight = 0, bgra = 0;
+	int x = 0, y = 0, w = 0, h = 0;
+
+	if (!PsyX_Vk_TakeStoredFrameBuffer(&rgba, &stride, &srcWidth, &srcHeight, &bgra, &x, &y, &w, &h))
+		return;
+
+	if (!rgba || stride <= 0 || srcWidth <= 0 || srcHeight <= 0 || w <= 0 || h <= 0)
+		return;
+
+	// The destination is always inside the PSX portrait; guard anyway so a bad
+	// display rect can never scribble outside the CPU VRAM mirror.
+	if (x < 0 || y < 0 || x + w > VRAM_WIDTH || y + h > VRAM_HEIGHT)
+		return;
+
+	{
+		static int reported = 0;
+		if (!reported)
+		{
+			reported = 1;
+			eprintinfo("Vulkan frame mirror: %dx%d -> VRAM %d,%d %dx%d bgra=%d\n",
+				srcWidth, srcHeight, x, y, w, h, bgra);
+		}
+	}
+
+	for (int row = 0; row < h; row++)
+	{
+		// The presented image covers the whole window, so scale it onto the PSX
+		// display rect (GR_StoreFrameBuffer receives the PSX display size).
+		const unsigned char* src = rgba + (size_t)(row * srcHeight / h) * stride;
+		unsigned short* dst = vram + (size_t)(y + row) * VRAM_WIDTH + x;
+
+		for (int col = 0; col < w; col++)
+		{
+			const unsigned char* texel = src + (size_t)(col * srcWidth / w) * 4;
+
+			const int c0 = texel[0];
+			const int c1 = texel[1];
+			const int c2 = texel[2];
+			const int r = bgra ? c2 : c0;
+			const int g = c1;
+			const int b = bgra ? c0 : c2;
+			const int a = (r == 0 && g == 0 && b == 0) ? 0 : 1;
+
+			dst[col] = (unsigned short)(((r >> 3) & 0x1F) | (((g >> 3) & 0x1F) << 5) |
+				(((b >> 3) & 0x1F) << 10) | (a << 15));
+		}
+	}
+
+	vram_need_update = 1;
+}
+
 void GR_SetScissorState(int enable)
 {
 	if (GR_UseVulkan())
@@ -1829,10 +1890,9 @@ void GR_StoreFrameBuffer(int x, int y, int w, int h)
 {
 	if (GR_UseVulkan())
 	{
-		// The back buffer -> VRAM screen-area copy is a GPU readback and is not
-		// ported yet (mirrors and other framebuffer-as-texture effects will be
-		// stale). The rect is remembered so the copy can be added without
-		// touching the game side.
+		// Vulkan captures the frame from its presented swapchain instead of the
+		// default framebuffer; the rect is queued and consumed by
+		// GR_VkMirrorFrameToVRAM at the start of the next scene.
 		PsyX_Vk_GameStoreFrameBuffer(x, y, w, h);
 		return;
 	}

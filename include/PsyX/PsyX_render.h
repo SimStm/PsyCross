@@ -188,6 +188,11 @@ extern void			GR_StoreFrameBuffer(int x, int y, int w, int h);
 extern void			GR_UpdateVRAM();
 extern void			GR_ReadFramebufferDataToVRAM();
 
+// Vulkan presents into its own swapchain, so the on-screen image lives outside
+// VRAM. This mirrors the last presented frame back into the PSX VRAM portrait
+// at the display rect, the equivalent of the GL StoreFrameBuffer/readback pair.
+extern void			GR_VkMirrorFrameToVRAM();
+
 extern TextureID	GR_CreateRGBATexture(int width, int height, u_char* data /*= nullptr*/);
 extern TextureID	GR_CreateRGBATextureMipmapped(int width, int height, u_char* data /*= nullptr*/);
 extern ShaderID		GR_Shader_Compile(const char* source, int isPsxShader);

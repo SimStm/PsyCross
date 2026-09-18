@@ -320,11 +320,10 @@ typedef struct
 	int clearRequested;
 	float clearColor[3];
 
-	// Pending back-buffer -> VRAM blit rect (GR_StoreFrameBuffer). The readback
-	// itself is not ported yet; the rect is recorded so it can be added.
+	// Pending back-buffer -> VRAM blit rect (GR_StoreFrameBuffer). Consumed
+	// through PsyX_Vk_TakeStoredFrameBuffer once the presented frame is done.
 	int frameBufferRect[4];
 	int frameBufferPending;
-	int frameBufferWarned;
 
 	VkDescriptorSet dummySet;	// white texture, used by 4/8/16-bit draws
 	VkPsxTexture textures[PSYX_VK_PSX_MAX_TEXTURES];
@@ -2032,12 +2031,31 @@ void PsyX_Vk_GameStoreFrameBuffer(int x, int y, int width, int height)
 	psx->frameBufferRect[2] = width;
 	psx->frameBufferRect[3] = height;
 	psx->frameBufferPending = 1;
+}
 
-	if (!psx->frameBufferWarned)
-	{
-		psx->frameBufferWarned = 1;
-		eprintwarn("PsyX Vulkan: GR_StoreFrameBuffer readback not ported yet (framebuffer textures stay stale)\n");
-	}
+int PsyX_Vk_TakeStoredFrameBuffer(const unsigned char** rgba, int* stride,
+	int* srcWidth, int* srcHeight, int* bgra, int* x, int* y, int* width, int* height)
+{
+	VkPsxState* psx = &g_vk.psx;
+	if (!g_vk.initialised || !psx->frameBufferPending || !g_vk.readbackMapped)
+		return 0;
+
+	// The readback buffer was filled when the previous frame was submitted; the
+	// fence was waited at the start of this frame, so the pixels are complete.
+	psx->frameBufferPending = 0;
+
+	if (rgba) *rgba = g_vk.readbackMapped;
+	if (stride) *stride = g_vk.width * 4;
+	if (srcWidth) *srcWidth = g_vk.width;
+	if (srcHeight) *srcHeight = g_vk.height;
+	if (bgra)
+		*bgra = (g_vk.swapchainFormat == VK_FORMAT_B8G8R8A8_SRGB ||
+				 g_vk.swapchainFormat == VK_FORMAT_B8G8R8A8_UNORM) ? 1 : 0;
+	if (x) *x = psx->frameBufferRect[0];
+	if (y) *y = psx->frameBufferRect[1];
+	if (width) *width = psx->frameBufferRect[2];
+	if (height) *height = psx->frameBufferRect[3];
+	return 1;
 }
 
 void PsyX_Vk_GameClear(int x, int y, int width, int height, unsigned char r, unsigned char g, unsigned char b)
@@ -4124,6 +4142,13 @@ void PsyX_Vk_GameSetScissor(int enable, int x, int y, int width, int height)
 }
 void PsyX_Vk_GameSetViewPort(int x, int y, int width, int height) { (void)x; (void)y; (void)width; (void)height; }
 void PsyX_Vk_GameStoreFrameBuffer(int x, int y, int width, int height) { (void)x; (void)y; (void)width; (void)height; }
+int PsyX_Vk_TakeStoredFrameBuffer(const unsigned char** rgba, int* stride,
+	int* srcWidth, int* srcHeight, int* bgra, int* x, int* y, int* width, int* height)
+{
+	(void)rgba; (void)stride; (void)srcWidth; (void)srcHeight; (void)bgra;
+	(void)x; (void)y; (void)width; (void)height;
+	return 0;
+}
 void PsyX_Vk_GameClear(int x, int y, int width, int height, unsigned char r, unsigned char g, unsigned char b)
 {
 	(void)x; (void)y; (void)width; (void)height; (void)r; (void)g; (void)b;
