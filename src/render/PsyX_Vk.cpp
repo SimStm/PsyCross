@@ -1141,6 +1141,27 @@ static void DestroySwapchain(void)
 	}
 }
 
+// Full swapchain recreation for a resize or an out-of-date acquire/present.
+// DestroySwapchainResources() must run first: recreating the framebuffers while
+// the previous ones still reference the old swapchain views and depth image
+// leaks both and leaves dangling attachments. The device is idle before any of
+// it so nothing in flight still uses the images being released.
+static int RecreateSwapchain(void)
+{
+	vkDeviceWaitIdle(g_vk.device);
+	DestroySwapchainResources();
+	DestroySwapchain();
+	const int ok = CreateSwapchain();
+	if (ok)
+	{
+		char line[128];
+		snprintf(line, sizeof(line), "swapchain recreated %dx%d images=%d",
+			g_vk.width, g_vk.height, g_vk.swapchainImageCount);
+		VkStage(line);
+	}
+	return ok;
+}
+
 // ---------------------------------------------------------------------------
 // Pipelines and descriptors
 
@@ -3807,9 +3828,7 @@ int PsyX_Vk_RenderFrame(void)
 	if (g_vk.resizePending)
 	{
 		g_vk.resizePending = 0;
-		vkDeviceWaitIdle(g_vk.device);
-		DestroySwapchain();
-		if (!CreateSwapchain())
+		if (!RecreateSwapchain())
 			return 1;	// try again next frame
 	}
 
@@ -3822,9 +3841,7 @@ int PsyX_Vk_RenderFrame(void)
 		g_vk.imageAvailable, VK_NULL_HANDLE, &imageIndex);
 	if (acquire == VK_ERROR_OUT_OF_DATE_KHR)
 	{
-		vkDeviceWaitIdle(g_vk.device);
-		DestroySwapchain();
-		CreateSwapchain();
+		RecreateSwapchain();
 		return 1;
 	}
 	if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR)
