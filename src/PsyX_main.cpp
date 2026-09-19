@@ -1007,6 +1007,32 @@ void PsyX_TakeScreenshot()
 	if (!pixels)
 		return;
 
+	if (g_renderBackend == PSYX_BACKEND_VULKAN)
+	{
+		// The Vulkan readback already returns top-down RGBA (BGRA swapped),
+		// so the rows must not be flipped again and the surface needs the
+		// matching channel masks.
+		int readWidth = 0;
+		int readHeight = 0;
+		if (!PsyX_Vk_ReadbackRgba(pixels, &readWidth, &readHeight))
+		{
+			free(pixels);
+			return;
+		}
+
+		SDL_Surface* vkSurface = SDL_CreateRGBSurfaceFrom(pixels, readWidth, readHeight, 8 * 4, readWidth * 4,
+			0x000000FF, 0x0000FF00, 0x00FF0000, 0xFF000000);
+
+		if (vkSurface)
+		{
+			SDL_SaveBMP(vkSurface, "SCREENSHOT.BMP");
+			SDL_FreeSurface(vkSurface);
+		}
+
+		free(pixels);
+		return;
+	}
+
 #if defined(RENDERER_OGL)
 	glReadPixels(0, 0, width, height, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
 #elif defined(RENDERER_OGLES)
