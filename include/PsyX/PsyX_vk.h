@@ -119,6 +119,11 @@ void PsyX_Vk_GameBeginFrame(void);
 /* Replaces the whole CPU VRAM mirror (1024x512 little-endian 16-bit PSX
    pixels, row stride PSYX_VK_VRAM_WIDTH) and re-uploads it to the GPU. */
 void PsyX_Vk_GameSetVram(const unsigned short* vram);
+// Queues one VRAM rectangle for replay inside the deferred draw list, ordered
+// against the draws that follow it. Used by the DS_LoadImage path, which the
+// overhead map uses to stream tiles through a few VRAM slots every frame.
+void PsyX_Vk_GameCopyVRAM(const unsigned short* src, int srcStride,
+	int x, int y, int w, int h, int dstX, int dstY);
 
 /* Column-major matrices identical to GR_Ortho2D / GR_Perspective3D. */
 void PsyX_Vk_GameSetProjection2D(const float projection[16]);

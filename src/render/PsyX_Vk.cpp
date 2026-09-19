@@ -286,12 +286,19 @@ typedef char VkPsxVertexLayoutCheck[(sizeof(VkPsxVertex) == 44) ? 1 : -1];
 #define PSYX_VK_PSX_MAX_DRAWS 4096
 #define PSYX_VK_PSX_BLEND_COUNT 5
 #define PSYX_VK_PSX_VRAM_BYTES (PSYX_VK_VRAM_WIDTH * PSYX_VK_VRAM_HEIGHT * 8)
-// The game uploads the whole frame's vertex list once per frame, exactly like
-// the OpenGL path. Keep the same 65536-vertex ceiling (MAX_VERTEX_BUFFER_SIZE)
-// so no geometry is dropped; 44 is sizeof(VkPsxVertex) (asserted below).
+// MAX_VERTEX_BUFFER_SIZE (65536) bounds one flush, as it does in OpenGL; the
+// Vulkan backend keeps several flushes so a deferred frame can still read the
+// vertices of every earlier flush. 44 is sizeof(VkPsxVertex) (asserted below).
 #define PSYX_VK_PSX_MAX_VERTICES 65536
-#define PSYX_VK_PSX_VERTEX_CAPACITY (PSYX_VK_PSX_MAX_VERTICES * 44)
+#define PSYX_VK_PSX_VERTEX_FLUSHES 4
+#define PSYX_VK_PSX_VERTEX_CAPACITY (PSYX_VK_PSX_MAX_VERTICES * PSYX_VK_PSX_VERTEX_FLUSHES * 44)
 #define PSYX_VK_PSX_MAX_TEXTURES 512
+// The game rewrites VRAM between draw flushes (the overhead map streams tiles
+// through sixteen VRAM slots every frame). The draws are recorded at frame end,
+// so those writes are replayed in order instead of uploading the memory once;
+// without that, every tile samples the last batch's slot contents.
+#define PSYX_VK_PSX_MAX_VRAM_UPLOADS 8192
+#define PSYX_VK_PSX_VRAM_UPLOAD_BYTES (8 * 1024 * 1024)
 // GR_SetOffscreenState groups per frame (the game reaches for a render-to-VRAM
 // target from DR_ENV dfe=0 draws such as the Tanner shadow).
 #define PSYX_VK_PSX_MAX_OFFSCREEN_GROUPS 16
@@ -314,7 +321,19 @@ typedef struct
 	int offscreen;			// queued while GR_SetOffscreenState(enable=1)
 	int stencilMode;		// 1 = PSX mask-bit set, 0 = mask-bit test
 	int srgbEncode;			// 1 when this draw targets an sRGB attachment
+	uint32_t vramGeneration;	// VRAM writes visible to this draw
 } VkPsxDraw;
+
+// One VRAM rectangle rewritten between draw flushes. `generation` orders the
+// write against the deferred draws: a draw sees every write with a smaller
+// generation. The pixels are RG32F in `vramUploadStaging`, matching the VRAM
+// image, so the replay is a plain buffer-to-image copy.
+typedef struct
+{
+	uint32_t generation;
+	int x, y, w, h;
+	VkDeviceSize offset;
+} VkPsxVramUpload;
 
 // One GR_SetOffscreenState(enable=1 .. enable=0) run: the PSX draws render into
 // an offscreen image and are copied back into VRAM at `rect`. The projection
@@ -407,6 +426,24 @@ typedef struct
 	VkDeviceSize vertexCapacity;
 	VkDeviceSize vertexSize;
 	uint32_t vertexCount;
+	// The game flushes more than once in some frames (the overhead map's
+	// 16-tile batches, for one), and the Vulkan draws are recorded at frame
+	// end. Each flush therefore has to keep its vertices, so uploads append
+	// and every draw is offset by the base of the upload it came from.
+	uint32_t vertexUploadBase;	// first vertex of the most recent upload
+	uint32_t vertexUploadedTotal;	// vertices kept for the current frame
+
+	// VRAM writes issued between draw flushes, replayed in order while the
+	// deferred draw list is recorded.
+	uint32_t vramUploadGeneration;
+	VkBuffer vramUploadStaging;
+	VkDeviceMemory vramUploadStagingMemory;
+	void* vramUploadStagingMapped;
+	VkDeviceSize vramUploadStagingCapacity;
+	VkDeviceSize vramUploadStagingUsed;
+	int vramUploadCount;
+	int vramUploadsApplied;
+	VkPsxVramUpload vramUploads[PSYX_VK_PSX_MAX_VRAM_UPLOADS];
 
 	VkPsxDraw draws[PSYX_VK_PSX_MAX_DRAWS];
 	int drawCount;
@@ -482,6 +519,13 @@ static struct
 	// draw environment asks for it), so a brand-new image must be cleared once
 	// before it can be loaded.
 	int swapchainImageDrawn[8];
+
+	// The main pass is closed and reopened around replayed VRAM writes (a
+	// transfer cannot be recorded inside a render pass). The reopen uses the
+	// modern pass, which loads the same colour/depth attachments.
+	VkRenderPassBeginInfo mainPassBegin;
+	uint32_t mainPassImageIndex;
+	int mainPassOpen;
 
 	VkImage depthImage;
 	VkDeviceMemory depthMemory;
@@ -2460,6 +2504,13 @@ static int CreatePsxResources(void)
 		return 0;
 	psx->vertexCapacity = PSYX_VK_PSX_VERTEX_CAPACITY;
 
+	// Staging for the VRAM rectangles replayed between deferred draws.
+	if (!CreateBuffer(PSYX_VK_PSX_VRAM_UPLOAD_BYTES, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		&psx->vramUploadStaging, &psx->vramUploadStagingMemory, &psx->vramUploadStagingMapped))
+		return 0;
+	psx->vramUploadStagingCapacity = PSYX_VK_PSX_VRAM_UPLOAD_BYTES;
+
 	// Upload the LUT once; it only depends on the PSX colour format.
 	BuildRG8Lut((unsigned char*)psx->lutStagingMapped);
 	{
@@ -2547,6 +2598,8 @@ static void DestroyPsxResources(void)
 	if (psx->uboMemory) vkFreeMemory(g_vk.device, psx->uboMemory, NULL);
 	if (psx->vertexBuffer) vkDestroyBuffer(g_vk.device, psx->vertexBuffer, NULL);
 	if (psx->vertexMemory) vkFreeMemory(g_vk.device, psx->vertexMemory, NULL);
+	if (psx->vramUploadStaging) vkDestroyBuffer(g_vk.device, psx->vramUploadStaging, NULL);
+	if (psx->vramUploadStagingMemory) vkFreeMemory(g_vk.device, psx->vramUploadStagingMemory, NULL);
 	for (int i = 0; i < PSYX_VK_PSX_BLEND_COUNT; i++)
 	{
 		if (psx->pipelines[i]) vkDestroyPipeline(g_vk.device, psx->pipelines[i], NULL);
@@ -2584,7 +2637,15 @@ void PsyX_Vk_GameBeginFrame(void)
 
 	g_vk.psx.vertexSize = 0;
 	g_vk.psx.vertexCount = 0;
+	g_vk.psx.vertexUploadBase = 0;
+	g_vk.psx.vertexUploadedTotal = 0;
 	g_vk.psx.drawCount = 0;
+	// VRAM writes queued before this frame have already been replayed (or are
+	// irrelevant now); each frame starts from the image the GPU holds.
+	g_vk.psx.vramUploadGeneration = 0;
+	g_vk.psx.vramUploadCount = 0;
+	g_vk.psx.vramUploadsApplied = 0;
+	g_vk.psx.vramUploadStagingUsed = 0;
 	// The game queues the frame N draws during frame N+1's DrawSync, so the
 	// list being built is one frame ahead of the one now presented.
 	g_vk.psx.frameIndex = g_vk.frameIndex + 1;
@@ -2631,6 +2692,57 @@ void PsyX_Vk_GameSetVram(const unsigned short* vram)
 	UploadVramMirror(vram);
 }
 
+// Queues one VRAM rectangle for replay inside the deferred draw list. Called
+// for the DS_LoadImage path, which the overhead map uses to stream its tiles
+// through a handful of VRAM slots between draw flushes. The pixels are copied
+// now because the CPU mirror keeps changing.
+void PsyX_Vk_GameCopyVRAM(const unsigned short* src, int srcStride,
+	int x, int y, int w, int h, int dstX, int dstY)
+{
+	VkPsxState* psx = &g_vk.psx;
+	if (!psx->ready || !src || !psx->vramUploadStagingMapped || w <= 0 || h <= 0)
+		return;
+
+	if (x < 0 || y < 0 || dstX < 0 || dstY < 0 ||
+		x + w > PSYX_VK_VRAM_WIDTH || y + h > PSYX_VK_VRAM_HEIGHT ||
+		dstX + w > PSYX_VK_VRAM_WIDTH || dstY + h > PSYX_VK_VRAM_HEIGHT)
+	{
+		eprintwarn("PsyX Vulkan: VRAM upload out of range (%d,%d %dx%d -> %d,%d)\n",
+			x, y, w, h, dstX, dstY);
+		return;
+	}
+
+	const VkDeviceSize bytes = (VkDeviceSize)w * h * 8;
+	if (psx->vramUploadCount >= PSYX_VK_PSX_MAX_VRAM_UPLOADS ||
+		psx->vramUploadStagingUsed + bytes > psx->vramUploadStagingCapacity)
+	{
+		eprintwarn("PsyX Vulkan: VRAM upload queue full, dropping %dx%d at %d,%d\n",
+			w, h, dstX, dstY);
+		return;
+	}
+
+	float* dst = (float*)((unsigned char*)psx->vramUploadStagingMapped + psx->vramUploadStagingUsed);
+	for (int row = 0; row < h; row++)
+	{
+		const unsigned short* s = src + (size_t)(y + row) * srcStride + x;
+		for (int col = 0; col < w; col++)
+		{
+			const unsigned short word = s[col];
+			*dst++ = (float)(word & 0xFF) * (1.0f / 255.0f);
+			*dst++ = (float)((word >> 8) & 0xFF) * (1.0f / 255.0f);
+		}
+	}
+
+	VkPsxVramUpload* up = &psx->vramUploads[psx->vramUploadCount++];
+	up->generation = psx->vramUploadGeneration++;
+	up->x = dstX;
+	up->y = dstY;
+	up->w = w;
+	up->h = h;
+	up->offset = psx->vramUploadStagingUsed;
+	psx->vramUploadStagingUsed += bytes;
+}
+
 void PsyX_Vk_GameSetProjection2D(const float projection[16])
 {
 	if (!g_vk.psx.ready || !projection)
@@ -2651,17 +2763,33 @@ void PsyX_Vk_GameUpdateVertexBuffer(const void* vertices, int vertexCount)
 	if (!psx->ready || !vertices || vertexCount <= 0)
 		return;
 
-	VkDeviceSize bytes = (VkDeviceSize)vertexCount * sizeof(VkPsxVertex);
-	if (bytes > psx->vertexCapacity)
+	if (vertexCount > PSYX_VK_PSX_MAX_VERTICES)
 	{
-		eprintwarn("PsyX Vulkan: PSX vertex buffer overflow (%d vertices)\n", vertexCount);
-		vertexCount = (int)(psx->vertexCapacity / sizeof(VkPsxVertex));
-		bytes = (VkDeviceSize)vertexCount * sizeof(VkPsxVertex);
+		eprintwarn("PsyX Vulkan: PSX vertex flush too large (%d vertices)\n", vertexCount);
+		vertexCount = PSYX_VK_PSX_MAX_VERTICES;
 	}
 
-	memcpy(psx->vertexMapped, vertices, (size_t)bytes);
-	psx->vertexSize = bytes;
-	psx->vertexCount = (uint32_t)vertexCount;
+	const uint32_t capacityVertices = (uint32_t)(psx->vertexCapacity / sizeof(VkPsxVertex));
+
+	// The OpenGL renderer draws each flush immediately, so it can overwrite one
+	// buffer every time. Here the draws are recorded at frame end, so an
+	// overwrite would leave the earlier draws pointing at unrelated vertices
+	// (the overhead map's tile batches all disappeared). Append instead, and
+	// only wrap when a frame really exceeds the capacity.
+	if (psx->vertexUploadedTotal + (uint32_t)vertexCount > capacityVertices)
+	{
+		eprintwarn("PsyX Vulkan: PSX vertex buffer full (%u + %d), reusing from the start\n",
+			psx->vertexUploadedTotal, vertexCount);
+		psx->vertexUploadedTotal = 0;
+	}
+
+	psx->vertexUploadBase = psx->vertexUploadedTotal;
+	psx->vertexUploadedTotal += (uint32_t)vertexCount;
+
+	const VkDeviceSize bytes = (VkDeviceSize)vertexCount * sizeof(VkPsxVertex);
+	memcpy(psx->vertexMapped + (size_t)psx->vertexUploadBase * sizeof(VkPsxVertex), vertices, (size_t)bytes);
+	psx->vertexSize = (VkDeviceSize)psx->vertexUploadedTotal * sizeof(VkPsxVertex);
+	psx->vertexCount = psx->vertexUploadedTotal;
 }
 
 void PsyX_Vk_GameSetBlendMode(int blendMode)
@@ -2828,10 +2956,13 @@ int PsyX_Vk_GameDrawTriangles(int firstVertex, int triangles)
 		eprintwarn("PsyX Vulkan: PSX draw list full, dropping draw\n");
 		return 0;
 	}
-	if (firstVertex < 0 || (uint32_t)(firstVertex + triangles * 3) > psx->vertexCount)
+	const uint32_t uploadBase = psx->vertexUploadBase;
+	const uint32_t uploadCount = psx->vertexUploadedTotal - uploadBase;
+
+	if (firstVertex < 0 || (uint32_t)(firstVertex + triangles * 3) > uploadCount)
 	{
 		eprintwarn("PsyX Vulkan: PSX draw out of range (%d + %d triangles, %u vertices)\n",
-			firstVertex, triangles, psx->vertexCount);
+			firstVertex, triangles, uploadCount);
 		return 0;
 	}
 
@@ -2856,11 +2987,11 @@ int PsyX_Vk_GameDrawTriangles(int firstVertex, int triangles)
 		psx->textures[psx->stTexture - 1].used)
 		? psx->textures[psx->stTexture - 1].set
 		: VK_NULL_HANDLE;
-	draw->firstVertex = (uint32_t)firstVertex;
-	draw->vertexCount = (uint32_t)(triangles * 3);
+	draw->firstVertex = uploadBase + (uint32_t)firstVertex;	draw->vertexCount = (uint32_t)(triangles * 3);
 	draw->frame = psx->frameIndex;
 	draw->offscreen = psx->offscreenActive;
 	draw->stencilMode = psx->stStencilMode;
+	draw->vramGeneration = psx->vramUploadGeneration;
 
 	return triangles;
 }
@@ -3754,6 +3885,64 @@ SDL_Window* PsyX_Vk_GetSDLWindow(void)
 	return g_vk.window;
 }
 
+// Replays the VRAM writes a draw must see. A transfer cannot be recorded
+// inside a render pass, so the pass is closed and immediately reopened against
+// the loaded attachments; the draw state set per draw is unaffected.
+static void ApplyVramUploadsUpTo(VkCommandBuffer cmd, uint32_t generation, int *passClosed)
+{
+	VkPsxState* psx = &g_vk.psx;
+
+	while (psx->vramUploadsApplied < psx->vramUploadCount &&
+		psx->vramUploads[psx->vramUploadsApplied].generation < generation)
+	{
+		const VkPsxVramUpload* up = &psx->vramUploads[psx->vramUploadsApplied];
+
+		if (g_vk.mainPassOpen)
+		{
+			vkCmdEndRenderPass(cmd);
+			g_vk.mainPassOpen = 0;
+			*passClosed = 1;
+		}
+
+		ImageBarrier(cmd, psx->vramImage, VK_IMAGE_ASPECT_COLOR_BIT,
+			VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+			VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+
+		VkBufferImageCopy region;
+		memset(&region, 0, sizeof(region));
+		region.bufferOffset = up->offset;
+		region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		region.imageSubresource.layerCount = 1;
+		region.imageOffset.x = up->x;
+		region.imageOffset.y = up->y;
+		region.imageExtent.width = (uint32_t)up->w;
+		region.imageExtent.height = (uint32_t)up->h;
+		region.imageExtent.depth = 1;
+		vkCmdCopyBufferToImage(cmd, psx->vramUploadStaging, psx->vramImage,
+			VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+		ImageBarrier(cmd, psx->vramImage, VK_IMAGE_ASPECT_COLOR_BIT,
+			VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+		psx->vramUploadsApplied++;
+	}
+}
+
+static void ResumeMainPass(VkCommandBuffer cmd)
+{
+	if (g_vk.mainPassOpen || !g_vk.mainPassBegin.renderPass)
+		return;
+
+	VkRenderPassBeginInfo resume = g_vk.mainPassBegin;
+	resume.renderPass = g_vk.modernRenderPass;	// loads colour and depth
+	resume.framebuffer = g_vk.modernFramebuffers[g_vk.mainPassImageIndex];
+	vkCmdBeginRenderPass(cmd, &resume, VK_SUBPASS_CONTENTS_INLINE);
+	g_vk.mainPassOpen = 1;
+}
+
 // Records the queued PSX draws into `cmd`. A draw belongs to a single display
 // list (frame index); `frame` selects which one. `offscreen` selects the draws
 // queued inside a GR_SetOffscreenState render-to-VRAM run, and the main pass
@@ -3762,7 +3951,9 @@ static void RecordPsxDraws(VkCommandBuffer cmd, int offscreen, int frame,
 	int targetWidth, int targetHeight)
 {
 	VkPsxState* psx = &g_vk.psx;
-	if (!psx->ready || psx->drawCount == 0)
+	// A frame can carry VRAM writes without any draw (level loading); those
+	// still have to reach the image.
+	if (!psx->ready || (psx->drawCount == 0 && (offscreen != 0 || psx->vramUploadCount == 0)))
 		return;
 
 	const int endDraw = psx->drawCount;
@@ -3775,6 +3966,7 @@ static void RecordPsxDraws(VkCommandBuffer cmd, int offscreen, int frame,
 	vkCmdSetBlendConstants(cmd, blendConstants);
 
 	VkDescriptorSet boundSet = VK_NULL_HANDLE;
+	int passClosed = 0;
 
 	int stencilDraws = 0;
 	int recordedDraws = 0;
@@ -3790,6 +3982,14 @@ static void RecordPsxDraws(VkCommandBuffer cmd, int offscreen, int frame,
 		recordedDraws++;
 		if (!offscreen && draw->stencilMode)
 			stencilDraws++;
+
+		// The game rewrites VRAM between flushes; only the writes that happened
+		// before this draw may be visible to it.
+		if (!offscreen)
+		{
+			ApplyVramUploadsUpTo(cmd, draw->vramGeneration, &passClosed);
+			ResumeMainPass(cmd);
+		}
 
 		const VkDescriptorSet set = draw->textureSet ? draw->textureSet : psx->dummySet;
 		const VkPipeline pipeline = offscreen
@@ -3860,6 +4060,10 @@ static void RecordPsxDraws(VkCommandBuffer cmd, int offscreen, int frame,
 	{
 		psx->lastDraws = recordedDraws;
 		psx->lastStencilDraws = stencilDraws;
+
+		// Writes queued after the last draw still have to land in the image so
+		// the next frame starts from the memory the game expects.
+		ApplyVramUploadsUpTo(cmd, psx->vramUploadGeneration + 1, &passClosed);
 	}
 }
 
@@ -5128,6 +5332,9 @@ int PsyX_Vk_RenderFrame(void)
 	// The emulated PSX game image goes down first; the modern meshes and the
 	// overlay draw on top of it. Offscreen (render-to-VRAM) draws are resolved
 	// into the VRAM mirror before the frame, so they are skipped here.
+	g_vk.mainPassBegin = mainBegin;
+	g_vk.mainPassImageIndex = imageIndex;
+	g_vk.mainPassOpen = 1;
 	RecordPsxDraws(g_vk.commandBuffer, 0, g_vk.psx.frameIndex, g_vk.width, g_vk.height);
 	drawCalls += g_vk.psx.drawCount;
 
@@ -5137,7 +5344,11 @@ int PsyX_Vk_RenderFrame(void)
 		// end it, copy the scene depth when the shadow composite is active, and
 		// continue in the load pass so modern meshes share the legacy depth
 		// buffer. The developer overlay is contributed below, in this pass.
-		vkCmdEndRenderPass(g_vk.commandBuffer);
+		if (g_vk.mainPassOpen)
+		{
+			vkCmdEndRenderPass(g_vk.commandBuffer);
+			g_vk.mainPassOpen = 0;
+		}
 
 		const int modernShadows = g_vk.gameModernEnabled && g_vk.lights.shadowsEnabled &&
 			g_vk.modernCameraValid && g_vk.sceneDepthImage != VK_NULL_HANDLE;
@@ -5167,6 +5378,10 @@ int PsyX_Vk_RenderFrame(void)
 	}
 	else
 	{
+		// A replayed VRAM write may have closed the pass; the gallery draws in
+		// the same loaded pass.
+		ResumeMainPass(g_vk.commandBuffer);
+
 		vkCmdBindPipeline(g_vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.pbrPipeline);
 
 		for (int i = 0; i < PSYX_VK_MAX_MESHES; i++)

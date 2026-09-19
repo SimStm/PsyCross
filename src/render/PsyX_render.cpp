@@ -2009,8 +2009,6 @@ void GR_StoreFrameBuffer(int x, int y, int w, int h)
 
 void GR_CopyVRAM(unsigned short* src, int x, int y, int w, int h, int dst_x, int dst_y)
 {
-	vram_need_update = 1;
-
 	int stride = w;
 
 	if (!src)
@@ -2019,6 +2017,18 @@ void GR_CopyVRAM(unsigned short* src, int x, int y, int w, int h, int dst_x, int
 
 		src = vram;
 		stride = VRAM_WIDTH;
+	}
+
+	// The Vulkan renderer records its draws at frame end, so a write that lands
+	// between two flushes has to be replayed in order; the OpenGL renderer
+	// draws immediately and only needs the dirty flag.
+	if (GR_UseVulkan())
+	{
+		PsyX_Vk_GameCopyVRAM(src, stride, x, y, w, h, dst_x, dst_y);
+	}
+	else
+	{
+		vram_need_update = 1;
 	}
 
 	src += x + y * stride;
