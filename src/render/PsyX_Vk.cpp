@@ -2136,7 +2136,15 @@ static int CreatePsxPipeline(int blendMode, int depthEnable, int stencilMode, Vk
 	memset(&depthStencil, 0, sizeof(depthStencil));
 	depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
 	depthStencil.depthTestEnable = depthEnable ? VK_TRUE : VK_FALSE;
-	depthStencil.depthWriteEnable = depthEnable ? VK_TRUE : VK_FALSE;
+	// OpenGL only toggles GL_DEPTH_TEST and never touches glDepthMask, so a draw
+	// with the test disabled still writes depth. The PSX game depends on that:
+	// the 2D UI (the overhead map, the Damage/Felony bars) is drawn against a
+	// depth-tested 3D scene, and without the write the scene shows through and
+	// their colours shift with whatever is behind them. Mirror GL here, but only
+	// where the render pass actually owns a depth attachment (the offscreen
+	// pass is depth-less and rejects depth state).
+	const VkBool32 passHasDepth = (renderPass == g_vk.mainRenderPass) ? VK_TRUE : VK_FALSE;
+	depthStencil.depthWriteEnable = passHasDepth;
 	depthStencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 
 	// PSX mask bit, mirroring GR_SetStencilMode's GL state. Stencil bit 4 is the
