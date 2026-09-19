@@ -140,7 +140,8 @@
 	X(vkCmdCopyImageToBuffer) \
 	X(vkCmdCopyImage) \
 	X(vkCmdBlitImage) \
-	X(vkCmdClearColorImage)
+	X(vkCmdClearColorImage) \
+	X(vkCmdClearAttachments)
 
 #define PSYX_VK_DECLARE_FN(name) static PFN_##name name = nullptr;
 PSYX_VK_FUNCTIONS(PSYX_VK_DECLARE_FN)
@@ -475,6 +476,12 @@ static struct
 	VkImageView swapchainViews[8];
 	VkFramebuffer framebuffers[8];
 	int framebufferCount;
+
+	// Which swapchain images already hold a rendered frame. The main pass
+	// preserves the previous contents (like OpenGL, which only clears when the
+	// draw environment asks for it), so a brand-new image must be cleared once
+	// before it can be loaded.
+	int swapchainImageDrawn[8];
 
 	VkImage depthImage;
 	VkDeviceMemory depthMemory;
@@ -1241,6 +1248,9 @@ static int CreateSwapchain(void)
 	}
 	g_vk.modernFramebufferCount = (int)g_vk.swapchainImageCount;
 
+	// Fresh images have undefined contents, so force a clear on first use.
+	memset(g_vk.swapchainImageDrawn, 0, sizeof(g_vk.swapchainImageDrawn));
+
 	// Sampleable copy of the legacy scene depth for the shadow composite.
 	if (!CreateImage2D(width, height, depthFormat,
 		VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
@@ -1819,11 +1829,16 @@ static int CreateRenderPasses(void)
 
 	attachments[0].format = g_vk.swapchainFormat;
 	attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
-	attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+	// The main pass preserves the previous frame unless the game asked for a
+	// clear (GR_Clear), mirroring the OpenGL renderer which only clears when
+	// activeDrawEnv.isbg is set. Loading art and other code that relies on the
+	// framebuffer persisting therefore survive. The first use of a swapchain
+	// image is cleared explicitly because its contents are undefined.
+	attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
 	attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 	attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
 	attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-	attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	attachments[0].initialLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 	attachments[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
 	VkFormat depthFormat = PickDepthStencilFormat(&g_vk.psx.stencilSupported);
@@ -5027,23 +5042,40 @@ int PsyX_Vk_RenderFrame(void)
 		VkStage(line);
 	}
 
-	// Main pass. In game mode the clear colour comes from the PSX draw
-	// environment (GR_Clear), exactly like glClearColor/glClear.
+	// Main pass. The colour attachment preserves the previous frame; the clear
+	// colour only matters when the game asked for a clear (GR_Clear, i.e. the
+	// draw environment had isbg set) or when this swapchain image has never
+	// been drawn, because then its contents are undefined. A fresh image is
+	// first moved to the PRESENT_SRC layout the pass declares.
+	const int firstUse = !g_vk.swapchainImageDrawn[imageIndex];
+	if (firstUse)
+	{
+		ImageBarrier(g_vk.commandBuffer, g_vk.swapchainImages[imageIndex], VK_IMAGE_ASPECT_COLOR_BIT,
+			VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+	}
+
 	VkClearValue clears[2];
 	memset(clears, 0, sizeof(clears));
+	int clearColor = 0;
 	if (g_vk.gameMode)
 	{
 		clears[0].color.float32[0] = g_vk.psx.clearColor[0];
 		clears[0].color.float32[1] = g_vk.psx.clearColor[1];
 		clears[0].color.float32[2] = g_vk.psx.clearColor[2];
 		clears[0].color.float32[3] = 1.0f;
+		clearColor = g_vk.psx.clearRequested || firstUse;
+		g_vk.psx.clearRequested = 0;
 	}
 	else
 	{
+		// The fixture window has no draw environment and always clears.
 		clears[0].color.float32[0] = 0.42f;
 		clears[0].color.float32[1] = 0.58f;
 		clears[0].color.float32[2] = 0.78f;
 		clears[0].color.float32[3] = 1.0f;
+		clearColor = 1;
 	}
 	clears[1].depthStencil.depth = 1.0f;
 	clears[1].depthStencil.stencil = 0;	// PSX mask bit starts clear every frame
@@ -5059,6 +5091,26 @@ int PsyX_Vk_RenderFrame(void)
 	mainBegin.pClearValues = clears;
 
 	vkCmdBeginRenderPass(g_vk.commandBuffer, &mainBegin, VK_SUBPASS_CONTENTS_INLINE);
+
+	if (clearColor)
+	{
+		// The pass loads, so the colour attachment is cleared explicitly. The
+		// depth/stencil attachment still uses the render-pass clear above.
+		VkClearAttachment colorClear;
+		memset(&colorClear, 0, sizeof(colorClear));
+		colorClear.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		colorClear.colorAttachment = 0;
+		colorClear.clearValue = clears[0];
+
+		VkClearRect colorRect;
+		memset(&colorRect, 0, sizeof(colorRect));
+		colorRect.rect = mainBegin.renderArea;
+		colorRect.layerCount = 1;
+
+		vkCmdClearAttachments(g_vk.commandBuffer, 1, &colorClear, 1, &colorRect);
+	}
+
+	g_vk.swapchainImageDrawn[imageIndex] = 1;
 
 	VkViewport viewport;
 	memset(&viewport, 0, sizeof(viewport));
