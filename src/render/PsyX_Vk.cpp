@@ -1891,11 +1891,14 @@ static int CreateRenderPasses(void)
 	attachments[1].format = depthFormat;
 	attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
 	attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-	attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	// The depth and mask bit have to survive the pass being closed and reopened
+	// when a deferred VRAM write is replayed mid-frame, so they are stored rather
+	// than discarded. They are still cleared at the start of every frame.
+	attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 	// The PSX mask bit lives in this attachment's stencil aspect; it is cleared
 	// every frame so the mask never leaks between frames.
 	attachments[1].stencilLoadOp = (g_vk.psx.stencilSupported) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-	attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	attachments[1].stencilStoreOp = (g_vk.psx.stencilSupported) ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
 	attachments[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 	attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
