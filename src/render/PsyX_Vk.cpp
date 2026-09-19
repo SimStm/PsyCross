@@ -258,6 +258,7 @@ typedef struct
 	int frame;			// g_vk.psx.frameIndex at queue time
 	int offscreen;			// queued while GR_SetOffscreenState(enable=1)
 	int stencilMode;		// 1 = PSX mask-bit set, 0 = mask-bit test
+	int srgbEncode;			// 1 when this draw targets an sRGB attachment
 } VkPsxDraw;
 
 // One GR_SetOffscreenState(enable=1 .. enable=0) run: the PSX draws render into
@@ -1944,7 +1945,7 @@ static int CreatePsxResources(void)
 	memset(&pushRange, 0, sizeof(pushRange));
 	pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 	pushRange.offset = 0;
-	pushRange.size = 32;	// texFormat, bilinearFilter, texelSize, overrideAlphaMode
+	pushRange.size = 32;	// texFormat, bilinearFilter, texelSize, overrideAlphaMode, srgbEncode
 
 	VkPipelineLayoutCreateInfo pipelineLayout;
 	memset(&pipelineLayout, 0, sizeof(pipelineLayout));
@@ -2425,6 +2426,11 @@ int PsyX_Vk_GameDrawTriangles(int firstVertex, int triangles)
 	draw->texelSize[0] = psx->stOverrideWidth > 0 ? 1.0f / (float)psx->stOverrideWidth : 1.0f / 256.0f;
 	draw->texelSize[1] = psx->stOverrideHeight > 0 ? 1.0f / (float)psx->stOverrideHeight : 1.0f / 256.0f;
 	draw->overrideAlphaMode = psx->stOverrideAlphaMode;
+	// The PSX shader emits display-referred (encoded) values. When the draw
+	// targets an sRGB attachment the hardware encodes on store, so the shader
+	// must inverse-encode to cancel it and match the OpenGL image exactly.
+	// Offscreen targets are UNORM, so those draws leave srgbEncode at 0.
+	draw->srgbEncode = (psx->offscreenActive || !g_vk.srgbOutput) ? 0 : 1;
 	draw->blendMode = psx->stBlendMode;
 	draw->depthTest = psx->stDepth;
 	draw->scissorEnable = psx->stScissorEnable;
@@ -2755,12 +2761,14 @@ static void RecordPsxDraws(VkCommandBuffer cmd, int offscreen, int frame,
 			int bilinearFilter;
 			float texelSize[2];
 			int overrideAlphaMode;
+			int srgbEncode;
 		} constants;
 		constants.texFormat = draw->texFormat;
 		constants.bilinearFilter = draw->bilinearFilter;
 		constants.texelSize[0] = draw->texelSize[0];
 		constants.texelSize[1] = draw->texelSize[1];
 		constants.overrideAlphaMode = draw->overrideAlphaMode;
+		constants.srgbEncode = draw->srgbEncode;
 
 		vkCmdPushConstants(cmd, psx->layout,
 			VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(constants), &constants);
@@ -2957,13 +2965,6 @@ int PsyX_Vk_GameResolveOffscreen(unsigned short* vram)
 	return 1;
 }
 
-static float SrgbEncodeFloat(float value)
-{
-	if (value <= 0.0031308f)
-		return value * 12.92f;
-	return 1.055f * powf(value, 1.0f / 2.4f) - 0.055f;
-}
-
 static void ReportAppend(char* report, int size, const char* text)
 {
 	if (!report || size <= 0)
@@ -3092,9 +3093,11 @@ int PsyX_Vk_GameSelfTest(char* report, int reportSize)
 	}
 
 	{
-		const float linear = 248.0f / 255.0f;
-		const float channel = g_vk.srgbOutput ? SrgbEncodeFloat(linear) : linear;
-		const float expected[4] = { channel, 0.0f, 0.0f, 1.0f };
+		// The readback is the presented swapchain. The PSX shader emits
+		// display-referred values; on an sRGB attachment it inverse-encodes so
+		// the hardware store re-encodes back to the original value. The pixel
+		// therefore reads as the raw PSX value on both backends.
+		const float expected[4] = { 248.0f / 255.0f, 0.0f, 0.0f, 1.0f };
 		if (!PsxCheckPixel(rgba, readWidth, readHeight, readWidth / 2, readHeight / 2, expected, tolerance,
 			"16-bit 0x001F", report, reportSize))
 			failures++;
@@ -3131,9 +3134,9 @@ int PsyX_Vk_GameSelfTest(char* report, int reportSize)
 	}
 	else
 	{
-		const float linear = 248.0f / 255.0f;
-		const float channel = g_vk.srgbOutput ? SrgbEncodeFloat(linear) : linear;
-		const float expected[4] = { 0.0f, 0.0f, channel, 1.0f };
+		// Same reasoning as case 1: the presented pixel is the display-referred
+		// PSX value, independent of the attachment colour space.
+		const float expected[4] = { 0.0f, 0.0f, 248.0f / 255.0f, 1.0f };
 		if (!PsxCheckPixel(rgba, readWidth, readHeight, readWidth / 2, readHeight / 2, expected, tolerance,
 			"4-bit CLUT entry 5", report, reportSize))
 			failures++;

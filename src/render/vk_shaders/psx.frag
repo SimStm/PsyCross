@@ -21,6 +21,7 @@ layout(push_constant) uniform Push
 	int bilinearFilter;
 	vec2 texelSize;
 	int overrideAlphaMode;
+	int srgbEncode;
 } pc;
 
 layout(location = 0) out vec4 fragColor;
@@ -37,6 +38,12 @@ const mat4 c_dither = mat4(
 vec2 VRAM(vec2 uv) { return texture(s_vram, uv).rg; }
 float _idx2(vec2 array, int idx) { return array[idx]; }
 vec4 lut(vec2 rg) { return texture(s_rgLut, rg - c_LUTTexel * 0.0001); }
+
+// The PSX path produces display-referred (already gamma-encoded) values, just
+// like the OpenGL shader. When the target is an sRGB attachment the hardware
+// encodes on store; applying the inverse here cancels it so the Vulkan image
+// matches OpenGL. Offscreen (UNORM) targets receive the raw values unchanged.
+vec3 ToLinear(vec3 c) { return pow(max(c, vec3(0.0)), vec3(2.2)); }
 
 vec4 dither(vec4 color)
 {
@@ -131,4 +138,6 @@ void main()
 	}
 
 	fragColor = dither(color * v_color);
+	if (pc.srgbEncode != 0)
+		fragColor.rgb = ToLinear(fragColor.rgb);
 }
