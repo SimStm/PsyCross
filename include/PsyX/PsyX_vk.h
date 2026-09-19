@@ -184,6 +184,34 @@ int PsyX_Vk_GameDrawTriangles(int firstVertex, int triangles);
 int  PsyX_Vk_GameCreateTexture(const unsigned char* rgba, int width, int height, int mipmapped);
 void PsyX_Vk_GameDestroyTexture(int texture);
 
+/* Developer-overlay accessors for a game texture handle. The overlay id is an
+   ImGui descriptor set (VkDescriptorSet) packed into an integer; it is cached
+   and invalidated when the texture is destroyed. */
+unsigned long long PsyX_Vk_GameGetOverlayTextureId(int texture);
+void PsyX_Vk_GameGetTextureSize(int texture, int* width, int* height);
+
+/*
+ * In-game modern mesh path (renderer roadmap R7b).
+ *
+ * Same contract as PsyX_ModernMesh_*, implemented on the Vulkan backend: the
+ * meshes are persistent, drawn after the emulated PSX scene into the shared
+ * colour/depth attachments, and use the game's own PsyX_CreateRGBATexture
+ * handles for their material maps. The game-side dispatcher calls these only
+ * when Vulkan is the active backend.
+ */
+int  PsyX_Vk_GameModernMeshCreate(const PsyXModernMeshDesc* desc);
+void PsyX_Vk_GameModernMeshDestroy(int mesh);
+void PsyX_Vk_GameModernMeshSetInstance(int mesh, const float viewMatrix[16],
+	const float color[4], int visible);
+void PsyX_Vk_GameModernMeshSetInstanceWorld(int mesh, const float worldMatrix[16]);
+void PsyX_Vk_GameModernMeshSetLights(const PsyXModernLightSet* lights);
+void PsyX_Vk_GameModernMeshSetCamera(const float viewRotation[16], const float cameraPosition[3]);
+void PsyX_Vk_GameModernMeshSetShadowDebug(int mode);
+void PsyX_Vk_GameModernMeshSetEnabled(int enabled);
+int  PsyX_Vk_GameModernMeshGetEnabled(void);
+void PsyX_Vk_GameModernMeshGetStats(PsyXModernMeshStats* stats);
+void PsyX_Vk_GameModernMeshShutdown(void);
+
 /* Submits the queued draws into the main render pass and presents. */
 void PsyX_Vk_GameEndFrame(void);
 void PsyX_Vk_GameResetDevice(void);

@@ -180,6 +180,15 @@ extern void PsyX_TakeScreenshot(void);
    the caller and must be destroyed with PsyX_DestroyRGBATexture when unused. */
 extern unsigned int PsyX_CreateRGBATexture(int width, int height, const unsigned char* rgbaPixels);
 extern void PsyX_DestroyRGBATexture(unsigned int textureId);
+
+/* Backend-aware texture accessor for developer overlays (Dear ImGui). The
+   OpenGL backend returns the GL texture name; the Vulkan backend returns the
+   ImGui descriptor set that binds the texture, as an integer. 0 means the
+   texture cannot be drawn by the overlay. The handle stays owned by PsyCross
+   and must not be destroyed by the caller. */
+extern unsigned long long PsyX_GetOverlayTextureId(unsigned int textureId);
+/* Real pixel size of a PsyX_CreateRGBATexture texture (0 when unknown). */
+extern void PsyX_GetRGBATextureSize(unsigned int textureId, int* width, int* height);
 extern int PsyX_RegisterTextureOverride(const PsyXTextureOverride* textureOverride);
 extern void PsyX_RemoveTextureOverride(int overrideId);
 extern void PsyX_ClearTextureOverrides(void);

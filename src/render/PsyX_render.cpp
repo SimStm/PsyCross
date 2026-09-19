@@ -1053,6 +1053,44 @@ TextureID GR_CreateRGBATextureMipmapped(int width, int height, u_char* data /*= 
 	return newTexture;
 }
 
+unsigned long long PsyX_GetOverlayTextureId(unsigned int textureId)
+{
+	if (GR_UseVulkan())
+		return PsyX_Vk_GameGetOverlayTextureId((int)textureId);
+
+	// The OpenGL ImGui backend draws a texture name directly.
+	return (unsigned long long)textureId;
+}
+
+void PsyX_GetRGBATextureSize(unsigned int textureId, int* width, int* height)
+{
+	if (GR_UseVulkan())
+	{
+		PsyX_Vk_GameGetTextureSize((int)textureId, width, height);
+		return;
+	}
+
+	int w = 0, h = 0;
+
+#if USE_OPENGL
+	if (textureId)
+	{
+		GLint previous = 0;
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous);
+		glBindTexture(GL_TEXTURE_2D, (GLuint)textureId);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+		glBindTexture(GL_TEXTURE_2D, (GLuint)previous);
+
+		// Guard against a failed query leaving GL's error state set.
+		while (glGetError() != GL_NO_ERROR) {}
+	}
+#endif
+
+	if (width) *width = w;
+	if (height) *height = h;
+}
+
 void GR_CompilePSXShader(PSXGPU_Shader* sh, const char* source)
 {
 	sh->shader = GR_Shader_Compile(source, true);
@@ -1279,15 +1317,16 @@ void GR_Perspective3D(const float fov, const float width, const float height, co
 		0, 0, -(2 * zFar * zNear) / (zFar - zNear), 0
 	};
 
+	// The modern mesh path shares this exact projection so its clip position
+	// and depth match legacy geometry. The Vulkan backend reads the captured
+	// matrix from g_psyxModernProjection when it builds its modern UBO.
+	PsyX_ModernMesh_SetProjection(persp);
+
 	if (GR_UseVulkan())
 	{
 		PsyX_Vk_GameSetProjection3D(persp);
 		return;
 	}
-
-	// The modern mesh path shares this exact projection so its clip position
-	// and depth match legacy geometry.
-	PsyX_ModernMesh_SetProjection(persp);
 
 #if USE_OPENGL
 	glUniformMatrix4fv(u_projection3DLoc, 1, GL_FALSE, persp);

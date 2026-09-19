@@ -1,6 +1,7 @@
 #include "PsyX/PsyX_public.h"
 #include "PsyX/PsyX_render.h"
 #include "PsyX/PsyX_globals.h"
+#include "PsyX/PsyX_vk.h"
 
 #include "../platform.h"
 #include "../gpu/PsyX_GPU.h"
@@ -19,6 +20,15 @@
    legacy geometry, which is what lets the two paths occlude each other. */
 #define PSYX_MODERN_GTE_VIEW_SCALE 128.0f
 #define PSYX_MODERN_MAX_MESHES 16
+
+/* The public modern-mesh API is shared by both backends. When the Vulkan
+   backend is active these calls forward to its in-game implementation
+   (PsyX_Vk_GameModernMesh*), which draws into the game's own frame; the
+   OpenGL implementation below handles every other desktop configuration. */
+static inline int ModernMeshUsesVulkan(void)
+{
+	return PsyX_GetRenderBackend() == PSYX_BACKEND_VULKAN;
+}
 
 #if defined(USE_OPENGL)
 
@@ -434,6 +444,12 @@ void PsyX_ModernMesh_SetProjection(const float matrix[16])
 
 void PsyX_ModernMesh_SetCamera(const float viewRotation[16], const float cameraPosition[3])
 {
+	if (ModernMeshUsesVulkan())
+	{
+		PsyX_Vk_GameModernMeshSetCamera(viewRotation, cameraPosition);
+		return;
+	}
+
 	if (viewRotation)
 		memcpy(g_modernCameraRotation, viewRotation, sizeof(g_modernCameraRotation));
 	if (cameraPosition)
@@ -461,6 +477,12 @@ void PsyX_ModernMesh_SetCamera(const float viewRotation[16], const float cameraP
 
 void PsyX_ModernMesh_SetShadowDebug(int mode)
 {
+	if (ModernMeshUsesVulkan())
+	{
+		PsyX_Vk_GameModernMeshSetShadowDebug(mode);
+		return;
+	}
+
 	g_shadowDebugMode = mode;
 }
 
@@ -739,6 +761,9 @@ static int EnsureSceneDepthTarget(int width, int height)
 
 int PsyX_ModernMesh_CreateEx(const PsyXModernMeshDesc* desc)
 {
+	if (ModernMeshUsesVulkan())
+		return PsyX_Vk_GameModernMeshCreate(desc);
+
 	if (!desc || !desc->positions || desc->vertexCount <= 0 || g_meshCount >= PSYX_MODERN_MAX_MESHES)
 		return -1;
 
@@ -870,12 +895,24 @@ int PsyX_ModernMesh_Create(const float* positions, int vertexCount,
 
 void PsyX_ModernMesh_SetLights(const PsyXModernLightSet* lights)
 {
+	if (ModernMeshUsesVulkan())
+	{
+		PsyX_Vk_GameModernMeshSetLights(lights);
+		return;
+	}
+
 	if (lights)
 		g_lights = *lights;
 }
 
 void PsyX_ModernMesh_Destroy(int mesh)
 {
+	if (ModernMeshUsesVulkan())
+	{
+		PsyX_Vk_GameModernMeshDestroy(mesh);
+		return;
+	}
+
 	if (mesh < 0 || mesh >= PSYX_MODERN_MAX_MESHES || !g_meshes[mesh].used)
 		return;
 
@@ -894,6 +931,12 @@ void PsyX_ModernMesh_Destroy(int mesh)
 
 void PsyX_ModernMesh_SetInstance(int mesh, const float viewMatrix[16], const float color[4], int visible)
 {
+	if (ModernMeshUsesVulkan())
+	{
+		PsyX_Vk_GameModernMeshSetInstance(mesh, viewMatrix, color, visible);
+		return;
+	}
+
 	if (mesh < 0 || mesh >= PSYX_MODERN_MAX_MESHES || !g_meshes[mesh].used)
 		return;
 
@@ -907,6 +950,12 @@ void PsyX_ModernMesh_SetInstance(int mesh, const float viewMatrix[16], const flo
 
 void PsyX_ModernMesh_SetInstanceWorld(int mesh, const float worldMatrix[16])
 {
+	if (ModernMeshUsesVulkan())
+	{
+		PsyX_Vk_GameModernMeshSetInstanceWorld(mesh, worldMatrix);
+		return;
+	}
+
 	if (mesh < 0 || mesh >= PSYX_MODERN_MAX_MESHES || !g_meshes[mesh].used)
 		return;
 
@@ -917,22 +966,41 @@ void PsyX_ModernMesh_SetInstanceWorld(int mesh, const float worldMatrix[16])
 
 void PsyX_ModernMesh_SetEnabled(int enabled)
 {
+	if (ModernMeshUsesVulkan())
+	{
+		PsyX_Vk_GameModernMeshSetEnabled(enabled);
+		return;
+	}
+
 	g_enabled = enabled != 0;
 }
 
 int PsyX_ModernMesh_GetEnabled(void)
 {
+	if (ModernMeshUsesVulkan())
+		return PsyX_Vk_GameModernMeshGetEnabled();
+
 	return g_enabled;
 }
 
 void PsyX_ModernMesh_GetStats(PsyXModernMeshStats* stats)
 {
+	if (ModernMeshUsesVulkan())
+	{
+		PsyX_Vk_GameModernMeshGetStats(stats);
+		return;
+	}
+
 	if (stats)
 		*stats = g_stats;
 }
 
 void PsyX_ModernMesh_RenderFrame(void)
 {
+	// The Vulkan backend draws the modern meshes inside its own game frame.
+	if (ModernMeshUsesVulkan())
+		return;
+
 	memset(&g_stats, 0, sizeof(g_stats));
 
 	if (!g_enabled || !g_psyxModernProjectionValid || !g_program || g_meshCount == 0)
@@ -1260,6 +1328,12 @@ void PsyX_ModernMesh_RenderFrame(void)
 
 void PsyX_ModernMesh_Shutdown(void)
 {
+	if (ModernMeshUsesVulkan())
+	{
+		PsyX_Vk_GameModernMeshShutdown();
+		return;
+	}
+
 	for (int i = 0; i < PSYX_MODERN_MAX_MESHES; i++)
 		PsyX_ModernMesh_Destroy(i);
 

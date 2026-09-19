@@ -20,10 +20,15 @@
 #include <vulkan/vulkan.h>
 
 #include "../platform.h"
+#include "../gpu/PsyX_GPU.h"
 
 #include "PsyX_Vk_Shaders.h"
 
 #include "PsyX/PsyX_public.h"
+
+// The in-game modern path shares the projection captured by GR_Perspective3D.
+#include "PsyX_ModernMesh.h"
+#include "psx/gtereg.h"
 
 #include <SDL.h>
 #include <SDL_vulkan.h>
@@ -133,6 +138,7 @@
 	X(vkCmdPipelineBarrier) \
 	X(vkCmdCopyBufferToImage) \
 	X(vkCmdCopyImageToBuffer) \
+	X(vkCmdCopyImage) \
 	X(vkCmdBlitImage) \
 	X(vkCmdClearColorImage)
 
@@ -203,6 +209,54 @@ typedef struct
 } VkMesh;
 
 static VkTexture g_textures[PSYX_VK_MAX_TEXTURES];
+
+// ---------------------------------------------------------------------------
+// In-game modern mesh (renderer roadmap R7b)
+//
+// The OpenGL modern path's Vulkan equivalent: the same persistent, world
+// anchored meshes drawn into the game's own frame so modern geometry and the
+// emulated PSX scene share one depth buffer. Material texture handles are the
+// game's PsyX_CreateRGBATexture handles, which the Vulkan backend stores in its
+// PSX texture table, not the fixture's separate VkTexture table.
+
+#define PSYX_VK_GAME_MODERN_MAX_MESHES 16
+
+typedef struct
+{
+	int used;
+	int vertexCount;
+	int indexCount;
+	VkBuffer vertexBuffer;
+	VkDeviceMemory vertexMemory;
+	VkBuffer indexBuffer;
+	VkDeviceMemory indexMemory;
+	VkDescriptorSet descriptorSet;
+	int textureSlots[4];		// 1-based PSX texture handles, 0 = neutral
+	float factors[2];		// metallic, roughness
+	float emissive[3];		// emissive factor
+	float world[16];
+	float color[4];
+	int visible;
+} VkGameMesh;
+
+// Uniform block shared by the modern mesh shaders and the shadow composite.
+// The layout must match ModernUBO in vk_shaders/psx_modern.vert,
+// psx_modern.frag and psx_composite.frag.
+typedef struct
+{
+	float proj[16];
+	float projInverse[16];
+	float shadowMatrix[16];
+	float cameraViewInverse[16];
+	float cameraRotation[16];
+	float xyScale[4];		// x, y, z (1/128), unused
+	float shadowParams[4];		// x = enabled, y = texel, z = strength, w = ao
+	float lightInfo[4];		// x = count, y = srgb output, z = shadow debug
+	float ambientExposure[4];	// rgb = ambient, w = exposure
+	float cameraPos[4];
+	float viewport[4];		// width, height
+	VkLightStd140 lights[PSYX_VK_MAX_LIGHTS];
+} VkGameModernUbo;
 
 // ---------------------------------------------------------------------------
 // Emulated PSX GPU path (renderer roadmap R7b)
@@ -386,6 +440,12 @@ typedef struct
 
 	VkDescriptorSet dummySet;	// white texture, used by 4/8/16-bit draws
 	VkPsxTexture textures[PSYX_VK_PSX_MAX_TEXTURES];
+
+	// Developer-overlay (Dear ImGui) bridge for one game texture at a time. The
+	// ImGui Vulkan backend draws textures through descriptor sets from its own
+	// pool, not GL names, so a preview asks for one and it is cached here.
+	int overlayTextureSlot;
+	unsigned long long overlayTextureId;
 } VkPsxState;
 
 static struct
@@ -465,6 +525,31 @@ static struct
 
 	PsyXModernLightSet lights;
 
+	// In-game modern mesh state. The render pass loads the legacy colour and
+	// depth written by the main pass so modern meshes share the PSX depth
+	// buffer; the fixture's render pass clears instead.
+	VkRenderPass modernRenderPass;
+	VkFramebuffer modernFramebuffers[8];
+	int modernFramebufferCount;
+	VkPipeline gameModernPipeline;
+	VkPipeline gameCompositePipeline;
+	VkBuffer gameModernUboBuffer;
+	VkDeviceMemory gameModernUboMemory;
+	VkGameModernUbo* gameModernUboMapped;
+	VkDescriptorSet gameCompositeSet;
+	VkGameMesh gameMeshes[PSYX_VK_GAME_MODERN_MAX_MESHES];
+	int gameModernMeshCount;
+	VkImage sceneDepthImage;
+	VkDeviceMemory sceneDepthMemory;
+	VkImageView sceneDepthView;
+	VkSampler sceneDepthSampler;
+	float modernCameraRotation[16];
+	float modernCameraPosition[3];
+	int modernCameraValid;
+	int gameModernEnabled;
+	int gameModernShadowDebug;
+	PsyXModernMeshStats gameModernStats;
+
 	int imguiActive;
 	char overlayText[512];
 	double lastFps;
@@ -473,6 +558,10 @@ static struct
 } g_vk;
 
 static int g_supported = -1;
+
+// Shared helpers defined with their owners further down.
+static void FillMeshVertices(const PsyXModernMeshDesc* desc, VkVertex* vertices);
+static void BuildShadowMatrix(float out[16]);
 
 // PsyCross logging is only wired up once the game has started, so the Vulkan
 // initialisation stages also go to a small side log for developer runs.
@@ -885,11 +974,35 @@ static void DestroySwapchainResources(void)
 	}
 	g_vk.framebufferCount = 0;
 
+	for (int i = 0; i < g_vk.modernFramebufferCount; i++)
+	{
+		if (g_vk.modernFramebuffers[i])
+			vkDestroyFramebuffer(g_vk.device, g_vk.modernFramebuffers[i], NULL);
+		g_vk.modernFramebuffers[i] = VK_NULL_HANDLE;
+	}
+	g_vk.modernFramebufferCount = 0;
+
 	for (uint32_t i = 0; i < g_vk.swapchainImageCount; i++)
 	{
 		if (g_vk.swapchainViews[i])
 			vkDestroyImageView(g_vk.device, g_vk.swapchainViews[i], NULL);
 		g_vk.swapchainViews[i] = VK_NULL_HANDLE;
+	}
+
+	if (g_vk.sceneDepthView)
+	{
+		vkDestroyImageView(g_vk.device, g_vk.sceneDepthView, NULL);
+		g_vk.sceneDepthView = VK_NULL_HANDLE;
+	}
+	if (g_vk.sceneDepthImage)
+	{
+		vkDestroyImage(g_vk.device, g_vk.sceneDepthImage, NULL);
+		g_vk.sceneDepthImage = VK_NULL_HANDLE;
+	}
+	if (g_vk.sceneDepthMemory)
+	{
+		vkFreeMemory(g_vk.device, g_vk.sceneDepthMemory, NULL);
+		g_vk.sceneDepthMemory = VK_NULL_HANDLE;
 	}
 
 	if (g_vk.depthView)
@@ -1080,7 +1193,10 @@ static int CreateSwapchain(void)
 		? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
 		: VK_IMAGE_ASPECT_DEPTH_BIT;
 
-	if (!CreateImage2D(width, height, depthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+	// TRANSFER_SRC lets the in-game modern path copy the legacy scene depth out
+	// for the shadow composite.
+	if (!CreateImage2D(width, height, depthFormat,
+		VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
 		&g_vk.depthImage, &g_vk.depthMemory))
 		return 0;
 	if (!CreateImageView2D(g_vk.depthImage, depthFormat, depthAspect, &g_vk.depthView))
@@ -1104,6 +1220,34 @@ static int CreateSwapchain(void)
 			return 0;
 	}
 	g_vk.framebufferCount = (int)g_vk.swapchainImageCount;
+
+	// The modern pass uses the same views with a load render pass.
+	for (uint32_t i = 0; i < g_vk.swapchainImageCount; i++)
+	{
+		VkImageView attachments[2] = { g_vk.swapchainViews[i], g_vk.depthView };
+
+		VkFramebufferCreateInfo framebuffer;
+		memset(&framebuffer, 0, sizeof(framebuffer));
+		framebuffer.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+		framebuffer.renderPass = g_vk.modernRenderPass;
+		framebuffer.attachmentCount = 2;
+		framebuffer.pAttachments = attachments;
+		framebuffer.width = width;
+		framebuffer.height = height;
+		framebuffer.layers = 1;
+
+		if (!VkOk(vkCreateFramebuffer(g_vk.device, &framebuffer, NULL, &g_vk.modernFramebuffers[i]), "vkCreateFramebuffer(modern)"))
+			return 0;
+	}
+	g_vk.modernFramebufferCount = (int)g_vk.swapchainImageCount;
+
+	// Sampleable copy of the legacy scene depth for the shadow composite.
+	if (!CreateImage2D(width, height, depthFormat,
+		VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+		&g_vk.sceneDepthImage, &g_vk.sceneDepthMemory))
+		return 0;
+	if (!CreateImageView2D(g_vk.sceneDepthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT, &g_vk.sceneDepthView))
+		return 0;
 
 	// Readback buffer for the last frame.
 	if (g_vk.readbackBuffer)
@@ -1210,8 +1354,9 @@ static int CreatePipelines(void)
 	VkPushConstantRange pushRange;
 	memset(&pushRange, 0, sizeof(pushRange));
 	pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-	pushRange.offset = 0;
-	pushRange.size = 96;	// mat4 world + vec4 color + vec4 factors
+	// mat4 world + vec4 color + vec4 factors + vec4 emissive factor. The
+	// fixture shader only reads the first 96 bytes of the block.
+	pushRange.size = 112;
 
 	VkPipelineLayoutCreateInfo pipelineLayout;
 	memset(&pipelineLayout, 0, sizeof(pipelineLayout));
@@ -1430,16 +1575,19 @@ static int CreatePipelines(void)
 	VkDescriptorPoolSize poolSizes[2];
 	poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 	// Meshes get one set each; the PSX path takes one set for the dummy
-	// (VRAM-decoded) case plus one per game RGBA texture.
+	// (VRAM-decoded) case plus one per game RGBA texture. The in-game modern
+	// path takes one set per mesh plus one for the shadow composite.
 	const int psxSetCount = PSYX_VK_PSX_MAX_TEXTURES + 1;
-	poolSizes[0].descriptorCount = PSYX_VK_MAX_MESHES + 4 + psxSetCount;
+	const int gameSetCount = PSYX_VK_GAME_MODERN_MAX_MESHES + 1;
+	const int totalSets = PSYX_VK_MAX_MESHES + 4 + psxSetCount + gameSetCount;
+	poolSizes[0].descriptorCount = totalSets;
 	poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	poolSizes[1].descriptorCount = (PSYX_VK_MAX_MESHES + 4) * 5 + psxSetCount * 3;
+	poolSizes[1].descriptorCount = (PSYX_VK_MAX_MESHES + 4) * 5 + psxSetCount * 3 + PSYX_VK_GAME_MODERN_MAX_MESHES * 5 + 2;
 
 	VkDescriptorPoolCreateInfo pool;
 	memset(&pool, 0, sizeof(pool));
 	pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-	pool.maxSets = PSYX_VK_MAX_MESHES + 4 + psxSetCount;
+	pool.maxSets = totalSets;
 	pool.poolSizeCount = 2;
 	pool.pPoolSizes = poolSizes;
 
@@ -1447,6 +1595,217 @@ static int CreatePipelines(void)
 		return 0;
 
 	return 1;
+}
+
+// Pipelines for the in-game modern mesh path. Both draw into the load render
+// pass so they see the legacy scene colour and share its depth buffer.
+static int CreateGameModernPipelines(void)
+{
+	if (!g_vk.modernRenderPass)
+		return 0;
+
+	VkVertexInputBindingDescription binding;
+	memset(&binding, 0, sizeof(binding));
+	binding.binding = 0;
+	binding.stride = sizeof(VkVertex);
+	binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+	VkVertexInputAttributeDescription attributes[4];
+	memset(attributes, 0, sizeof(attributes));
+	attributes[0].location = 0; attributes[0].binding = 0; attributes[0].format = VK_FORMAT_R32G32B32_SFLOAT; attributes[0].offset = 0;
+	attributes[1].location = 1; attributes[1].binding = 0; attributes[1].format = VK_FORMAT_R32G32B32A32_SFLOAT; attributes[1].offset = 12;
+	attributes[2].location = 2; attributes[2].binding = 0; attributes[2].format = VK_FORMAT_R32G32B32_SFLOAT; attributes[2].offset = 28;
+	attributes[3].location = 3; attributes[3].binding = 0; attributes[3].format = VK_FORMAT_R32G32_SFLOAT; attributes[3].offset = 40;
+
+	VkPipelineVertexInputStateCreateInfo vertexInput;
+	memset(&vertexInput, 0, sizeof(vertexInput));
+	vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+	vertexInput.vertexBindingDescriptionCount = 1;
+	vertexInput.pVertexBindingDescriptions = &binding;
+	vertexInput.vertexAttributeDescriptionCount = 4;
+	vertexInput.pVertexAttributeDescriptions = attributes;
+
+	VkPipelineInputAssemblyStateCreateInfo assembly;
+	memset(&assembly, 0, sizeof(assembly));
+	assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+	assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+	VkPipelineViewportStateCreateInfo viewport;
+	memset(&viewport, 0, sizeof(viewport));
+	viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+	viewport.viewportCount = 1;
+	viewport.scissorCount = 1;
+
+	VkPipelineRasterizationStateCreateInfo raster;
+	memset(&raster, 0, sizeof(raster));
+	raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+	raster.polygonMode = VK_POLYGON_MODE_FILL;
+	raster.cullMode = VK_CULL_MODE_NONE;
+	raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+	raster.lineWidth = 1.0f;
+
+	VkPipelineMultisampleStateCreateInfo multisample;
+	memset(&multisample, 0, sizeof(multisample));
+	multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+	multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+	VkDynamicState dynamicStates[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+	VkPipelineDynamicStateCreateInfo dynamic;
+	memset(&dynamic, 0, sizeof(dynamic));
+	dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+	dynamic.dynamicStateCount = 2;
+	dynamic.pDynamicStates = dynamicStates;
+
+	// PBR pass: opaque, shares the legacy depth (LEQUAL, writes).
+	{
+		VkShaderModule vertex = CreateShaderModuleFromSpirv(psx_modern_vert_spv, psx_modern_vert_spv_size);
+		VkShaderModule fragment = CreateShaderModuleFromSpirv(psx_modern_frag_spv, psx_modern_frag_spv_size);
+		if (!vertex || !fragment)
+			return 0;
+
+		VkPipelineShaderStageCreateInfo stages[2];
+		memset(stages, 0, sizeof(stages));
+		stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+		stages[0].module = vertex;
+		stages[0].pName = "main";
+		stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+		stages[1].module = fragment;
+		stages[1].pName = "main";
+
+		VkPipelineDepthStencilStateCreateInfo depthStencil;
+		memset(&depthStencil, 0, sizeof(depthStencil));
+		depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+		depthStencil.depthTestEnable = VK_TRUE;
+		depthStencil.depthWriteEnable = VK_TRUE;
+		depthStencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+		VkPipelineColorBlendAttachmentState blendAttachment;
+		memset(&blendAttachment, 0, sizeof(blendAttachment));
+		blendAttachment.blendEnable = VK_FALSE;
+		blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+			VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+		VkPipelineColorBlendStateCreateInfo blend;
+		memset(&blend, 0, sizeof(blend));
+		blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+		blend.attachmentCount = 1;
+		blend.pAttachments = &blendAttachment;
+
+		VkGraphicsPipelineCreateInfo pipeline;
+		memset(&pipeline, 0, sizeof(pipeline));
+		pipeline.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+		pipeline.stageCount = 2;
+		pipeline.pStages = stages;
+		pipeline.pVertexInputState = &vertexInput;
+		pipeline.pInputAssemblyState = &assembly;
+		pipeline.pViewportState = &viewport;
+		pipeline.pRasterizationState = &raster;
+		pipeline.pMultisampleState = &multisample;
+		pipeline.pDepthStencilState = &depthStencil;
+		pipeline.pColorBlendState = &blend;
+		pipeline.pDynamicState = &dynamic;
+		pipeline.layout = g_vk.pipelineLayout;
+		pipeline.renderPass = g_vk.modernRenderPass;
+		pipeline.subpass = 0;
+
+		const int ok = VkOk(vkCreateGraphicsPipelines(g_vk.device, VK_NULL_HANDLE, 1, &pipeline, NULL, &g_vk.gameModernPipeline),
+			"vkCreateGraphicsPipelines(game modern)");
+
+		vkDestroyShaderModule(g_vk.device, vertex, NULL);
+		vkDestroyShaderModule(g_vk.device, fragment, NULL);
+
+		if (!ok)
+			return 0;
+	}
+
+	// Shadow composite: fullscreen triangle over the legacy colour, multiplied
+	// by the shadow term (the OpenGL path's GL_DST_COLOR/GL_ZERO blend).
+	{
+		VkShaderModule vertex = CreateShaderModuleFromSpirv(fullscreen_vert_spv, fullscreen_vert_spv_size);
+		VkShaderModule fragment = CreateShaderModuleFromSpirv(psx_composite_frag_spv, psx_composite_frag_spv_size);
+		if (!vertex || !fragment)
+			return 0;
+
+		VkPipelineShaderStageCreateInfo stages[2];
+		memset(stages, 0, sizeof(stages));
+		stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+		stages[0].module = vertex;
+		stages[0].pName = "main";
+		stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+		stages[1].module = fragment;
+		stages[1].pName = "main";
+
+		VkPipelineVertexInputStateCreateInfo emptyVertexInput;
+		memset(&emptyVertexInput, 0, sizeof(emptyVertexInput));
+		emptyVertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+		VkPipelineDepthStencilStateCreateInfo depthStencil;
+		memset(&depthStencil, 0, sizeof(depthStencil));
+		depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+		depthStencil.depthTestEnable = VK_FALSE;
+		depthStencil.depthWriteEnable = VK_FALSE;
+
+		VkPipelineColorBlendAttachmentState blendAttachment;
+		memset(&blendAttachment, 0, sizeof(blendAttachment));
+		blendAttachment.blendEnable = VK_TRUE;
+		blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_DST_COLOR;
+		blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+		blendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+		blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+		blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+		blendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+		blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+			VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+		VkPipelineColorBlendStateCreateInfo blend;
+		memset(&blend, 0, sizeof(blend));
+		blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+		blend.attachmentCount = 1;
+		blend.pAttachments = &blendAttachment;
+
+		VkGraphicsPipelineCreateInfo pipeline;
+		memset(&pipeline, 0, sizeof(pipeline));
+		pipeline.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+		pipeline.stageCount = 2;
+		pipeline.pStages = stages;
+		pipeline.pVertexInputState = &emptyVertexInput;
+		pipeline.pInputAssemblyState = &assembly;
+		pipeline.pViewportState = &viewport;
+		pipeline.pRasterizationState = &raster;
+		pipeline.pMultisampleState = &multisample;
+		pipeline.pDepthStencilState = &depthStencil;
+		pipeline.pColorBlendState = &blend;
+		pipeline.pDynamicState = &dynamic;
+		pipeline.layout = g_vk.pipelineLayout;
+		pipeline.renderPass = g_vk.modernRenderPass;
+		pipeline.subpass = 0;
+
+		const int ok = VkOk(vkCreateGraphicsPipelines(g_vk.device, VK_NULL_HANDLE, 1, &pipeline, NULL, &g_vk.gameCompositePipeline),
+			"vkCreateGraphicsPipelines(game composite)");
+
+		vkDestroyShaderModule(g_vk.device, vertex, NULL);
+		vkDestroyShaderModule(g_vk.device, fragment, NULL);
+
+		if (!ok)
+			return 0;
+	}
+
+	return 1;
+}
+
+static int CreateGameModernResources(void)
+{
+	if (!CreateBuffer(sizeof(VkGameModernUbo), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		&g_vk.gameModernUboBuffer, &g_vk.gameModernUboMemory, (void**)&g_vk.gameModernUboMapped))
+		return 0;
+
+	memset(g_vk.gameModernUboMapped, 0, sizeof(VkGameModernUbo));
+	return CreateGameModernPipelines();
 }
 
 // ---------------------------------------------------------------------------
@@ -1521,6 +1880,48 @@ static int CreateRenderPasses(void)
 		return 0;
 
 	VkStage("main pass depth-stencil format %d stencil=%d", (int)depthFormat, g_vk.psx.stencilSupported);
+
+	// Modern pass: the in-game modern meshes and the shadow composite draw
+	// after the legacy scene into the same colour/depth images, so this pass
+	// loads instead of clearing. The attachment formats and references match
+	// the main pass, so the same attachment views are used.
+	VkAttachmentDescription modernAttachments[2];
+	memset(modernAttachments, 0, sizeof(modernAttachments));
+	modernAttachments[0] = attachments[0];
+	modernAttachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+	modernAttachments[0].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	modernAttachments[1] = attachments[1];
+	modernAttachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+	modernAttachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+	modernAttachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	modernAttachments[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+	// The modern pass loads the colour and depth the main pass wrote, so unlike
+	// the main pass's external dependency it must declare those writes
+	// available; otherwise the loaded depth is unsynchronized and the modern
+	// meshes are depth-rejected against stale data.
+	VkSubpassDependency modernDependency;
+	memset(&modernDependency, 0, sizeof(modernDependency));
+	modernDependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+	modernDependency.dstSubpass = 0;
+	modernDependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+		VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+	modernDependency.dstStageMask = modernDependency.srcStageMask;
+	modernDependency.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+	modernDependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+		VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+	memset(&renderPass, 0, sizeof(renderPass));
+	renderPass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+	renderPass.attachmentCount = 2;
+	renderPass.pAttachments = modernAttachments;
+	renderPass.subpassCount = 1;
+	renderPass.pSubpasses = &subpass;
+	renderPass.dependencyCount = 1;
+	renderPass.pDependencies = &modernDependency;
+
+	if (!VkOk(vkCreateRenderPass(g_vk.device, &renderPass, NULL, &g_vk.modernRenderPass), "vkCreateRenderPass(modern)"))
+		return 0;
 
 	// Shadow pass: depth only, sampled afterwards.
 	VkAttachmentDescription shadowAttachment;
@@ -2643,11 +3044,675 @@ void PsyX_Vk_GameDestroyTexture(int texture)
 	if (!tex->used)
 		return;
 
+	// Drop the overlay bridge first: its descriptor set references this view.
+	if (psx->overlayTextureSlot == texture)
+	{
+#ifdef PSYX_VK_IMGUI
+		if (psx->overlayTextureId)
+			ImGui_ImplVulkan_RemoveTexture((VkDescriptorSet)psx->overlayTextureId);
+#endif
+		psx->overlayTextureId = 0;
+		psx->overlayTextureSlot = 0;
+	}
+
 	if (tex->sampler) vkDestroySampler(g_vk.device, tex->sampler, NULL);
 	if (tex->view) vkDestroyImageView(g_vk.device, tex->view, NULL);
 	if (tex->image) vkDestroyImage(g_vk.device, tex->image, NULL);
 	if (tex->memory) vkFreeMemory(g_vk.device, tex->memory, NULL);
 	memset(tex, 0, sizeof(*tex));
+}
+
+unsigned long long PsyX_Vk_GameGetOverlayTextureId(int texture)
+{
+#ifdef PSYX_VK_IMGUI
+	VkPsxState* psx = &g_vk.psx;
+	if (!g_vk.initialised || !g_vk.imguiActive)
+		return 0;
+	if (texture <= 0 || texture > PSYX_VK_PSX_MAX_TEXTURES || !psx->textures[texture - 1].used)
+		return 0;
+
+	// One preview is visible at a time and the ImGui pool is small, so the
+	// bridge keeps exactly one user descriptor set alive.
+	if (psx->overlayTextureSlot == texture && psx->overlayTextureId != 0)
+		return psx->overlayTextureId;
+
+	if (psx->overlayTextureId)
+	{
+		ImGui_ImplVulkan_RemoveTexture((VkDescriptorSet)psx->overlayTextureId);
+		psx->overlayTextureId = 0;
+		psx->overlayTextureSlot = 0;
+	}
+
+	VkPsxTexture* tex = &psx->textures[texture - 1];
+	VkDescriptorSet set = ImGui_ImplVulkan_AddTexture(tex->sampler, tex->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+	if (set == VK_NULL_HANDLE)
+		return 0;
+
+	psx->overlayTextureId = (unsigned long long)set;
+	psx->overlayTextureSlot = texture;
+	return psx->overlayTextureId;
+#else
+	(void)texture;
+	return 0;
+#endif
+}
+
+void PsyX_Vk_GameGetTextureSize(int texture, int* width, int* height)
+{
+	VkPsxState* psx = &g_vk.psx;
+	const VkPsxTexture* tex = (texture > 0 && texture <= PSYX_VK_PSX_MAX_TEXTURES)
+		? &psx->textures[texture - 1]
+		: NULL;
+	if (width) *width = (tex && tex->used) ? tex->width : 0;
+	if (height) *height = (tex && tex->used) ? tex->height : 0;
+}
+
+// ---------------------------------------------------------------------------
+// In-game modern mesh (renderer roadmap R7b)
+//
+// Mirrors PsyX_ModernMesh.cpp's OpenGL path on the Vulkan backend: persistent
+// meshes drawn after the legacy scene into the shared colour/depth attachments,
+// the same PBR lighting set, the directional shadow map (casters) and the
+// legacy shadow composite (receivers). The game-side API is unchanged; only the
+// storage and draw calls differ.
+
+// Cofactor inverse of a column-major 4x4. Returns 0 when singular. Kept local
+// so the Vulkan backend does not depend on the OpenGL renderer's internals.
+static int InvertMatrix4(const float m[16], float out[16])
+{
+	float inv[16];
+
+	inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15]
+		+ m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+	inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15]
+		- m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+	inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15]
+		+ m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+	inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14]
+		- m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+	inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15]
+		- m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+	inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15]
+		+ m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+	inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15]
+		- m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+	inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14]
+		+ m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+	inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15]
+		+ m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+	inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15]
+		- m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+	inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15]
+		+ m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+	inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14]
+		- m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+	inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11]
+		- m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+	inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11]
+		+ m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+	inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11]
+		- m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+	inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10]
+		+ m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+
+	float det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+	if (det > -1e-12f && det < 1e-12f)
+		return 0;
+
+	det = 1.0f / det;
+	for (int i = 0; i < 16; i++)
+		out[i] = inv[i] * det;
+	return 1;
+}
+
+// Game texture handle accessor: 1-based PSX texture slots, 0 = neutral default.
+static const VkPsxTexture* GameTextureForHandle(int handle)
+{
+	if (handle <= 0 || handle > PSYX_VK_PSX_MAX_TEXTURES)
+		return NULL;
+	const VkPsxTexture* tex = &g_vk.psx.textures[handle - 1];
+	return tex->used ? tex : NULL;
+}
+
+static void GameDefaultMaterialView(int slot, VkImageView* viewOut, VkSampler* samplerOut)
+{
+	// 0 = base colour, 1 = normal, 2 = metallic/roughness, 3 = emissive.
+	// White is the identity multiply for base/mr/emissive; the flat normal map
+	// reconstructs the geometric normal.
+	static const int defaults[4] = { 0, 1, 0, 0 };
+	const int dummy = g_vk.dummyTextures[defaults[slot]];
+	if (dummy >= 0 && g_textures[dummy].used)
+	{
+		*viewOut = g_textures[dummy].view;
+		*samplerOut = g_vk.textureSampler;
+	}
+	else
+	{
+		*viewOut = VK_NULL_HANDLE;
+		*samplerOut = VK_NULL_HANDLE;
+	}
+}
+
+static void UpdateGameMeshDescriptorSet(VkGameMesh* mesh)
+{
+	if (!mesh->descriptorSet || !g_vk.gameModernUboBuffer)
+		return;
+
+	VkDescriptorBufferInfo bufferInfo;
+	memset(&bufferInfo, 0, sizeof(bufferInfo));
+	bufferInfo.buffer = g_vk.gameModernUboBuffer;
+	bufferInfo.offset = 0;
+	bufferInfo.range = sizeof(VkGameModernUbo);
+
+	VkDescriptorImageInfo shadowInfo;
+	memset(&shadowInfo, 0, sizeof(shadowInfo));
+	shadowInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	shadowInfo.imageView = g_vk.shadowView;
+	shadowInfo.sampler = g_vk.shadowSampler;
+
+	VkDescriptorImageInfo materialInfos[4];
+	memset(materialInfos, 0, sizeof(materialInfos));
+	for (int i = 0; i < 4; i++)
+	{
+		VkImageView view = VK_NULL_HANDLE;
+		VkSampler sampler = VK_NULL_HANDLE;
+		GameDefaultMaterialView(i, &view, &sampler);
+
+		const VkPsxTexture* texture = GameTextureForHandle(mesh->textureSlots[i]);
+		if (texture)
+		{
+			view = texture->view;
+			sampler = texture->sampler;
+		}
+
+		materialInfos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		materialInfos[i].imageView = view;
+		materialInfos[i].sampler = sampler;
+	}
+
+	VkWriteDescriptorSet writes[6];
+	memset(writes, 0, sizeof(writes));
+
+	writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	writes[0].dstSet = mesh->descriptorSet;
+	writes[0].dstBinding = 0;
+	writes[0].descriptorCount = 1;
+	writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	writes[0].pBufferInfo = &bufferInfo;
+
+	writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	writes[1].dstSet = mesh->descriptorSet;
+	writes[1].dstBinding = 1;
+	writes[1].descriptorCount = 1;
+	writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	writes[1].pImageInfo = &shadowInfo;
+
+	for (int i = 0; i < 4; i++)
+	{
+		writes[2 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[2 + i].dstSet = mesh->descriptorSet;
+		writes[2 + i].dstBinding = (uint32_t)(2 + i);
+		writes[2 + i].descriptorCount = 1;
+		writes[2 + i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		writes[2 + i].pImageInfo = &materialInfos[i];
+	}
+
+	vkUpdateDescriptorSets(g_vk.device, 6, writes, 0, NULL);
+}
+
+static void UpdateGameCompositeDescriptorSet(void)
+{
+	if (!g_vk.gameCompositeSet || !g_vk.gameModernUboBuffer || !g_vk.sceneDepthView)
+		return;
+
+	VkDescriptorBufferInfo bufferInfo;
+	memset(&bufferInfo, 0, sizeof(bufferInfo));
+	bufferInfo.buffer = g_vk.gameModernUboBuffer;
+	bufferInfo.offset = 0;
+	bufferInfo.range = sizeof(VkGameModernUbo);
+
+	VkDescriptorImageInfo shadowInfo;
+	memset(&shadowInfo, 0, sizeof(shadowInfo));
+	shadowInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	shadowInfo.imageView = g_vk.shadowView;
+	shadowInfo.sampler = g_vk.shadowSampler;
+
+	VkDescriptorImageInfo depthInfo;
+	memset(&depthInfo, 0, sizeof(depthInfo));
+	depthInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	depthInfo.imageView = g_vk.sceneDepthView;
+	depthInfo.sampler = g_vk.sceneDepthSampler;
+
+	VkWriteDescriptorSet writes[3];
+	memset(writes, 0, sizeof(writes));
+
+	writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	writes[0].dstSet = g_vk.gameCompositeSet;
+	writes[0].dstBinding = 0;
+	writes[0].descriptorCount = 1;
+	writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	writes[0].pBufferInfo = &bufferInfo;
+
+	writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	writes[1].dstSet = g_vk.gameCompositeSet;
+	writes[1].dstBinding = 1;
+	writes[1].descriptorCount = 1;
+	writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	writes[1].pImageInfo = &shadowInfo;
+
+	writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	writes[2].dstSet = g_vk.gameCompositeSet;
+	writes[2].dstBinding = 2;
+	writes[2].descriptorCount = 1;
+	writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	writes[2].pImageInfo = &depthInfo;
+
+	vkUpdateDescriptorSets(g_vk.device, 3, writes, 0, NULL);
+}
+
+int PsyX_Vk_GameModernMeshCreate(const PsyXModernMeshDesc* desc)
+{
+	if (!g_vk.initialised || !g_vk.psx.ready || !desc || !desc->positions || desc->vertexCount <= 0)
+		return -1;
+	if (g_vk.gameModernMeshCount >= PSYX_VK_GAME_MODERN_MAX_MESHES)
+		return -1;
+
+	int slot = -1;
+	for (int i = 0; i < PSYX_VK_GAME_MODERN_MAX_MESHES; i++)
+	{
+		if (!g_vk.gameMeshes[i].used)
+		{
+			slot = i;
+			break;
+		}
+	}
+	if (slot < 0)
+		return -1;
+
+	VkGameMesh* mesh = &g_vk.gameMeshes[slot];
+	const VkDescriptorSet descriptorSet = mesh->descriptorSet;
+	memset(mesh, 0, sizeof(*mesh));
+	mesh->descriptorSet = descriptorSet;
+
+	VkVertex* vertices = new VkVertex[desc->vertexCount];
+	FillMeshVertices(desc, vertices);
+
+	const VkDeviceSize vertexBytes = (VkDeviceSize)desc->vertexCount * sizeof(VkVertex);
+	void* vertexMapped = NULL;
+	if (!CreateBuffer(vertexBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		&mesh->vertexBuffer, &mesh->vertexMemory, &vertexMapped))
+	{
+		delete[] vertices;
+		return -1;
+	}
+	memcpy(vertexMapped, vertices, (size_t)vertexBytes);
+	delete[] vertices;
+	mesh->vertexCount = desc->vertexCount;
+
+	if (desc->indices && desc->indexCount > 0)
+	{
+		uint32_t* indices = new uint32_t[desc->indexCount];
+		for (int i = 0; i < desc->indexCount; i++)
+			indices[i] = desc->indices[i];
+
+		const VkDeviceSize indexBytes = (VkDeviceSize)desc->indexCount * sizeof(uint32_t);
+		void* indexMapped = NULL;
+		if (!CreateBuffer(indexBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			&mesh->indexBuffer, &mesh->indexMemory, &indexMapped))
+		{
+			delete[] indices;
+			return -1;
+		}
+		memcpy(indexMapped, indices, (size_t)indexBytes);
+		delete[] indices;
+		mesh->indexCount = desc->indexCount;
+	}
+
+	// Texture handles are the game's PsyX_CreateRGBATexture handles; the
+	// descriptor set resolves them against the PSX texture table at draw time.
+	mesh->textureSlots[0] = (int)desc->baseColorTexture;
+	mesh->textureSlots[1] = (int)desc->normalTexture;
+	mesh->textureSlots[2] = (int)desc->metallicRoughnessTexture;
+	mesh->textureSlots[3] = (int)desc->emissiveTexture;
+
+	mesh->factors[0] = desc->metallicFactor;
+	mesh->factors[1] = desc->roughnessFactor;
+	mesh->emissive[0] = desc->emissiveFactor ? desc->emissiveFactor[0] : 0.0f;
+	mesh->emissive[1] = desc->emissiveFactor ? desc->emissiveFactor[1] : 0.0f;
+	mesh->emissive[2] = desc->emissiveFactor ? desc->emissiveFactor[2] : 0.0f;
+
+	mesh->world[0] = mesh->world[5] = mesh->world[10] = mesh->world[15] = 1.0f;
+	mesh->color[0] = mesh->color[1] = mesh->color[2] = mesh->color[3] = 1.0f;
+	mesh->visible = 1;
+	mesh->used = 1;
+	g_vk.gameModernMeshCount++;
+
+	UpdateGameMeshDescriptorSet(mesh);
+	return slot;
+}
+
+void PsyX_Vk_GameModernMeshDestroy(int mesh)
+{
+	if (mesh < 0 || mesh >= PSYX_VK_GAME_MODERN_MAX_MESHES || !g_vk.gameMeshes[mesh].used)
+		return;
+
+	VkGameMesh* m = &g_vk.gameMeshes[mesh];
+	vkDeviceWaitIdle(g_vk.device);
+
+	const VkDescriptorSet descriptorSet = m->descriptorSet;
+	if (m->vertexBuffer) vkDestroyBuffer(g_vk.device, m->vertexBuffer, NULL);
+	if (m->vertexMemory) vkFreeMemory(g_vk.device, m->vertexMemory, NULL);
+	if (m->indexBuffer) vkDestroyBuffer(g_vk.device, m->indexBuffer, NULL);
+	if (m->indexMemory) vkFreeMemory(g_vk.device, m->indexMemory, NULL);
+
+	memset(m, 0, sizeof(*m));
+	m->descriptorSet = descriptorSet;
+	g_vk.gameModernMeshCount--;
+}
+
+void PsyX_Vk_GameModernMeshSetInstance(int mesh, const float viewMatrix[16],
+	const float color[4], int visible)
+{
+	if (mesh < 0 || mesh >= PSYX_VK_GAME_MODERN_MAX_MESHES || !g_vk.gameMeshes[mesh].used)
+		return;
+
+	// The view matrix is derived in the shader from the world matrix and the
+	// frame camera, so only the tint and visibility are stored here.
+	(void)viewMatrix;
+	if (color)
+		memcpy(g_vk.gameMeshes[mesh].color, color, sizeof(g_vk.gameMeshes[mesh].color));
+	g_vk.gameMeshes[mesh].visible = visible != 0;
+}
+
+void PsyX_Vk_GameModernMeshSetInstanceWorld(int mesh, const float worldMatrix[16])
+{
+	if (mesh < 0 || mesh >= PSYX_VK_GAME_MODERN_MAX_MESHES || !g_vk.gameMeshes[mesh].used)
+		return;
+
+	if (worldMatrix)
+		memcpy(g_vk.gameMeshes[mesh].world, worldMatrix, sizeof(g_vk.gameMeshes[mesh].world));
+}
+
+void PsyX_Vk_GameModernMeshSetLights(const PsyXModernLightSet* lights)
+{
+	if (lights)
+		g_vk.lights = *lights;
+}
+
+void PsyX_Vk_GameModernMeshSetCamera(const float viewRotation[16], const float cameraPosition[3])
+{
+	if (viewRotation)
+		memcpy(g_vk.modernCameraRotation, viewRotation, sizeof(g_vk.modernCameraRotation));
+	if (cameraPosition)
+		memcpy(g_vk.modernCameraPosition, cameraPosition, sizeof(g_vk.modernCameraPosition));
+
+	g_vk.modernCameraValid = (viewRotation != NULL && cameraPosition != NULL);
+}
+
+void PsyX_Vk_GameModernMeshSetShadowDebug(int mode)
+{
+	g_vk.gameModernShadowDebug = mode;
+}
+
+void PsyX_Vk_GameModernMeshSetEnabled(int enabled)
+{
+	g_vk.gameModernEnabled = enabled != 0;
+}
+
+int PsyX_Vk_GameModernMeshGetEnabled(void)
+{
+	return g_vk.gameModernEnabled;
+}
+
+void PsyX_Vk_GameModernMeshGetStats(PsyXModernMeshStats* stats)
+{
+	if (stats)
+		*stats = g_vk.gameModernStats;
+}
+
+void PsyX_Vk_GameModernMeshShutdown(void)
+{
+	for (int i = 0; i < PSYX_VK_GAME_MODERN_MAX_MESHES; i++)
+	{
+		if (g_vk.gameMeshes[i].used)
+			PsyX_Vk_GameModernMeshDestroy(i);
+	}
+}
+
+// Builds the frame's modern UBO: the legacy Projection3D captured by
+// GR_Perspective3D, the GTE screen scales, the frame camera, the light set and
+// the shadow volume.
+static void UpdateGameModernUbo(void)
+{
+	VkGameModernUbo* ubo = g_vk.gameModernUboMapped;
+	if (!ubo)
+		return;
+
+	memset(ubo, 0, sizeof(*ubo));
+
+	static const float identity[16] =
+	{
+		1.0f, 0.0f, 0.0f, 0.0f,
+		0.0f, 1.0f, 0.0f, 0.0f,
+		0.0f, 0.0f, 1.0f, 0.0f,
+		0.0f, 0.0f, 0.0f, 1.0f,
+	};
+
+	const float* projection = g_psyxModernProjectionValid ? g_psyxModernProjection : identity;
+	memcpy(ubo->proj, projection, sizeof(ubo->proj));
+	if (!InvertMatrix4(ubo->proj, ubo->projInverse))
+		memset(ubo->projInverse, 0, sizeof(ubo->projInverse));
+
+	// The OpenGL modern path's device-space encoding: the GTE screen distance
+	// over the display size, and camera z over the same fixed-point factor.
+	float displayWidth = 320.0f;
+	float displayHeight = 240.0f;
+	if (activeDispEnv.disp.w > 0 && activeDispEnv.disp.h > 0)
+	{
+		displayWidth = (float)activeDispEnv.disp.w;
+		displayHeight = (float)activeDispEnv.disp.h;
+	}
+	ubo->xyScale[0] = (float)C2_H / (128.0f * displayWidth);
+	ubo->xyScale[1] = (float)C2_H / (128.0f * displayHeight);
+	ubo->xyScale[2] = 1.0f / 128.0f;
+
+	memcpy(ubo->cameraRotation, g_vk.modernCameraRotation, sizeof(ubo->cameraRotation));
+	ubo->cameraPos[0] = g_vk.modernCameraPosition[0];
+	ubo->cameraPos[1] = g_vk.modernCameraPosition[1];
+	ubo->cameraPos[2] = g_vk.modernCameraPosition[2];
+
+	// Full camera view (rotation + translation) inverted for the composite's
+	// view-space -> world-space reconstruction, exactly like the OpenGL path.
+	{
+		float view[16];
+		memcpy(view, g_vk.modernCameraRotation, sizeof(view));
+		const float cx = g_vk.modernCameraPosition[0];
+		const float cy = g_vk.modernCameraPosition[1];
+		const float cz = g_vk.modernCameraPosition[2];
+		view[12] = -(view[0] * cx + view[4] * cy + view[8] * cz);
+		view[13] = -(view[1] * cx + view[5] * cy + view[9] * cz);
+		view[14] = -(view[2] * cx + view[6] * cy + view[10] * cz);
+		view[3] = view[7] = view[11] = 0.0f;
+		view[15] = 1.0f;
+		if (!InvertMatrix4(view, ubo->cameraViewInverse))
+			memset(ubo->cameraViewInverse, 0, sizeof(ubo->cameraViewInverse));
+	}
+
+	BuildShadowMatrix(ubo->shadowMatrix);
+
+	ubo->shadowParams[0] = g_vk.lights.shadowsEnabled ? 1.0f : 0.0f;
+	ubo->shadowParams[1] = 1.0f / (float)kShadowSize;
+	ubo->shadowParams[2] = 0.45f;
+	ubo->shadowParams[3] = g_vk.lights.aoEnabled ? 1.0f : 0.0f;
+
+	int lightCount = g_vk.lights.count;
+	if (lightCount < 0) lightCount = 0;
+	if (lightCount > PSYX_VK_MAX_LIGHTS) lightCount = PSYX_VK_MAX_LIGHTS;
+
+	ubo->lightInfo[0] = (float)lightCount;
+	ubo->lightInfo[1] = g_vk.srgbOutput ? 1.0f : 0.0f;
+	ubo->lightInfo[2] = (float)g_vk.gameModernShadowDebug;
+
+	ubo->ambientExposure[0] = g_vk.lights.ambient[0];
+	ubo->ambientExposure[1] = g_vk.lights.ambient[1];
+	ubo->ambientExposure[2] = g_vk.lights.ambient[2];
+	ubo->ambientExposure[3] = g_vk.lights.exposure > 0.0f ? g_vk.lights.exposure : 1.0f;
+
+	ubo->viewport[0] = (float)g_vk.width;
+	ubo->viewport[1] = (float)g_vk.height;
+
+	for (int i = 0; i < lightCount; i++)
+	{
+		const PsyXModernLight* light = &g_vk.lights.lights[i];
+		ubo->lights[i].posRange[0] = light->position[0];
+		ubo->lights[i].posRange[1] = light->position[1];
+		ubo->lights[i].posRange[2] = light->position[2];
+		ubo->lights[i].posRange[3] = light->range > 0.0f ? light->range : 1000.0f;
+		ubo->lights[i].dirType[0] = light->direction[0];
+		ubo->lights[i].dirType[1] = light->direction[1];
+		ubo->lights[i].dirType[2] = light->direction[2];
+		ubo->lights[i].dirType[3] = (float)light->type;
+		ubo->lights[i].color[0] = light->color[0] * light->intensity;
+		ubo->lights[i].color[1] = light->color[1] * light->intensity;
+		ubo->lights[i].color[2] = light->color[2] * light->intensity;
+	}
+}
+
+// Records the modern shadow casters into the already-open shadow pass. Casters
+// use their world matrix, so an instance casts where it stands.
+static void RecordGameModernShadowPass(VkCommandBuffer cmd)
+{
+	if (!g_vk.gameModernEnabled || !g_vk.lights.shadowsEnabled || !g_vk.gameModernUboMapped)
+		return;
+
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.shadowPipeline);
+
+	for (int i = 0; i < PSYX_VK_GAME_MODERN_MAX_MESHES; i++)
+	{
+		VkGameMesh* mesh = &g_vk.gameMeshes[i];
+		if (!mesh->used || !mesh->visible || mesh->vertexCount == 0)
+			continue;
+
+		float lightWorld[16];
+		MulMatrix4(g_vk.gameModernUboMapped->shadowMatrix, mesh->world, lightWorld);
+
+		vkCmdPushConstants(cmd, g_vk.shadowPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, lightWorld);
+
+		VkDeviceSize offset = 0;
+		vkCmdBindVertexBuffers(cmd, 0, 1, &mesh->vertexBuffer, &offset);
+		if (mesh->indexCount > 0)
+		{
+			vkCmdBindIndexBuffer(cmd, mesh->indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+			vkCmdDrawIndexed(cmd, (uint32_t)mesh->indexCount, 1, 0, 0, 0);
+		}
+		else
+		{
+			vkCmdDraw(cmd, (uint32_t)mesh->vertexCount, 1, 0, 0);
+		}
+	}
+}
+
+// Copies the legacy scene depth (written by the main pass) into a sampleable
+// image so the composite can reconstruct world positions for shaded pixels.
+static void RecordGameModernSceneDepthCopy(VkCommandBuffer cmd)
+{
+	VkImageAspectFlags aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+
+	ImageBarrier(cmd, g_vk.depthImage, aspect,
+		VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+
+	VkImageCopy copy;
+	memset(&copy, 0, sizeof(copy));
+	copy.srcSubresource.aspectMask = aspect;
+	copy.srcSubresource.layerCount = 1;
+	copy.dstSubresource.aspectMask = aspect;
+	copy.dstSubresource.layerCount = 1;
+	copy.extent.width = (uint32_t)g_vk.width;
+	copy.extent.height = (uint32_t)g_vk.height;
+	copy.extent.depth = 1;
+	vkCmdCopyImage(cmd, g_vk.depthImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		g_vk.sceneDepthImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+	ImageBarrier(cmd, g_vk.depthImage, aspect,
+		VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+		VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+
+	ImageBarrier(cmd, g_vk.sceneDepthImage, aspect,
+		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+}
+
+// Draws the modern meshes into the current (load) pass. Returns the number of
+// draw calls and fills the shared stats.
+static int RecordGameModernMeshes(VkCommandBuffer cmd)
+{
+	PsyXModernMeshStats* stats = &g_vk.gameModernStats;
+	const int legacyShadowPass = stats->legacyShadowPass;
+	memset(stats, 0, sizeof(*stats));
+	stats->legacyShadowPass = legacyShadowPass;
+	stats->meshCount = g_vk.gameModernMeshCount;
+	stats->depthShared = 1;
+
+	if (!g_vk.gameModernEnabled || g_vk.gameModernMeshCount == 0 || !g_vk.gameModernPipeline)
+		return 0;
+
+	const Uint64 start = SDL_GetPerformanceCounter();
+	int draws = 0;
+
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.gameModernPipeline);
+
+	for (int i = 0; i < PSYX_VK_GAME_MODERN_MAX_MESHES; i++)
+	{
+		VkGameMesh* mesh = &g_vk.gameMeshes[i];
+		if (!mesh->used || !mesh->visible || mesh->vertexCount == 0)
+			continue;
+
+		float push[28];
+		memcpy(push, mesh->world, sizeof(mesh->world));
+		memcpy(push + 16, mesh->color, sizeof(mesh->color));
+		push[20] = mesh->factors[0];
+		push[21] = mesh->factors[1];
+		push[22] = 0.0f;
+		push[23] = 0.0f;
+		push[24] = mesh->emissive[0];
+		push[25] = mesh->emissive[1];
+		push[26] = mesh->emissive[2];
+		push[27] = 0.0f;
+
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+			g_vk.pipelineLayout, 0, 1, &mesh->descriptorSet, 0, NULL);
+		vkCmdPushConstants(cmd, g_vk.pipelineLayout,
+			VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
+
+		VkDeviceSize offset = 0;
+		vkCmdBindVertexBuffers(cmd, 0, 1, &mesh->vertexBuffer, &offset);
+		if (mesh->indexCount > 0)
+		{
+			vkCmdBindIndexBuffer(cmd, mesh->indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+			vkCmdDrawIndexed(cmd, (uint32_t)mesh->indexCount, 1, 0, 0, 0);
+		}
+		else
+		{
+			vkCmdDraw(cmd, (uint32_t)mesh->vertexCount, 1, 0, 0);
+		}
+
+		stats->visibleInstances++;
+		stats->vertexCount += mesh->vertexCount;
+		stats->drawCalls++;
+		draws++;
+	}
+
+	const Uint64 end = SDL_GetPerformanceCounter();
+	const Uint64 frequency = SDL_GetPerformanceFrequency();
+	stats->lastFrameMicros = frequency ? (int)((end - start) * 1000000ull / frequency) : 0;
+
+	return draws;
 }
 
 void PsyX_Vk_GameEndFrame(void)
@@ -3391,34 +4456,11 @@ void PsyX_Vk_SetMeshFactors(int mesh, float metallic, float roughness, float emi
 	g_vk.meshes[mesh].factors[2] = emissiveScale;
 }
 
-int PsyX_Vk_CreateMesh(const PsyXModernMeshDesc* desc)
+// Normalises a shared modern-mesh description into the pipeline's fixed
+// vertex layout. The base colour factor is baked into the vertex colour so the
+// shaders only need the per-instance tint.
+static void FillMeshVertices(const PsyXModernMeshDesc* desc, VkVertex* vertices)
 {
-	if (!g_vk.initialised || !desc || !desc->positions || desc->vertexCount <= 0)
-		return -1;
-	if (g_vk.meshCount >= PSYX_VK_MAX_MESHES)
-		return -1;
-
-	int slot = -1;
-	for (int i = 0; i < PSYX_VK_MAX_MESHES; i++)
-	{
-		if (!g_vk.meshes[i].used)
-		{
-			slot = i;
-			break;
-		}
-	}
-	if (slot < 0)
-		return -1;
-
-	VkMesh* mesh = &g_vk.meshes[slot];
-	// The descriptor set is allocated once at initialisation; keep it across
-	// the reset.
-	const VkDescriptorSet descriptorSet = mesh->descriptorSet;
-	memset(mesh, 0, sizeof(*mesh));
-	mesh->descriptorSet = descriptorSet;
-
-	// Normalise to the pipeline's fixed vertex layout.
-	VkVertex* vertices = new VkVertex[desc->vertexCount];
 	for (int i = 0; i < desc->vertexCount; i++)
 	{
 		vertices[i].pos[0] = desc->positions[i * 3 + 0];
@@ -3450,14 +4492,42 @@ int PsyX_Vk_CreateMesh(const PsyXModernMeshDesc* desc)
 			vertices[i].uv[1] = desc->uvs[i * 2 + 1];
 		}
 
-		// The base colour factor is baked into the vertex colour so the shader
-		// needs only the per-instance tint.
 		if (desc->baseColorFactor)
 		{
 			for (int c = 0; c < 4; c++)
 				vertices[i].color[c] *= desc->baseColorFactor[c];
 		}
 	}
+}
+
+int PsyX_Vk_CreateMesh(const PsyXModernMeshDesc* desc)
+{
+	if (!g_vk.initialised || !desc || !desc->positions || desc->vertexCount <= 0)
+		return -1;
+	if (g_vk.meshCount >= PSYX_VK_MAX_MESHES)
+		return -1;
+
+	int slot = -1;
+	for (int i = 0; i < PSYX_VK_MAX_MESHES; i++)
+	{
+		if (!g_vk.meshes[i].used)
+		{
+			slot = i;
+			break;
+		}
+	}
+	if (slot < 0)
+		return -1;
+
+	VkMesh* mesh = &g_vk.meshes[slot];
+	// The descriptor set is allocated once at initialisation; keep it across
+	// the reset.
+	const VkDescriptorSet descriptorSet = mesh->descriptorSet;
+	memset(mesh, 0, sizeof(*mesh));
+	mesh->descriptorSet = descriptorSet;
+
+	VkVertex* vertices = new VkVertex[desc->vertexCount];
+	FillMeshVertices(desc, vertices);
 
 	const VkDeviceSize vertexBytes = (VkDeviceSize)desc->vertexCount * sizeof(VkVertex);
 	void* vertexMapped = NULL;
@@ -3585,6 +4655,8 @@ void PsyX_Vk_SetOverlayText(const char* text)
 // ---------------------------------------------------------------------------
 // Frame rendering
 
+static void BuildShadowMatrix(float out[16]);
+
 static void UpdateSceneUbo(void)
 {
 	VkSceneUbo* ubo = g_vk.uboMapped;
@@ -3608,9 +4680,6 @@ static void UpdateSceneUbo(void)
 
 	ubo->lightInfo[0] = (float)g_vk.lights.count;
 	ubo->lightInfo[1] = g_vk.srgbOutput ? 1.0f : 0.0f;
-
-	const float dir[3] = { 0.0f, 1.0f, 0.0f };
-	const float extent = g_vk.lights.shadowExtent > 0.0f ? g_vk.lights.shadowExtent : 4000.0f;
 
 	int lightCount = g_vk.lights.count;
 	if (lightCount < 0) lightCount = 0;
@@ -3640,73 +4709,84 @@ static void UpdateSceneUbo(void)
 		out->color[2] = light->color[2] * light->intensity;
 	}
 
-	// Shadow matrix: orthographic light volume around the shadow centre.
-	if (lightCount > 0)
+	BuildShadowMatrix(ubo->shadowMatrix);
+}
+
+// Orthographic shadow volume around the light set's shadow centre, with
+// Vulkan's [0,1] depth convention. Shared by the fixture UBO and the in-game
+// modern UBO so both shadow paths match the OpenGL construction.
+static void BuildShadowMatrix(float out[16])
+{
+	int lightCount = g_vk.lights.count;
+	if (lightCount < 0) lightCount = 0;
+	if (lightCount > PSYX_VK_MAX_LIGHTS) lightCount = PSYX_VK_MAX_LIGHTS;
+
+	if (lightCount == 0)
 	{
-		const PsyXModernLight* sun = NULL;
-		for (int i = 0; i < lightCount; i++)
-		{
-			if (g_vk.lights.lights[i].type == 0)
-			{
-				sun = &g_vk.lights.lights[i];
-				break;
-			}
-		}
-
-		float sunDir[3] = { 0.35f, 0.8f, 0.45f };
-		if (sun)
-		{
-			sunDir[0] = sun->direction[0];
-			sunDir[1] = sun->direction[1];
-			sunDir[2] = sun->direction[2];
-		}
-		float length = sqrtf(sunDir[0] * sunDir[0] + sunDir[1] * sunDir[1] + sunDir[2] * sunDir[2]);
-		length = length > 1e-5f ? length : 1.0f;
-		sunDir[0] /= length; sunDir[1] /= length; sunDir[2] /= length;
-
-		const float* c = g_vk.lights.shadowCenter;
-		const float eye[3] = { c[0] + sunDir[0] * extent * 2.0f, c[1] + sunDir[1] * extent * 2.0f, c[2] + sunDir[2] * extent * 2.0f };
-
-		// Reuse the OpenGL path's look-at/ortho construction (column-major).
-		float f[3] = { c[0] - eye[0], c[1] - eye[1], c[2] - eye[2] };
-		float fl = sqrtf(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
-		fl = fl > 1e-5f ? fl : 1.0f;
-		f[0] /= fl; f[1] /= fl; f[2] /= fl;
-
-		const int vertical = (sunDir[1] > 0.95f || sunDir[1] < -0.95f);
-		const float up[3] = { 0.0f, vertical ? 0.0f : 1.0f, vertical ? 1.0f : 0.0f };
-
-		float s[3] = { f[1] * up[2] - f[2] * up[1], f[2] * up[0] - f[0] * up[2], f[0] * up[1] - f[1] * up[0] };
-		float sl = sqrtf(s[0] * s[0] + s[1] * s[1] + s[2] * s[2]);
-		sl = sl > 1e-5f ? sl : 1.0f;
-		s[0] /= sl; s[1] /= sl; s[2] /= sl;
-
-		const float u[3] = { s[1] * f[2] - s[2] * f[1], s[2] * f[0] - s[0] * f[2], s[0] * f[1] - s[1] * f[0] };
-
-		float lightView[16];
-		lightView[0] = s[0]; lightView[4] = s[1]; lightView[8] = s[2]; lightView[12] = -(s[0] * eye[0] + s[1] * eye[1] + s[2] * eye[2]);
-		lightView[1] = u[0]; lightView[5] = u[1]; lightView[9] = u[2]; lightView[13] = -(u[0] * eye[0] + u[1] * eye[1] + u[2] * eye[2]);
-		lightView[2] = -f[0]; lightView[6] = -f[1]; lightView[10] = -f[2]; lightView[14] = (f[0] * eye[0] + f[1] * eye[1] + f[2] * eye[2]);
-		lightView[3] = 0.0f; lightView[7] = 0.0f; lightView[11] = 0.0f; lightView[15] = 1.0f;
-
-		// Orthographic projection with Vulkan's [0,1] depth convention.
-		float lightProj[16];
-		const float nearZ = 0.05f;
-		const float farZ = extent * 4.0f;
-		memset(lightProj, 0, sizeof(lightProj));
-		lightProj[0] = 2.0f / (2.0f * extent);
-		lightProj[5] = 2.0f / (2.0f * extent);
-		lightProj[10] = 1.0f / (nearZ - farZ);
-		lightProj[14] = nearZ / (nearZ - farZ);
-		lightProj[15] = 1.0f;
-
-		MulMatrix4(lightProj, lightView, ubo->shadowMatrix);
+		memset(out, 0, 16 * sizeof(float));
+		return;
 	}
-	else
+
+	const float extent = g_vk.lights.shadowExtent > 0.0f ? g_vk.lights.shadowExtent : 4000.0f;
+
+	const PsyXModernLight* sun = NULL;
+	for (int i = 0; i < lightCount; i++)
 	{
-		memset(ubo->shadowMatrix, 0, sizeof(ubo->shadowMatrix));
+		if (g_vk.lights.lights[i].type == 0)
+		{
+			sun = &g_vk.lights.lights[i];
+			break;
+		}
 	}
-	(void)dir;
+
+	float sunDir[3] = { 0.35f, 0.8f, 0.45f };
+	if (sun)
+	{
+		sunDir[0] = sun->direction[0];
+		sunDir[1] = sun->direction[1];
+		sunDir[2] = sun->direction[2];
+	}
+	float length = sqrtf(sunDir[0] * sunDir[0] + sunDir[1] * sunDir[1] + sunDir[2] * sunDir[2]);
+	length = length > 1e-5f ? length : 1.0f;
+	sunDir[0] /= length; sunDir[1] /= length; sunDir[2] /= length;
+
+	const float* c = g_vk.lights.shadowCenter;
+	const float eye[3] = { c[0] + sunDir[0] * extent * 2.0f, c[1] + sunDir[1] * extent * 2.0f, c[2] + sunDir[2] * extent * 2.0f };
+
+	// Reuse the OpenGL path's look-at/ortho construction (column-major).
+	float f[3] = { c[0] - eye[0], c[1] - eye[1], c[2] - eye[2] };
+	float fl = sqrtf(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+	fl = fl > 1e-5f ? fl : 1.0f;
+	f[0] /= fl; f[1] /= fl; f[2] /= fl;
+
+	const int vertical = (sunDir[1] > 0.95f || sunDir[1] < -0.95f);
+	const float up[3] = { 0.0f, vertical ? 0.0f : 1.0f, vertical ? 1.0f : 0.0f };
+
+	float s[3] = { f[1] * up[2] - f[2] * up[1], f[2] * up[0] - f[0] * up[2], f[0] * up[1] - f[1] * up[0] };
+	float sl = sqrtf(s[0] * s[0] + s[1] * s[1] + s[2] * s[2]);
+	sl = sl > 1e-5f ? sl : 1.0f;
+	s[0] /= sl; s[1] /= sl; s[2] /= sl;
+
+	const float u[3] = { s[1] * f[2] - s[2] * f[1], s[2] * f[0] - s[0] * f[2], s[0] * f[1] - s[1] * f[0] };
+
+	float lightView[16];
+	lightView[0] = s[0]; lightView[4] = s[1]; lightView[8] = s[2]; lightView[12] = -(s[0] * eye[0] + s[1] * eye[1] + s[2] * eye[2]);
+	lightView[1] = u[0]; lightView[5] = u[1]; lightView[9] = u[2]; lightView[13] = -(u[0] * eye[0] + u[1] * eye[1] + u[2] * eye[2]);
+	lightView[2] = -f[0]; lightView[6] = -f[1]; lightView[10] = -f[2]; lightView[14] = (f[0] * eye[0] + f[1] * eye[1] + f[2] * eye[2]);
+	lightView[3] = 0.0f; lightView[7] = 0.0f; lightView[11] = 0.0f; lightView[15] = 1.0f;
+
+	// Orthographic projection with Vulkan's [0,1] depth convention.
+	float lightProj[16];
+	const float nearZ = 0.05f;
+	const float farZ = extent * 4.0f;
+	memset(lightProj, 0, sizeof(lightProj));
+	lightProj[0] = 2.0f / (2.0f * extent);
+	lightProj[5] = 2.0f / (2.0f * extent);
+	lightProj[10] = 1.0f / (nearZ - farZ);
+	lightProj[14] = nearZ / (nearZ - farZ);
+	lightProj[15] = 1.0f;
+
+	MulMatrix4(lightProj, lightView, out);
 }
 
 static void UpdateDescriptorSetForMesh(VkMesh* mesh)
@@ -3856,6 +4936,8 @@ int PsyX_Vk_RenderFrame(void)
 		return 1;
 
 	UpdateSceneUbo();
+	if (g_vk.gameMode)
+		UpdateGameModernUbo();
 
 	// Command buffer.
 	vkResetCommandBuffer(g_vk.commandBuffer, 0);
@@ -3907,6 +4989,8 @@ int PsyX_Vk_RenderFrame(void)
 
 		for (int i = 0; i < PSYX_VK_MAX_MESHES; i++)
 		{
+			// Fixture meshes only; in game mode this table is empty and the
+			// in-game modern meshes are recorded below instead.
 			VkMesh* mesh = &g_vk.meshes[i];
 			if (!mesh->used || !mesh->visible || mesh->vertexCount == 0)
 				continue;
@@ -3929,6 +5013,9 @@ int PsyX_Vk_RenderFrame(void)
 			}
 			drawCalls++;
 		}
+
+		if (g_vk.gameMode)
+			RecordGameModernShadowPass(g_vk.commandBuffer);
 	}
 
 	// The render pass moves the shadow map to SHADER_READ_ONLY_OPTIMAL.
@@ -3992,37 +5079,74 @@ int PsyX_Vk_RenderFrame(void)
 	RecordPsxDraws(g_vk.commandBuffer, 0, g_vk.psx.frameIndex, g_vk.width, g_vk.height);
 	drawCalls += g_vk.psx.drawCount;
 
-	vkCmdBindPipeline(g_vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.pbrPipeline);
-
-	for (int i = 0; i < PSYX_VK_MAX_MESHES; i++)
+	if (g_vk.gameMode)
 	{
-		VkMesh* mesh = &g_vk.meshes[i];
-		if (!mesh->used || !mesh->visible || mesh->vertexCount == 0 || !mesh->descriptorSet)
-			continue;
+		// In-game modern path. The legacy scene is complete in the main pass;
+		// end it, copy the scene depth when the shadow composite is active, and
+		// continue in the load pass so modern meshes share the legacy depth
+		// buffer. The developer overlay is contributed below, in this pass.
+		vkCmdEndRenderPass(g_vk.commandBuffer);
 
-		float push[24];
-		memcpy(push, mesh->world, sizeof(mesh->world));
-		memcpy(push + 16, mesh->color, sizeof(mesh->color));
-		push[20] = mesh->factors[0];
-		push[21] = mesh->factors[1];
-		push[22] = mesh->factors[2];
-		push[23] = 0.0f;
+		const int modernShadows = g_vk.gameModernEnabled && g_vk.lights.shadowsEnabled &&
+			g_vk.modernCameraValid && g_vk.sceneDepthImage != VK_NULL_HANDLE;
+		if (modernShadows)
+			RecordGameModernSceneDepthCopy(g_vk.commandBuffer);
 
-		vkCmdBindDescriptorSets(g_vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-			g_vk.pipelineLayout, 0, 1, &mesh->descriptorSet, 0, NULL);
-		vkCmdPushConstants(g_vk.commandBuffer, g_vk.pipelineLayout,
-			VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 96, push);
+		VkRenderPassBeginInfo modernBegin = mainBegin;
+		modernBegin.renderPass = g_vk.modernRenderPass;
+		modernBegin.framebuffer = g_vk.modernFramebuffers[imageIndex];
+		modernBegin.clearValueCount = 0;
+		modernBegin.pClearValues = NULL;
+		vkCmdBeginRenderPass(g_vk.commandBuffer, &modernBegin, VK_SUBPASS_CONTENTS_INLINE);
+		vkCmdSetViewport(g_vk.commandBuffer, 0, 1, &viewport);
+		vkCmdSetScissor(g_vk.commandBuffer, 0, 1, &scissor);
 
-		VkDeviceSize offset = 0;
-		vkCmdBindVertexBuffers(g_vk.commandBuffer, 0, 1, &mesh->vertexBuffer, &offset);
-		if (mesh->indexCount > 0)
+		if (modernShadows)
 		{
-			vkCmdBindIndexBuffer(g_vk.commandBuffer, mesh->indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-			vkCmdDrawIndexed(g_vk.commandBuffer, (uint32_t)mesh->indexCount, 1, 0, 0, 0);
+			UpdateGameCompositeDescriptorSet();
+			vkCmdBindPipeline(g_vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.gameCompositePipeline);
+			vkCmdBindDescriptorSets(g_vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+				g_vk.pipelineLayout, 0, 1, &g_vk.gameCompositeSet, 0, NULL);
+			vkCmdDraw(g_vk.commandBuffer, 3, 1, 0, 0);
+			g_vk.gameModernStats.legacyShadowPass = 1;
 		}
-		else
+
+		drawCalls += RecordGameModernMeshes(g_vk.commandBuffer);
+	}
+	else
+	{
+		vkCmdBindPipeline(g_vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.pbrPipeline);
+
+		for (int i = 0; i < PSYX_VK_MAX_MESHES; i++)
 		{
-			vkCmdDraw(g_vk.commandBuffer, (uint32_t)mesh->vertexCount, 1, 0, 0);
+			VkMesh* mesh = &g_vk.meshes[i];
+			if (!mesh->used || !mesh->visible || mesh->vertexCount == 0 || !mesh->descriptorSet)
+				continue;
+
+			float push[24];
+			memcpy(push, mesh->world, sizeof(mesh->world));
+			memcpy(push + 16, mesh->color, sizeof(mesh->color));
+			push[20] = mesh->factors[0];
+			push[21] = mesh->factors[1];
+			push[22] = mesh->factors[2];
+			push[23] = 0.0f;
+
+			vkCmdBindDescriptorSets(g_vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+				g_vk.pipelineLayout, 0, 1, &mesh->descriptorSet, 0, NULL);
+			vkCmdPushConstants(g_vk.commandBuffer, g_vk.pipelineLayout,
+				VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 96, push);
+
+			VkDeviceSize offset = 0;
+			vkCmdBindVertexBuffers(g_vk.commandBuffer, 0, 1, &mesh->vertexBuffer, &offset);
+			if (mesh->indexCount > 0)
+			{
+				vkCmdBindIndexBuffer(g_vk.commandBuffer, mesh->indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+				vkCmdDrawIndexed(g_vk.commandBuffer, (uint32_t)mesh->indexCount, 1, 0, 0, 0);
+			}
+			else
+			{
+				vkCmdDraw(g_vk.commandBuffer, (uint32_t)mesh->vertexCount, 1, 0, 0);
+			}
 		}
 	}
 
@@ -4464,6 +5588,20 @@ static int CreateShadowResources(void)
 	if (!VkOk(vkCreateSampler(g_vk.device, &sampler, NULL, &g_vk.textureSampler), "vkCreateSampler(material)"))
 		return 0;
 
+	// Scene-depth copy sampler for the modern shadow composite.
+	memset(&sampler, 0, sizeof(sampler));
+	sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+	sampler.magFilter = VK_FILTER_NEAREST;
+	sampler.minFilter = VK_FILTER_NEAREST;
+	sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+	sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	sampler.maxLod = 1.0f;
+
+	if (!VkOk(vkCreateSampler(g_vk.device, &sampler, NULL, &g_vk.sceneDepthSampler), "vkCreateSampler(scene depth)"))
+		return 0;
+
 	g_vk.info.shadowMapSize = kShadowSize;
 	return 1;
 }
@@ -4588,6 +5726,13 @@ int PsyX_Vk_Initialise(const PsyXVkConfig* config)
 		return 0;
 	VkStage("initialise: pipelines");
 
+	// The in-game modern path is additive: a failure disables it but leaves the
+	// PSX renderer (and the fixture) intact.
+	if (CreateGameModernResources())
+		VkStage("initialise: game modern resources");
+	else
+		VkStage("initialise: game modern resources failed");
+
 	// The swapchain depends on the main render pass.
 	if (!CreateSwapchain())
 		return 0;
@@ -4628,6 +5773,28 @@ int PsyX_Vk_Initialise(const PsyXVkConfig* config)
 		return 0;
 	for (int i = 0; i < PSYX_VK_MAX_MESHES; i++)
 		g_vk.meshes[i].descriptorSet = sets[i];
+
+	// In-game modern mesh sets: one per mesh slot plus the shadow composite.
+	{
+		VkDescriptorSetLayout layouts[PSYX_VK_GAME_MODERN_MAX_MESHES + 1];
+		for (int i = 0; i <= PSYX_VK_GAME_MODERN_MAX_MESHES; i++)
+			layouts[i] = g_vk.descriptorSetLayout;
+
+		VkDescriptorSetAllocateInfo gameAllocate;
+		memset(&gameAllocate, 0, sizeof(gameAllocate));
+		gameAllocate.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+		gameAllocate.descriptorPool = g_vk.descriptorPool;
+		gameAllocate.descriptorSetCount = PSYX_VK_GAME_MODERN_MAX_MESHES + 1;
+		gameAllocate.pSetLayouts = layouts;
+
+		VkDescriptorSet gameSets[PSYX_VK_GAME_MODERN_MAX_MESHES + 1];
+		if (VkOk(vkAllocateDescriptorSets(g_vk.device, &gameAllocate, gameSets), "vkAllocateDescriptorSets(game modern)"))
+		{
+			for (int i = 0; i < PSYX_VK_GAME_MODERN_MAX_MESHES; i++)
+				g_vk.gameMeshes[i].descriptorSet = gameSets[i];
+			g_vk.gameCompositeSet = gameSets[PSYX_VK_GAME_MODERN_MAX_MESHES];
+		}
+	}
 
 	VkStage("initialise: descriptors");
 
@@ -4676,7 +5843,9 @@ int PsyX_Vk_Initialise(const PsyXVkConfig* config)
 		initInfo.QueueFamily = g_vk.queueFamily;
 		initInfo.Queue = g_vk.queue;
 		initInfo.DescriptorPoolSize = 8;
-		initInfo.RenderPass = g_vk.mainRenderPass;
+		// In game mode the overlay is recorded inside the modern load pass (the
+		// PSX pass ends before it), so ImGui's pipeline must target that pass.
+		initInfo.RenderPass = g_vk.gameMode ? g_vk.modernRenderPass : g_vk.mainRenderPass;
 		initInfo.MinImageCount = g_vk.swapchainImageCount < 2 ? 2 : g_vk.swapchainImageCount;
 		initInfo.ImageCount = g_vk.swapchainImageCount;
 		initInfo.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
@@ -4722,6 +5891,15 @@ void PsyX_Vk_Shutdown(void)
 		if (g_vk.meshes[i].used)
 			PsyX_Vk_DestroyMesh(i);
 	}
+
+	PsyX_Vk_GameModernMeshShutdown();
+
+	if (g_vk.gameModernUboBuffer) vkDestroyBuffer(g_vk.device, g_vk.gameModernUboBuffer, NULL);
+	if (g_vk.gameModernUboMemory) vkFreeMemory(g_vk.device, g_vk.gameModernUboMemory, NULL);
+	if (g_vk.gameModernPipeline) vkDestroyPipeline(g_vk.device, g_vk.gameModernPipeline, NULL);
+	if (g_vk.gameCompositePipeline) vkDestroyPipeline(g_vk.device, g_vk.gameCompositePipeline, NULL);
+	if (g_vk.sceneDepthSampler) vkDestroySampler(g_vk.device, g_vk.sceneDepthSampler, NULL);
+	if (g_vk.modernRenderPass) vkDestroyRenderPass(g_vk.device, g_vk.modernRenderPass, NULL);
 
 	if (g_vk.uboBuffer) vkDestroyBuffer(g_vk.device, g_vk.uboBuffer, NULL);
 	if (g_vk.uboMemory) vkFreeMemory(g_vk.device, g_vk.uboMemory, NULL);
@@ -4845,6 +6023,37 @@ int PsyX_Vk_GameCreateTexture(const unsigned char* rgba, int width, int height, 
 	return 0;
 }
 void PsyX_Vk_GameDestroyTexture(int texture) { (void)texture; }
+unsigned long long PsyX_Vk_GameGetOverlayTextureId(int texture) { (void)texture; return 0; }
+void PsyX_Vk_GameGetTextureSize(int texture, int* width, int* height)
+{
+	(void)texture;
+	if (width) *width = 0;
+	if (height) *height = 0;
+}
+int PsyX_Vk_GameModernMeshCreate(const PsyXModernMeshDesc* desc) { (void)desc; return -1; }
+void PsyX_Vk_GameModernMeshDestroy(int mesh) { (void)mesh; }
+void PsyX_Vk_GameModernMeshSetInstance(int mesh, const float viewMatrix[16],
+	const float color[4], int visible)
+{
+	(void)mesh; (void)viewMatrix; (void)color; (void)visible;
+}
+void PsyX_Vk_GameModernMeshSetInstanceWorld(int mesh, const float worldMatrix[16])
+{
+	(void)mesh; (void)worldMatrix;
+}
+void PsyX_Vk_GameModernMeshSetLights(const PsyXModernLightSet* lights) { (void)lights; }
+void PsyX_Vk_GameModernMeshSetCamera(const float viewRotation[16], const float cameraPosition[3])
+{
+	(void)viewRotation; (void)cameraPosition;
+}
+void PsyX_Vk_GameModernMeshSetShadowDebug(int mode) { (void)mode; }
+void PsyX_Vk_GameModernMeshSetEnabled(int enabled) { (void)enabled; }
+int  PsyX_Vk_GameModernMeshGetEnabled(void) { return 0; }
+void PsyX_Vk_GameModernMeshGetStats(PsyXModernMeshStats* stats)
+{
+	if (stats) memset(stats, 0, sizeof(*stats));
+}
+void PsyX_Vk_GameModernMeshShutdown(void) {}
 void PsyX_Vk_GameEndFrame(void) {}
 void PsyX_Vk_GameResetDevice(void) {}
 int PsyX_Vk_GameIsActive(void) { return 0; }
