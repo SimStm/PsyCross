@@ -2001,8 +2001,8 @@ static int CreateRenderPasses(void)
 // an R32G32_SFLOAT image (R = low byte, G = high byte of every little-endian
 // 16-bit PSX pixel), a 256x256 RGBA table decodes PSX 5551 colours, and the
 // ported psx.vert/psx.frag do the CLUT, texture-window, dither and bilinear
-// work inside the shader. knowledge/roadmap/planned/vulkan-game-renderer.md
-// holds the phased plan that maps the game's GR_* contract onto this.
+// work inside the shader. knowledge/roadmap/done/vulkan-game-renderer.md holds
+// the phased plan that maps the game's GR_* contract onto this.
 
 // Mirrors GR_InitRG8LUT (PsyX_render.cpp). The table turns a PSX 5551 word,
 // addressed as its two VRAM bytes, into RGBA8. Kept in sync by hand so this
