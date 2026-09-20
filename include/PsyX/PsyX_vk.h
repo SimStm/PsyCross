@@ -104,6 +104,7 @@ void PsyX_Vk_SetOverlayText(const char* text);
 #define PSYX_VK_TEX_8BIT 1
 #define PSYX_VK_TEX_16BIT 2
 #define PSYX_VK_TEX_32BIT 3
+#define PSYX_VK_TEX_WHITE 4 /* untextured PSX primitive: decoded GL white texture */
 
 /* PSX blend modes, matching the game renderer's BlendMode order. */
 #define PSYX_VK_BLEND_NONE 0

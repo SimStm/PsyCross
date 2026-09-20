@@ -25,6 +25,7 @@
 #include "PsyX_Vk_Shaders.h"
 
 #include "PsyX/PsyX_public.h"
+#include "PsyX/PsyX_render.h"
 
 // The in-game modern path shares the projection captured by GR_Perspective3D.
 #include "PsyX_ModernMesh.h"
@@ -373,6 +374,7 @@ typedef struct
 	VkPipeline pipelinesStencilWrite[PSYX_VK_PSX_BLEND_COUNT];
 	int stencilSupported;		// main depth attachment carries an stencil aspect
 	VkPipeline pipelineNoDepth;
+	VkPipeline pipelineNoDepthStencilWrite;
 	VkDescriptorSet set;
 
 	// Offscreen (render-to-VRAM) target, mirroring GR_SetOffscreenState. The
@@ -998,13 +1000,17 @@ static VkFormat PickSurfaceFormat(VkFormat* outFormat, int* outSrgb)
 
 	for (int p = 0; p < 4; p++)
 	{
+		// PSX blending operates on display-referred values, as in GL with
+		// FRAMEBUFFER_SRGB disabled. Shader inverse gamma cannot undo the
+		// linear destination read performed by an sRGB blend attachment.
+		const int candidate = g_vk.gameMode ? (p + 2) % 4 : p;
 		for (uint32_t i = 0; i < count; i++)
 		{
-			if (formats[i].format == preferred[p] &&
+			if (formats[i].format == preferred[candidate] &&
 				formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
 			{
 				*outFormat = formats[i].format;
-				*outSrgb = (p < 2) ? 1 : 0;
+				*outSrgb = (candidate < 2) ? 1 : 0;
 				return formats[i].format;
 			}
 		}
@@ -1923,10 +1929,12 @@ static int CreateRenderPasses(void)
 	memset(&dependency, 0, sizeof(dependency));
 	dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
 	dependency.dstSubpass = 0;
-	dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-	dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-	dependency.srcAccessMask = 0;
-	dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+	dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+		VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+	dependency.dstStageMask = dependency.srcStageMask;
+	dependency.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+	dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+		VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
 	VkRenderPassCreateInfo renderPass;
 	memset(&renderPass, 0, sizeof(renderPass));
@@ -1955,23 +1963,12 @@ static int CreateRenderPasses(void)
 	modernAttachments[1] = attachments[1];
 	modernAttachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
 	modernAttachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-	modernAttachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	modernAttachments[1].stencilStoreOp = attachments[1].stencilStoreOp;
 	modernAttachments[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
-	// The modern pass loads the colour and depth the main pass wrote, so unlike
-	// the main pass's external dependency it must declare those writes
-	// available; otherwise the loaded depth is unsynchronized and the modern
-	// meshes are depth-rejected against stale data.
-	VkSubpassDependency modernDependency;
-	memset(&modernDependency, 0, sizeof(modernDependency));
-	modernDependency.srcSubpass = VK_SUBPASS_EXTERNAL;
-	modernDependency.dstSubpass = 0;
-	modernDependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-		VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-	modernDependency.dstStageMask = modernDependency.srcStageMask;
-	modernDependency.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-	modernDependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-		VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+	// Both passes make prior colour/depth writes available to attachment loads.
+	// Dependencies must match too for pipelines to be render-pass compatible.
+	VkSubpassDependency modernDependency = dependency;
 
 	memset(&renderPass, 0, sizeof(renderPass));
 	renderPass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -2139,20 +2136,15 @@ static int CreatePsxPipeline(int blendMode, int depthEnable, int stencilMode, Vk
 	memset(&depthStencil, 0, sizeof(depthStencil));
 	depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
 	depthStencil.depthTestEnable = depthEnable ? VK_TRUE : VK_FALSE;
-	// OpenGL only toggles GL_DEPTH_TEST and never touches glDepthMask, so a draw
-	// with the test disabled still writes depth. The PSX game depends on that:
-	// the 2D UI (the overhead map, the Damage/Felony bars) is drawn against a
-	// depth-tested 3D scene, and without the write the scene shows through and
-	// their colours shift with whatever is behind them. Mirror GL here, but only
-	// where the render pass actually owns a depth attachment (the offscreen
-	// pass is depth-less and rejects depth state).
+	// Both GL and Vulkan disable depth writes when the depth test is disabled.
 	const VkBool32 passHasDepth = (renderPass == g_vk.mainRenderPass) ? VK_TRUE : VK_FALSE;
-	depthStencil.depthWriteEnable = passHasDepth;
+	depthStencil.depthWriteEnable = depthEnable && passHasDepth;
 	depthStencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 
-	// PSX mask bit, mirroring GR_SetStencilMode's GL state. Stencil bit 4 is the
-	// PSX mask (GL's 0x10). The mask-set draw always passes and writes the bit;
-	// every other draw only passes where the bit is clear. The offscreen pass has
+	// Mirror GR_SetStencilMode exactly: GL's 0x10 is the comparison mask,
+	// not the write mask. Mask-set draws store reference 1 with all bits writable.
+	// Other draws reject that value and keep stencil on a passing fragment.
+	// The offscreen pass has
 	// no depth-stencil attachment, so stencil stays disabled there.
 	if (stencilMode >= 0 && g_vk.psx.stencilSupported)
 	{
@@ -2161,7 +2153,7 @@ static int CreatePsxPipeline(int blendMode, int depthEnable, int stencilMode, Vk
 		VkStencilOpState& front = depthStencil.front;
 		VkStencilOpState& back = depthStencil.back;
 		front.compareMask = 0x10;
-		front.writeMask = 0x10;
+		front.writeMask = 0xFF;
 		front.reference = 1;
 		if (stencilMode)
 		{
@@ -2174,8 +2166,8 @@ static int CreatePsxPipeline(int blendMode, int depthEnable, int stencilMode, Vk
 		{
 			front.compareMask = 0xFF;
 			front.compareOp = VK_COMPARE_OP_NOT_EQUAL;
-			front.passOp = VK_STENCIL_OP_REPLACE;
-			front.failOp = VK_STENCIL_OP_KEEP;
+			front.passOp = VK_STENCIL_OP_KEEP;
+			front.failOp = VK_STENCIL_OP_REPLACE;
 			front.depthFailOp = VK_STENCIL_OP_KEEP;
 		}
 		back = front;
@@ -2386,7 +2378,11 @@ static int CreatePsxOffscreenRenderPass(void)
 static int CreatePsxResources(void)
 {
 	VkPsxState* psx = &g_vk.psx;
+	// CreateRenderPasses already selected the depth/stencil format. Clearing
+	// this capability here silently created every PSX pipeline without stencil.
+	const int stencilSupported = psx->stencilSupported;
 	memset(psx, 0, sizeof(*psx));
+	psx->stencilSupported = stencilSupported;
 
 	// Descriptor set: 0 = matrices, 1 = VRAM, 2 = RG8 LUT, 3 = RGBA texture.
 	VkDescriptorSetLayoutBinding bindings[4];
@@ -2439,7 +2435,9 @@ static int CreatePsxResources(void)
 		if (!CreatePsxPipeline(mode, mode == 0 ? 1 : 0, 1, g_vk.mainRenderPass, &psx->pipelinesStencilWrite[mode]))
 			return 0;
 	}
-	if (!CreatePsxPipeline(0, 0, -1, g_vk.mainRenderPass, &psx->pipelineNoDepth))
+	if (!CreatePsxPipeline(0, 0, 0, g_vk.mainRenderPass, &psx->pipelineNoDepth))
+		return 0;
+	if (!CreatePsxPipeline(0, 0, 1, g_vk.mainRenderPass, &psx->pipelineNoDepthStencilWrite))
 		return 0;
 
 	// The per-frame draw list belongs to frameIndex, so the queue maps one
@@ -2617,6 +2615,7 @@ static void DestroyPsxResources(void)
 		if (psx->pipelinesStencilWrite[i]) vkDestroyPipeline(g_vk.device, psx->pipelinesStencilWrite[i], NULL);
 	}
 	if (psx->pipelineNoDepth) vkDestroyPipeline(g_vk.device, psx->pipelineNoDepth, NULL);
+	if (psx->pipelineNoDepthStencilWrite) vkDestroyPipeline(g_vk.device, psx->pipelineNoDepthStencilWrite, NULL);
 	for (int i = 0; i < PSYX_VK_PSX_BLEND_COUNT; i++)
 	{
 		if (psx->offscreenPipelines[i]) vkDestroyPipeline(g_vk.device, psx->offscreenPipelines[i], NULL);
@@ -2829,8 +2828,6 @@ void PsyX_Vk_GameSetOverrideAlphaMode(int mode)
 
 void PsyX_Vk_GameSetStencilMode(int drawPrimMode)
 {
-	// The PSX stencil mask is not emulated by this backend yet; the value is
-	// kept so the state mirror matches the OpenGL renderer's inputs.
 	g_vk.psx.stStencilMode = drawPrimMode;
 }
 
@@ -3973,7 +3970,8 @@ static void RecordPsxDraws(VkCommandBuffer cmd, int offscreen, int frame,
 	const VkDeviceSize offset = 0;
 	vkCmdBindVertexBuffers(cmd, 0, 1, &psx->vertexBuffer, &offset);
 
-	const float blendConstants[4] = { 0.5f, 0.5f, 0.5f, 0.25f };
+	// GL uses GL_CONSTANT_ALPHA with glBlendColor(..., 0.5f).
+	const float blendConstants[4] = { 0.25f, 0.25f, 0.25f, 0.5f };
 	vkCmdSetBlendConstants(cmd, blendConstants);
 
 	VkDescriptorSet boundSet = VK_NULL_HANDLE;
@@ -4005,11 +4003,9 @@ static void RecordPsxDraws(VkCommandBuffer cmd, int offscreen, int frame,
 		const VkDescriptorSet set = draw->textureSet ? draw->textureSet : psx->dummySet;
 		const VkPipeline pipeline = offscreen
 			? psx->offscreenPipelines[draw->blendMode]
-			: (draw->stencilMode
-				? psx->pipelinesStencilWrite[draw->blendMode]
-				: ((draw->blendMode == 0 && !draw->depthTest)
-					? psx->pipelineNoDepth
-					: psx->pipelines[draw->blendMode]));
+			: ((draw->blendMode == 0 && !draw->depthTest)
+				? (draw->stencilMode ? psx->pipelineNoDepthStencilWrite : psx->pipelineNoDepth)
+				: (draw->stencilMode ? psx->pipelinesStencilWrite[draw->blendMode] : psx->pipelines[draw->blendMode]));
 
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
@@ -4493,10 +4489,107 @@ int PsyX_Vk_GameSelfTest(char* report, int reportSize)
 			failures++;
 	}
 
+	// Exercise the game bridge, not just the backend's textured fast path.
+	// Empty VRAM must not make a POLY_F/G primitive disappear or change colour.
+	const int savedBackend = PsyX_GetRenderBackend();
+	PsyX_SetRenderBackend(PSYX_BACKEND_VULKAN);
+	PsyX_Vk_GameSetProjection2D(ortho);
+	memset(vram, 0, sizeof(unsigned short) * PSYX_VK_VRAM_WIDTH * PSYX_VK_VRAM_HEIGHT);
+	PsyX_Vk_GameSetVram(vram);
+	const float white = 248.0f / 255.0f;
+	const float alpha = 127.0f / 255.0f;
+	auto beginUiFrame = [&]() {
+		PsyX_Vk_GameBeginFrame();
+		PsyX_Vk_GameSetViewPort(0, 0, width, height);
+		PsyX_Vk_GameSetScissor(0, 0, 0, width, height);
+		PsyX_Vk_GameEnableDepth(0);
+		PsyX_Vk_GameSetStencilMode(0);
+		GR_SetTexture(g_whiteTexture, TF_16_BIT);
+	};
+	auto drawUiQuad = [&](int r, int g, int b, int blend, float quadWidth) {
+		PsxFillQuad(quadWidth, (float)height, 0, 0, 0, 0, quad);
+		for (int i = 0; i < 6; i++) {
+			quad[i].r = (unsigned char)r;
+			quad[i].g = (unsigned char)g;
+			quad[i].b = (unsigned char)b;
+		}
+		PsyX_Vk_GameUpdateVertexBuffer(quad, 6);
+		PsyX_Vk_GameSetBlendMode(blend);
+		PsyX_Vk_GameDrawTriangles(0, 2);
+	};
+	auto checkUiFrame = [&](const char* label, int x, const float* expected) {
+		// Public presentation readback deliberately reports opaque alpha.
+		float presented[4] = { expected[0], expected[1], expected[2], 1.0f };
+		if (!PsyX_Vk_RenderFrame() || !PsyX_Vk_ReadbackRgba(rgba, &readWidth, &readHeight)) {
+			ReportAppend(report, reportSize, "UI readback FAIL\n");
+			failures++;
+		} else if (!PsxCheckPixel(rgba, readWidth, readHeight, x, height / 2,
+			presented, tolerance, label, report, reportSize)) {
+			failures++;
+		}
+	};
+	for (int format = 0; format < 3; format++) {
+		beginUiFrame();
+		GR_SetTexture(g_whiteTexture, (TexFormat)format);
+		drawUiQuad(255, 255, 255, 0, (float)width);
+		const float expected[4] = { white, white, white, alpha };
+		checkUiFrame("untextured white / empty VRAM", width / 2, expected);
+	}
+
+	// All PSX blend modes must blend in display space, like OpenGL. An sRGB
+	// attachment gives different answers even if the shader inverse-encodes.
+	for (int mode = 0; mode < PSYX_VK_PSX_BLEND_COUNT; mode++) {
+		beginUiFrame();
+		drawUiQuad(64, 64, 64, 0, (float)width);
+		drawUiQuad(128, 0, 0, mode, (float)width);
+		const float dst = white * 64.0f / 255.0f;
+		const float src = white * 128.0f / 255.0f;
+		float expected[4] = { src, 0, 0, alpha };
+		if (mode == 1) {
+			expected[0] = src * alpha + dst * (1 - alpha);
+			expected[1] = expected[2] = dst * (1 - alpha);
+		} else if (mode >= 2) {
+			expected[0] = mode == 3 ? 0 : dst + src * (mode == 4 ? 0.5f : 1.0f);
+			expected[1] = expected[2] = dst;
+			expected[3] = alpha * (mode == 4 ? 1.5f : 2.0f);
+		}
+		char label[64];
+		snprintf(label, sizeof(label), "untextured blend mode %d", mode);
+		checkUiFrame(label, width / 2, expected);
+	}
+
+	// DrawPrim protection must survive multiple VRAM transfers/pass restarts.
+	// Later non-DrawPrim draws must still render outside the protected region.
+	beginUiFrame();
+	PsyX_Vk_GameSetStencilMode(1);
+	drawUiQuad(255, 255, 255, 0, width * 0.5f);
+	PsyX_Vk_GameSetStencilMode(0);
+	for (int split = 0; split < 2; split++) {
+		PsyX_Vk_GameCopyVRAM(vram, PSYX_VK_VRAM_WIDTH, 0, 0, 1, 1, 0, 0);
+		drawUiQuad(255, 0, 0, 0, (float)width);
+	}
+	const float protectedPixel[4] = { white, white, white, alpha };
+	checkUiFrame("stencil survives two pass restarts", width / 4, protectedPixel);
+	const float outsidePixel[4] = { white, 0, 0, 1.0f };
+	if (!PsxCheckPixel(rgba, readWidth, readHeight, width * 3 / 4, height / 2,
+		outsidePixel, tolerance, "stencil outside mask", report, reportSize))
+		failures++;
+
+	// Seed one frame, then update only its left half for several presentations.
+	// This checks the acquired-image sequence, not guaranteed swapchain rotation.
+	beginUiFrame();
+	drawUiQuad(255, 255, 255, 0, (float)width);
+	checkUiFrame("persistent framebuffer seed", width * 3 / 4, protectedPixel);
+	for (uint32_t frame = 0; frame <= g_vk.swapchainImageCount; frame++) {
+		beginUiFrame();
+		drawUiQuad(0, 0, 0, 0, width * 0.5f);
+		checkUiFrame("partial frame retains preceding image", width * 3 / 4, protectedPixel);
+	}
+	PsyX_SetRenderBackend(savedBackend);
 	delete[] rgba;
 	delete[] vram;
 
-	// Case 4: the VRAM TGA export (F10 / GR_SaveVRAM) must write the full pixel
+	// The VRAM TGA export (F10 / GR_SaveVRAM) must write the full pixel
 	// payload on the Vulkan build. It used to be compiled out unless USE_OPENGL,
 	// leaving a 18-byte header-only file.
 	{

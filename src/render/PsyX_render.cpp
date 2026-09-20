@@ -1453,7 +1453,12 @@ void GR_SetTexture(TextureID texture, TexFormat texFormat)
 	{
 		// TextureID and TexFormat values match PsyX_Vk_GameCreateTexture
 		// handles and PSYX_VK_TEX_*.
-		PsyX_Vk_GameSetTexture((int)texFormat, (int)texture);
+		// Untextured primitives use GL's white texture regardless of tpage.
+		// Preserve the PSX decode of white (248 RGB, 127 alpha), including
+		// its half-alpha for semitransparent untextured primitives.
+		const bool white = texture == g_whiteTexture || g_dbg_texturelessMode;
+		PsyX_Vk_GameSetTexture(white && texFormat != TF_32_BIT_RGBA ? PSYX_VK_TEX_WHITE : (int)texFormat,
+			white ? 0 : (int)texture);
 		PsyX_Vk_GameSetBilinear(g_cfg_bilinearFiltering);
 		g_lastBoundTexture = texture;
 		return;
@@ -2123,7 +2128,6 @@ void GR_SetStencilMode(int drawPrim)
 {
 	if (GR_UseVulkan())
 	{
-		// The PSX stencil mask has no Vulkan equivalent in this backend yet.
 		PsyX_Vk_GameSetStencilMode(drawPrim);
 		return;
 	}

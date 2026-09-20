@@ -120,7 +120,14 @@ void main()
 {
 	vec4 color;
 
-	if (pc.texFormat == 3)
+	if (pc.texFormat == 4)
+	{
+		// GL samples its 1x1 white texture instead of VRAM, then decodes
+		// 0xffff through the PSX LUT, even for a 4/8-bit tpage.
+		color = lut(vec2(1.0));
+		color.a = 1.0 - color.a;
+	}
+	else if (pc.texFormat == 3)
 	{
 		// 32-bit RGBA (custom/override textures).
 		vec2 tc = v_texcoord.xy * pc.texelSize + pc.texelSize * 0.5;
