@@ -3772,18 +3772,29 @@ static void RecordGameModernShadowPass(VkCommandBuffer cmd)
 // image so the composite can reconstruct world positions for shaded pixels.
 static void RecordGameModernSceneDepthCopy(VkCommandBuffer cmd)
 {
-	VkImageAspectFlags aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+	// Layout transitions cover both aspects unless separateDepthStencilLayouts
+	// is enabled. The copy and sampling view still access depth alone.
+	const VkImageAspectFlags aspect = g_vk.psx.stencilSupported
+		? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT
+		: VK_IMAGE_ASPECT_DEPTH_BIT;
 
 	ImageBarrier(cmd, g_vk.depthImage, aspect,
 		VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
 		VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+
+	// This frame overwrites the entire depth copy, so discard its old contents.
+	// Synchronize any preceding composite reads before writing the new copy.
+	ImageBarrier(cmd, g_vk.sceneDepthImage, aspect,
+		VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
 
 	VkImageCopy copy;
 	memset(&copy, 0, sizeof(copy));
-	copy.srcSubresource.aspectMask = aspect;
+	copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
 	copy.srcSubresource.layerCount = 1;
-	copy.dstSubresource.aspectMask = aspect;
+	copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
 	copy.dstSubresource.layerCount = 1;
 	copy.extent.width = (uint32_t)g_vk.width;
 	copy.extent.height = (uint32_t)g_vk.height;
