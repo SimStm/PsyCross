@@ -961,6 +961,12 @@ void PsyX_EndScene()
 	
 	GR_StoreFrameBuffer(activeDispEnv.disp.x, activeDispEnv.disp.y, activeDispEnv.disp.w, activeDispEnv.disp.h);
 
+	// Frame-submission CPU cost. The sample below is wall-clock between
+	// presented frames, which the game's own timestep can gate; timing the
+	// submission path separately shows how much of the frame budget the
+	// renderer actually consumes (command recording, submit, present call).
+	const Uint64 submitStart = SDL_GetPerformanceCounter();
+
 	if (g_renderBackend == PSYX_BACKEND_VULKAN)
 	{
 		// The overlay is contributed inside the Vulkan frame, between
@@ -976,6 +982,8 @@ void PsyX_EndScene()
 		GR_SwapWindow();
 	}
 
+	const Uint64 submitEnd = SDL_GetPerformanceCounter();
+
 	// Backend-agnostic performance sample. Both the OpenGL and the Vulkan path
 	// reach this point once per presented frame, so a single wall-clock counter
 	// produces directly comparable numbers in psyx_perf.log. Opt-in through
@@ -985,6 +993,7 @@ void PsyX_EndScene()
 		static int perfEnabled = -1;
 		static unsigned int perfFrames = 0;
 		static Uint32 perfWindowStart = 0;
+		static double perfSubmitMs = 0.0;
 
 		if (perfEnabled < 0)
 		{
@@ -998,6 +1007,10 @@ void PsyX_EndScene()
 			if (perfWindowStart == 0)
 				perfWindowStart = now;
 			perfFrames++;
+
+			const double counterHz = (double)SDL_GetPerformanceFrequency();
+			if (submitEnd > submitStart && counterHz > 0.0)
+				perfSubmitMs += (double)(submitEnd - submitStart) * 1000.0 / counterHz;
 
 			// Emit one sample per completed second window. The counter is
 			// wall-clock from the first frame, so the reported rate already
@@ -1013,16 +1026,18 @@ void PsyX_EndScene()
 				FILE* file = fopen("psyx_perf.log", "a");
 				if (file)
 				{
-					fprintf(file, "perf: backend=%s frames=%u window_ms=%.0f fps=%.1f frame_ms=%.2f vertices=%d draws=%d\n",
+					fprintf(file, "perf: backend=%s frames=%u window_ms=%.0f fps=%.1f frame_ms=%.2f submit_ms=%.2f vertices=%d draws=%d\n",
 						(g_renderBackend == PSYX_BACKEND_VULKAN) ? "vulkan" : "opengl",
 						perfFrames, elapsedMs, fps,
 						(fps > 0.0) ? (1000.0 / fps) : 0.0,
+						(perfFrames > 0) ? (perfSubmitMs / perfFrames) : 0.0,
 						stats.vertexCount, stats.drawSplitCount);
 					fclose(file);
 				}
 
 				perfFrames = 0;
 				perfWindowStart = now;
+				perfSubmitMs = 0.0;
 			}
 		}
 	}
