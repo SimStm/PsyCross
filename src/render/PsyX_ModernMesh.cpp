@@ -232,6 +232,7 @@ static const char* kCompositeFragmentShader =
 	"#version 140\n"
 	"uniform sampler2D s_sceneDepth;\n"
 	"uniform sampler2D s_shadowMap;\n"
+	"uniform sampler2D s_sceneColor;\n"
 	"uniform mat4 u_projInverse;\n"
 	"uniform mat4 u_cameraViewInverse;\n"
 	"uniform vec2 u_xyScale;\n"
@@ -241,33 +242,74 @@ static const char* kCompositeFragmentShader =
 	"uniform float u_shadowTexel;\n"
 	"uniform float u_strength;\n"
 	"uniform int u_debugMode;\n"
+	"uniform float u_legacyLightScale;\n"
+	"uniform vec3 u_lightDir;\n"
+	"uniform vec3 u_lightColor;\n"
+	"uniform vec3 u_cameraPos;\n"
 	"out vec4 fragColor;\n"
+	// Reconstructs the view-space position of a scene pixel from its depth. The
+	// PSX depth is a function of camera-space z, so the inverse of the
+	// projection the modern meshes use turns it back exactly.
+	"vec3 ReconstructView(vec2 uv, float depth)\n"
+	"{\n"
+	"	vec3 ndc = vec3(uv * 2.0 - 1.0, depth * 2.0 - 1.0);\n"
+	"	vec4 s = u_projInverse * vec4(ndc, 1.0);\n"
+	"	s /= s.w;\n"
+	"	return vec3(s.x / u_xyScale.x, -s.y / u_xyScale.y, s.z / u_zScale);\n"
+	"}\n"
 	"void main()\n"
 	"{\n"
 	"	vec2 uv = gl_FragCoord.xy / u_viewport;\n"
 	"	float depth = texture2D(s_sceneDepth, uv).r;\n"
+	"	vec3 scene = texture2D(s_sceneColor, uv).rgb;\n"
+	// Scene depth split over two channels, for reading the reconstruction's
+	// input at more than 8-bit precision from a screenshot: red holds the
+	// fraction, green the integral part, both of depth * 255.
+	"	if (u_debugMode == 8)\n"
+	"	{\n"
+	"		float t = depth * 255.0;\n"
+	"		fragColor = vec4(fract(t), floor(t) / 255.0, 0.0, 1.0);\n"
+	"		return;\n"
+	"	}\n"
 	"	if (u_debugMode == 1)\n"
 	"	{\n"
-	"		fragColor = vec4(vec3(depth), 1.0);\n"
+	"		fragColor = vec4(scene * depth, 1.0);\n"
 	"		return;\n"
 	"	}\n"
 	"	if (u_debugMode == 3)\n"
 	"	{\n"
-	"		fragColor = vec4(vec3(texture2D(s_shadowMap, uv).r), 1.0);\n"
+	"		fragColor = vec4(scene * texture2D(s_shadowMap, uv).r, 1.0);\n"
 	"		return;\n"
 	"	}\n"
 	"	vec3 debugColour = vec3(0.0, 0.0, 1.0);\n"
 	"	vec3 tint = vec3(1.0);\n"
+	"	vec3 N = vec3(0.0, 1.0, 0.0);\n"
+	"	float legacyNdl = 0.0;\n"
+	// Reconstruct the view position for every pixel: screen-space derivatives
+	// (used by the legacy lighting normal) are undefined inside non-uniform
+	// control flow. Only world pixels consume the result.
+	"	vec3 viewPos = ReconstructView(uv, depth);\n"
+	"	vec3 world = (u_cameraViewInverse * vec4(viewPos, 1.0)).xyz;\n"
+	// Reconstructed distance from the camera, two-channel encoded like the
+	// depth probe: value = (green + red / 255) / 255 * 65535 world units.
+	"	if (u_debugMode == 9)\n"
+	"	{\n"
+	"		float t = clamp(length(world - u_cameraPos), 0.0, 65535.0) / 65535.0 * 255.0;\n"
+	"		fragColor = vec4(fract(t), floor(t) / 255.0, 0.0, 1.0);\n"
+	"		return;\n"
+	"	}\n"
 	// The legacy 2D path (HUD, screen overlays) writes a constant 0.5 depth;
-	// such pixels are not world geometry and must not receive shadows.
+	// such pixels are not world geometry and must not receive shadows or light.
 	"	bool worldPixel = (depth < 0.999999) && (abs(depth - 0.5) > 1e-5);\n"
+	// The PSX depth buffer spends its top band on backdrop layers: the sky and
+	// painted skyline sit at ~0.9997, the cloud/haze sheet at ~0.990. Those
+	// pixels are flat images rather than surfaces, so the depth reconstruction
+	// saturates and the reconstructed normal carries no information - shading
+	// them with the sun washes the sky out.
+	"	const float kSunMaxDepth = 0.999;\n"
+	"	bool sunPixel = worldPixel && depth < kSunMaxDepth;\n"
 	"	if (worldPixel)\n"
 	"	{\n"
-	"		vec3 ndc = vec3(uv * 2.0 - 1.0, depth * 2.0 - 1.0);\n"
-	"		vec4 s = u_projInverse * vec4(ndc, 1.0);\n"
-	"		s /= s.w;\n"
-	"		vec3 viewPos = vec3(s.x / u_xyScale.x, -s.y / u_xyScale.y, s.z / u_zScale);\n"
-	"		vec3 world = (u_cameraViewInverse * vec4(viewPos, 1.0)).xyz;\n"
 	"		vec4 sc = u_shadowMatrix * vec4(world, 1.0);\n"
 	"		vec3 proj = sc.xyz / sc.w * 0.5 + 0.5;\n"
 	"		bool inside = (proj.x >= 0.0 && proj.x <= 1.0 && proj.y >= 0.0 && proj.y <= 1.0 && proj.z <= 1.0);\n"
@@ -275,7 +317,7 @@ static const char* kCompositeFragmentShader =
 	"		if (u_debugMode == 4)\n"
 	"		{\n"
 	"			float shadowDepth = inside ? texture2D(s_shadowMap, proj.xy).r : 1.0;\n"
-	"			fragColor = vec4(vec3(proj.z, shadowDepth, 0.0), 1.0);\n"
+	"			fragColor = vec4(scene * vec3(proj.z, shadowDepth, 0.0), 1.0);\n"
 	"			return;\n"
 	"		}\n"
 	"		if (inside)\n"
@@ -288,13 +330,73 @@ static const char* kCompositeFragmentShader =
 	"			lit /= 9.0;\n"
 	"			tint = vec3(mix(1.0 - u_strength, 1.0, lit));\n"
 	"		}\n"
+	// Legacy lighting receptivity: the legacy depth buffer has no surface
+	// normal, so one is reconstructed from a five-tap cross of the neighbour
+	// world positions. Screen-space derivatives at a single pixel amplify the
+	// PGXP depth quantisation and the polygon-edge steps, which showed up as
+	// flickering light on moving vehicles; the wider taps average that out and
+	// an edge test keeps a neighbouring surface from bending the normal.
+	"		if (sunPixel && u_legacyLightScale > 0.0)\n"
+	"		{\n"
+	"			vec2 tapStep = 2.0 / u_viewport;\n"
+	"			float dL = texture2D(s_sceneDepth, uv - vec2(tapStep.x, 0.0)).r;\n"
+	"			float dR = texture2D(s_sceneDepth, uv + vec2(tapStep.x, 0.0)).r;\n"
+	"			float dU = texture2D(s_sceneDepth, uv - vec2(0.0, tapStep.y)).r;\n"
+	"			float dD = texture2D(s_sceneDepth, uv + vec2(0.0, tapStep.y)).r;\n"
+	"			const float kEdgeTolerance = 0.0015;\n"
+	"			if (abs(dL - depth) < kEdgeTolerance && abs(dR - depth) < kEdgeTolerance &&\n"
+	"				abs(dU - depth) < kEdgeTolerance && abs(dD - depth) < kEdgeTolerance)\n"
+	"			{\n"
+	"				vec3 vL = ReconstructView(uv - vec2(tapStep.x, 0.0), dL);\n"
+	"				vec3 vR = ReconstructView(uv + vec2(tapStep.x, 0.0), dR);\n"
+	"				vec3 vU = ReconstructView(uv - vec2(0.0, tapStep.y), dU);\n"
+	"				vec3 vD = ReconstructView(uv + vec2(0.0, tapStep.y), dD);\n"
+	"				vec3 Nview = normalize(cross(vR - vL, vD - vU));\n"
+	"				vec3 V = normalize(-viewPos);\n"
+	"				if (dot(Nview, V) < 0.0)\n"
+	"					Nview = -Nview;\n"
+	"				N = mat3(u_cameraViewInverse) * Nview;\n"
+	"				vec3 Lview = normalize(transpose(mat3(u_cameraViewInverse)) * u_lightDir);\n"
+	"				legacyNdl = max(dot(Nview, Lview), 0.0);\n"
+	"			}\n"
+	// The sun term fades out with distance: beyond the shadow volume the
+	// reconstruction loses precision and a hard cutoff left a visible edge. The
+	// volume half-size is read from the shadow matrix itself, so the fade
+	// follows the size the panel sets.
+	"			float extent = 1.0 / max(u_shadowMatrix[0][0], 1e-6);\n"
+	"			float sunRange = 1.0 - smoothstep(extent * 2.0, extent * 4.0, length(world - u_cameraPos));\n"
+	"			tint *= vec3(1.0) + u_legacyLightScale * legacyNdl * u_lightColor * sunRange;\n"
+	"		}\n"
+	// Receptivity diagnostics. Each probe replaces the tint, so the frame it is
+	// captured in shows the untouched scene scaled by the probe: divide by a
+	// frame captured with the composite off to read the value.
+	"		if (u_debugMode == 5)\n"
+	"		{\n"
+	"			fragColor = vec4(scene * vec3(sunPixel ? 0.25 + 0.75 * legacyNdl : 1.0), 1.0);\n"
+	"			return;\n"
+	"		}\n"
+	"		if (u_debugMode == 6)\n"
+	"		{\n"
+	"			fragColor = vec4(scene * (N * 0.5 + 0.5), 1.0);\n"
+	"			return;\n"
+	"		}\n"
+	"		if (u_debugMode == 7)\n"
+	"		{\n"
+	"			fragColor = vec4(scene * vec3(sunPixel ? 0.25 + 0.75 * clamp(u_legacyLightScale, 0.0, 1.0) : 1.0), 1.0);\n"
+	"			return;\n"
+	"		}\n"
+	"		if (u_debugMode == 10)\n"
+	"		{\n"
+	"			fragColor = vec4(scene * vec3(sunPixel ? 0.35 : 1.0), 1.0);\n"
+	"			return;\n"
+	"		}\n"
 	"	}\n"
 	"	if (u_debugMode == 2)\n"
 	"	{\n"
-	"		fragColor = vec4(debugColour, 1.0);\n"
+	"		fragColor = vec4(scene * debugColour, 1.0);\n"
 	"		return;\n"
 	"	}\n"
-	"	fragColor = vec4(tint, 1.0);\n"
+	"	fragColor = vec4(scene * tint, 1.0);\n"
 	"}\n";
 
 typedef struct
@@ -361,13 +463,16 @@ static GLuint g_compositeProgram = 0;
 static GLuint g_fullscreenVao = 0;
 static GLuint g_sceneDepthFbo = 0;
 static GLuint g_sceneDepthTexture = 0;
+static GLuint g_sceneColorTexture = 0;
 static int    g_sceneDepthWidth = 0;
 static int    g_sceneDepthHeight = 0;
 static int    g_sceneDepthTargetOk = 0;
-static GLint  g_cuSceneDepth = -1, g_cuShadowMap = -1, g_cuProjInverse = -1;
+static GLint  g_cuSceneDepth = -1, g_cuShadowMap = -1, g_cuSceneColor = -1, g_cuProjInverse = -1;
 static GLint  g_cuCameraViewInverse = -1, g_cuXyScale = -1, g_cuZScale = -1;
 static GLint  g_cuShadowMatrix = -1, g_cuViewport = -1, g_cuShadowTexel = -1, g_cuStrength = -1;
 static GLint  g_cuDebugMode = -1;
+static GLint  g_cuLegacyLightScale = -1, g_cuLightDir = -1, g_cuLightColor = -1;
+static GLint  g_cuCameraPos = -1;
 
 static float g_modernCameraRotation[16] =
 {
@@ -704,6 +809,7 @@ static int CreateCompositeProgram()
 
 	g_cuSceneDepth = glGetUniformLocation(g_compositeProgram, "s_sceneDepth");
 	g_cuShadowMap = glGetUniformLocation(g_compositeProgram, "s_shadowMap");
+	g_cuSceneColor = glGetUniformLocation(g_compositeProgram, "s_sceneColor");
 	g_cuProjInverse = glGetUniformLocation(g_compositeProgram, "u_projInverse");
 	g_cuCameraViewInverse = glGetUniformLocation(g_compositeProgram, "u_cameraViewInverse");
 	g_cuXyScale = glGetUniformLocation(g_compositeProgram, "u_xyScale");
@@ -713,13 +819,18 @@ static int CreateCompositeProgram()
 	g_cuShadowTexel = glGetUniformLocation(g_compositeProgram, "u_shadowTexel");
 	g_cuStrength = glGetUniformLocation(g_compositeProgram, "u_strength");
 	g_cuDebugMode = glGetUniformLocation(g_compositeProgram, "u_debugMode");
+	g_cuLegacyLightScale = glGetUniformLocation(g_compositeProgram, "u_legacyLightScale");
+	g_cuLightDir = glGetUniformLocation(g_compositeProgram, "u_lightDir");
+	g_cuLightColor = glGetUniformLocation(g_compositeProgram, "u_lightColor");
+	g_cuCameraPos = glGetUniformLocation(g_compositeProgram, "u_cameraPos");
 
 	glGenVertexArrays(1, &g_fullscreenVao);
 	return 1;
 }
 
-/* Copies the legacy scene depth into a sampleable texture so the composite can
-   reconstruct world positions for pixels that are already shaded. */
+/* Copies the legacy scene depth and colour into sampleable textures so the
+   composite can reconstruct world positions for pixels that are already shaded
+   and rewrite their colour with the shadow and sunlight terms applied. */
 static int EnsureSceneDepthTarget(int width, int height)
 {
 	if (g_sceneDepthTexture != 0 && g_sceneDepthWidth == width && g_sceneDepthHeight == height)
@@ -729,6 +840,8 @@ static int EnsureSceneDepthTarget(int width, int height)
 		glGenFramebuffers(1, &g_sceneDepthFbo);
 	if (!g_sceneDepthTexture)
 		glGenTextures(1, &g_sceneDepthTexture);
+	if (!g_sceneColorTexture)
+		glGenTextures(1, &g_sceneColorTexture);
 
 	GLint prevFbo = 0;
 	GLint prevTexture = 0;
@@ -744,6 +857,15 @@ static int EnsureSceneDepthTarget(int width, int height)
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+
+	// The scene colour copy is read back with glCopyTexSubImage2D, which
+	// converts from the window format, so the internal format stays RGBA8.
+	glBindTexture(GL_TEXTURE_2D, g_sceneColorTexture);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
 	glBindFramebuffer(GL_FRAMEBUFFER, g_sceneDepthFbo);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, g_sceneDepthTexture, 0);
@@ -1161,8 +1283,12 @@ void PsyX_ModernMesh_RenderFrame(void)
 
 	// Legacy receivers: project the shadow map onto the pixels of the already
 	// rendered legacy scene. The modern meshes draw after this pass and shade
-	// their own shadows, so they are not darkened twice.
-	if (shadowActive && g_modernCameraValid && g_psyxModernProjectionInverseValid)
+	// their own shadows, so they are not darkened twice. The same pass applies
+	// the modern sun to legacy geometry when receptivity is enabled, with or
+	// without shadows.
+	const int legacyLighting = (g_lights.legacyLightingScale > 0.0f && g_lights.count > 0 &&
+		g_lights.lights[0].type == 0);
+	if ((shadowActive || legacyLighting) && g_modernCameraValid && g_psyxModernProjectionInverseValid)
 	{
 		if (!g_compositeProgram)
 			CreateCompositeProgram();
@@ -1177,6 +1303,11 @@ void PsyX_ModernMesh_RenderFrame(void)
 				0, 0, g_windowWidth, g_windowHeight,
 				GL_DEPTH_BUFFER_BIT, GL_NEAREST);
 			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+			// The colour is read back into a texture rather than blitted, so the
+			// driver converts from the window format for us.
+			glBindTexture(GL_TEXTURE_2D, g_sceneColorTexture);
+			glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, g_windowWidth, g_windowHeight);
 
 			static int s_blitErrorLogged = 0;
 			if (!s_blitErrorLogged)
@@ -1195,16 +1326,9 @@ void PsyX_ModernMesh_RenderFrame(void)
 			glDisable(GL_DEPTH_TEST);
 			glDepthMask(GL_FALSE);
 			glDisable(GL_CULL_FACE);
-			if (s_debugMode != 0)
-			{
-				glDisable(GL_BLEND);
-			}
-			else
-			{
-				glEnable(GL_BLEND);
-				glBlendEquation(GL_FUNC_ADD);
-				glBlendFuncSeparate(GL_DST_COLOR, GL_ZERO, GL_ZERO, GL_ONE);
-			}
+			// The shader writes the tinted scene colour itself: blending would
+			// clamp the source above 1.0, which the sunlight term needs.
+			glDisable(GL_BLEND);
 			glUniform1i(g_cuDebugMode, s_debugMode);
 
 			glActiveTexture(GL_TEXTURE0);
@@ -1213,6 +1337,9 @@ void PsyX_ModernMesh_RenderFrame(void)
 			glActiveTexture(GL_TEXTURE1);
 			glBindTexture(GL_TEXTURE_2D, g_shadowTexture);
 			glUniform1i(g_cuShadowMap, 1);
+			glActiveTexture(GL_TEXTURE2);
+			glBindTexture(GL_TEXTURE_2D, g_sceneColorTexture);
+			glUniform1i(g_cuSceneColor, 2);
 
 			glUniformMatrix4fv(g_cuProjInverse, 1, GL_FALSE, g_psyxModernProjectionInverse);
 			glUniformMatrix4fv(g_cuCameraViewInverse, 1, GL_FALSE, g_modernCameraViewInverse);
@@ -1222,6 +1349,13 @@ void PsyX_ModernMesh_RenderFrame(void)
 			glUniform2f(g_cuViewport, (float)g_windowWidth, (float)g_windowHeight);
 			glUniform1f(g_cuShadowTexel, 1.0f / (float)g_shadowSize);
 			glUniform1f(g_cuStrength, 0.45f);
+			glUniform1f(g_cuLegacyLightScale, legacyLighting ? g_lights.legacyLightingScale : 0.0f);
+			glUniform3f(g_cuLightDir, g_lights.lights[0].direction[0], g_lights.lights[0].direction[1], g_lights.lights[0].direction[2]);
+			glUniform3f(g_cuLightColor,
+				g_lights.lights[0].color[0] * g_lights.lights[0].intensity,
+				g_lights.lights[0].color[1] * g_lights.lights[0].intensity,
+				g_lights.lights[0].color[2] * g_lights.lights[0].intensity);
+			glUniform3f(g_cuCameraPos, g_modernCameraPosition[0], g_modernCameraPosition[1], g_modernCameraPosition[2]);
 
 			glBindVertexArray(g_fullscreenVao);
 
@@ -1235,7 +1369,8 @@ void PsyX_ModernMesh_RenderFrame(void)
 			glDepthMask(GL_TRUE);
 			glDisable(GL_CULL_FACE);
 
-			g_stats.legacyShadowPass = 1;
+			g_stats.legacyShadowPass = shadowActive ? 1 : 0;
+			g_stats.legacyLightPass = legacyLighting ? 1 : 0;
 		}
 	}
 
@@ -1376,6 +1511,11 @@ void PsyX_ModernMesh_Shutdown(void)
 	{
 		glDeleteTextures(1, &g_sceneDepthTexture);
 		g_sceneDepthTexture = 0;
+	}
+	if (g_sceneColorTexture)
+	{
+		glDeleteTextures(1, &g_sceneColorTexture);
+		g_sceneColorTexture = 0;
 	}
 	g_sceneDepthWidth = 0;
 	g_sceneDepthHeight = 0;

@@ -253,7 +253,7 @@ typedef struct
 	float cameraRotation[16];
 	float xyScale[4];		// x, y, z (1/128), unused
 	float shadowParams[4];		// x = enabled, y = texel, z = strength, w = ao
-	float lightInfo[4];		// x = count, y = srgb output, z = shadow debug
+	float lightInfo[4];		// x = count, y = srgb output, z = shadow debug, w = legacy light scale
 	float ambientExposure[4];	// rgb = ambient, w = exposure
 	float cameraPos[4];
 	float viewport[4];		// width, height
@@ -596,6 +596,9 @@ static struct
 	VkDeviceMemory sceneDepthMemory;
 	VkImageView sceneDepthView;
 	VkSampler sceneDepthSampler;
+	VkImage sceneColorImage;
+	VkDeviceMemory sceneColorMemory;
+	VkImageView sceneColorView;
 	float modernCameraRotation[16];
 	float modernCameraPosition[3];
 	int modernCameraValid;
@@ -1061,6 +1064,21 @@ static void DestroySwapchainResources(void)
 		vkFreeMemory(g_vk.device, g_vk.sceneDepthMemory, NULL);
 		g_vk.sceneDepthMemory = VK_NULL_HANDLE;
 	}
+	if (g_vk.sceneColorView)
+	{
+		vkDestroyImageView(g_vk.device, g_vk.sceneColorView, NULL);
+		g_vk.sceneColorView = VK_NULL_HANDLE;
+	}
+	if (g_vk.sceneColorImage)
+	{
+		vkDestroyImage(g_vk.device, g_vk.sceneColorImage, NULL);
+		g_vk.sceneColorImage = VK_NULL_HANDLE;
+	}
+	if (g_vk.sceneColorMemory)
+	{
+		vkFreeMemory(g_vk.device, g_vk.sceneColorMemory, NULL);
+		g_vk.sceneColorMemory = VK_NULL_HANDLE;
+	}
 
 	if (g_vk.depthView)
 	{
@@ -1097,6 +1115,24 @@ static int QuerySwapchainFormat(void)
 // combined format, in which case the mask bit degrades to a no-op.
 static VkFormat PickDepthStencilFormat(int* stencilSupported)
 {
+	// Developer validation override: PSYX_VK_DEPTH_FORMAT=d32 forces the
+	// stencil-less fallback so the degraded path can be exercised on drivers
+	// that always expose a combined format. It has no effect when the device
+	// cannot render to D32_SFLOAT either.
+	if (const char* requested = getenv("PSYX_VK_DEPTH_FORMAT"))
+	{
+		if (!strcmp(requested, "d32"))
+		{
+			VkFormatProperties properties;
+			vkGetPhysicalDeviceFormatProperties(g_vk.physicalDevice, VK_FORMAT_D32_SFLOAT, &properties);
+			if ((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0)
+			{
+				*stencilSupported = 0;
+				return VK_FORMAT_D32_SFLOAT;
+			}
+		}
+	}
+
 	VkFormat best = VK_FORMAT_UNDEFINED;
 	const VkFormat candidates[] =
 	{
@@ -1307,6 +1343,17 @@ static int CreateSwapchain(void)
 		&g_vk.sceneDepthImage, &g_vk.sceneDepthMemory))
 		return 0;
 	if (!CreateImageView2D(g_vk.sceneDepthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT, &g_vk.sceneDepthView))
+		return 0;
+
+	// Sampleable copy of the legacy scene colour. The composite rewrites the
+	// scene with the shadow and sunlight terms applied; it cannot read the
+	// colour attachment it writes to, and the blend stage clamps a source
+	// value above 1.0, so a copy is what lets the sunlight term brighten.
+	if (!CreateImage2D(width, height, g_vk.swapchainFormat,
+		VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+		&g_vk.sceneColorImage, &g_vk.sceneColorMemory))
+		return 0;
+	if (!CreateImageView2D(g_vk.sceneColorImage, g_vk.swapchainFormat, VK_IMAGE_ASPECT_COLOR_BIT, &g_vk.sceneColorView))
 		return 0;
 
 	// Readback buffer for the last frame.
@@ -1811,13 +1858,10 @@ static int CreateGameModernPipelines(void)
 
 		VkPipelineColorBlendAttachmentState blendAttachment;
 		memset(&blendAttachment, 0, sizeof(blendAttachment));
-		blendAttachment.blendEnable = VK_TRUE;
-		blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_DST_COLOR;
-		blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
-		blendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
-		blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
-		blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-		blendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+		// The shader samples the scene colour copy and writes the tinted result
+		// directly: a blend would clamp a source value above 1.0, which the
+		// sunlight term needs.
+		blendAttachment.blendEnable = VK_FALSE;
 		blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
 			VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
 
@@ -3437,7 +3481,13 @@ static void UpdateGameCompositeDescriptorSet(void)
 	depthInfo.imageView = g_vk.sceneDepthView;
 	depthInfo.sampler = g_vk.sceneDepthSampler;
 
-	VkWriteDescriptorSet writes[3];
+	VkDescriptorImageInfo colorInfo;
+	memset(&colorInfo, 0, sizeof(colorInfo));
+	colorInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	colorInfo.imageView = g_vk.sceneColorView;
+	colorInfo.sampler = g_vk.sceneDepthSampler;
+
+	VkWriteDescriptorSet writes[4];
 	memset(writes, 0, sizeof(writes));
 
 	writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -3461,7 +3511,16 @@ static void UpdateGameCompositeDescriptorSet(void)
 	writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 	writes[2].pImageInfo = &depthInfo;
 
-	vkUpdateDescriptorSets(g_vk.device, 3, writes, 0, NULL);
+	// Binding 3 is unused by the composite shader's material sibling; the
+	// composite reads the scene colour copy from it.
+	writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	writes[3].dstSet = g_vk.gameCompositeSet;
+	writes[3].dstBinding = 3;
+	writes[3].descriptorCount = 1;
+	writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	writes[3].pImageInfo = &colorInfo;
+
+	vkUpdateDescriptorSets(g_vk.device, 4, writes, 0, NULL);
 }
 
 int PsyX_Vk_GameModernMeshCreate(const PsyXModernMeshDesc* desc)
@@ -3708,6 +3767,9 @@ static void UpdateGameModernUbo(void)
 	ubo->lightInfo[0] = (float)lightCount;
 	ubo->lightInfo[1] = g_vk.srgbOutput ? 1.0f : 0.0f;
 	ubo->lightInfo[2] = (float)g_vk.gameModernShadowDebug;
+	// Legacy lighting receptivity: 0 disables the composite's sun term, so the
+	// legacy scene keeps its shipped shading.
+	ubo->lightInfo[3] = g_vk.lights.legacyLightingScale > 0.0f ? g_vk.lights.legacyLightingScale : 0.0f;
 
 	ubo->ambientExposure[0] = g_vk.lights.ambient[0];
 	ubo->ambientExposure[1] = g_vk.lights.ambient[1];
@@ -3768,9 +3830,12 @@ static void RecordGameModernShadowPass(VkCommandBuffer cmd)
 	}
 }
 
-// Copies the legacy scene depth (written by the main pass) into a sampleable
-// image so the composite can reconstruct world positions for shaded pixels.
-static void RecordGameModernSceneDepthCopy(VkCommandBuffer cmd)
+// Copies the legacy scene depth and colour (written by the main pass) into
+// sampleable images so the composite can reconstruct world positions for
+// shaded pixels and rewrite the scene with its tint applied. Sampling the
+// colour is required because a blend on a fixed-point attachment clamps a
+// source value above 1.0, which would discard the sunlight term.
+static void RecordGameModernSceneCopy(VkCommandBuffer cmd, uint32_t imageIndex)
 {
 	// Layout transitions cover both aspects unless separateDepthStencilLayouts
 	// is enabled. The copy and sampling view still access depth alone.
@@ -3811,6 +3876,40 @@ static void RecordGameModernSceneDepthCopy(VkCommandBuffer cmd)
 		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 		VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+	// Colour copy: the legacy scene is complete in the main pass, so the
+	// swapchain image is still writable as a transfer source here.
+	ImageBarrier(cmd, g_vk.swapchainImages[imageIndex], VK_IMAGE_ASPECT_COLOR_BIT,
+		VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+
+	ImageBarrier(cmd, g_vk.sceneColorImage, VK_IMAGE_ASPECT_COLOR_BIT,
+		VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+
+	VkImageCopy colorCopy;
+	memset(&colorCopy, 0, sizeof(colorCopy));
+	colorCopy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	colorCopy.srcSubresource.layerCount = 1;
+	colorCopy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	colorCopy.dstSubresource.layerCount = 1;
+	colorCopy.extent.width = (uint32_t)g_vk.width;
+	colorCopy.extent.height = (uint32_t)g_vk.height;
+	colorCopy.extent.depth = 1;
+	vkCmdCopyImage(cmd, g_vk.swapchainImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		g_vk.sceneColorImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &colorCopy);
+
+	ImageBarrier(cmd, g_vk.swapchainImages[imageIndex], VK_IMAGE_ASPECT_COLOR_BIT,
+		VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+
+	ImageBarrier(cmd, g_vk.sceneColorImage, VK_IMAGE_ASPECT_COLOR_BIT,
+		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 }
 
 // Draws the modern meshes into the current (load) pass. Returns the number of
@@ -3819,8 +3918,10 @@ static int RecordGameModernMeshes(VkCommandBuffer cmd)
 {
 	PsyXModernMeshStats* stats = &g_vk.gameModernStats;
 	const int legacyShadowPass = stats->legacyShadowPass;
+	const int legacyLightPass = stats->legacyLightPass;
 	memset(stats, 0, sizeof(*stats));
 	stats->legacyShadowPass = legacyShadowPass;
+	stats->legacyLightPass = legacyLightPass;
 	stats->meshCount = g_vk.gameModernMeshCount;
 	stats->depthShared = 1;
 
@@ -4346,6 +4447,13 @@ int PsyX_Vk_GameSelfTest(char* report, int reportSize)
 	const int width = g_vk.width;
 	const int height = g_vk.height;
 
+	{
+		char line[128];
+		snprintf(line, sizeof(line), "main depth format %d stencil=%d\n",
+			(int)g_vk.depthStencilFormat, g_vk.psx.stencilSupported);
+		ReportAppend(report, reportSize, line);
+	}
+
 	unsigned short* vram = new unsigned short[PSYX_VK_VRAM_WIDTH * PSYX_VK_VRAM_HEIGHT];
 	if (!vram)
 		return 0;
@@ -4571,6 +4679,9 @@ int PsyX_Vk_GameSelfTest(char* report, int reportSize)
 
 	// DrawPrim protection must survive multiple VRAM transfers/pass restarts.
 	// Later non-DrawPrim draws must still render outside the protected region.
+	// With the stencil-less D32_SFLOAT fallback the PSX mask bit is documented
+	// to degrade to a no-op, so the check asserts exactly that degradation
+	// instead of silently skipping the case.
 	beginUiFrame();
 	PsyX_Vk_GameSetStencilMode(1);
 	drawUiQuad(255, 255, 255, 0, width * 0.5f);
@@ -4579,8 +4690,16 @@ int PsyX_Vk_GameSelfTest(char* report, int reportSize)
 		PsyX_Vk_GameCopyVRAM(vram, PSYX_VK_VRAM_WIDTH, 0, 0, 1, 1, 0, 0);
 		drawUiQuad(255, 0, 0, 0, (float)width);
 	}
-	const float protectedPixel[4] = { white, white, white, alpha };
-	checkUiFrame("stencil survives two pass restarts", width / 4, protectedPixel);
+	if (g_vk.psx.stencilSupported)
+	{
+		const float protectedPixel[4] = { white, white, white, alpha };
+		checkUiFrame("stencil survives two pass restarts", width / 4, protectedPixel);
+	}
+	else
+	{
+		const float maskedPixel[4] = { white, 0, 0, 1.0f };
+		checkUiFrame("stencil unsupported: mask is a no-op", width / 4, maskedPixel);
+	}
 	const float outsidePixel[4] = { white, 0, 0, 1.0f };
 	if (!PsxCheckPixel(rgba, readWidth, readHeight, width * 3 / 4, height / 2,
 		outsidePixel, tolerance, "stencil outside mask", report, reportSize))
@@ -4588,13 +4707,14 @@ int PsyX_Vk_GameSelfTest(char* report, int reportSize)
 
 	// Seed one frame, then update only its left half for several presentations.
 	// This checks the acquired-image sequence, not guaranteed swapchain rotation.
+	const float seededPixel[4] = { white, white, white, alpha };
 	beginUiFrame();
 	drawUiQuad(255, 255, 255, 0, (float)width);
-	checkUiFrame("persistent framebuffer seed", width * 3 / 4, protectedPixel);
+	checkUiFrame("persistent framebuffer seed", width * 3 / 4, seededPixel);
 	for (uint32_t frame = 0; frame <= g_vk.swapchainImageCount; frame++) {
 		beginUiFrame();
 		drawUiQuad(0, 0, 0, 0, width * 0.5f);
-		checkUiFrame("partial frame retains preceding image", width * 3 / 4, protectedPixel);
+		checkUiFrame("partial frame retains preceding image", width * 3 / 4, seededPixel);
 	}
 	PsyX_SetRenderBackend(savedBackend);
 	delete[] rgba;
@@ -5465,10 +5585,19 @@ int PsyX_Vk_RenderFrame(void)
 			g_vk.mainPassOpen = 0;
 		}
 
+		const int sceneCopyReady = g_vk.sceneDepthImage != VK_NULL_HANDLE &&
+			g_vk.sceneColorImage != VK_NULL_HANDLE;
 		const int modernShadows = g_vk.gameModernEnabled && g_vk.lights.shadowsEnabled &&
-			g_vk.modernCameraValid && g_vk.sceneDepthImage != VK_NULL_HANDLE;
-		if (modernShadows)
-			RecordGameModernSceneDepthCopy(g_vk.commandBuffer);
+			g_vk.modernCameraValid && sceneCopyReady;
+		// Legacy lighting receptivity shares the composite pass (and therefore
+		// the scene copy) but is independent of the shadow toggle.
+		const int legacyLighting = g_vk.gameModernEnabled &&
+			g_vk.lights.legacyLightingScale > 0.0f && g_vk.lights.count > 0 &&
+			g_vk.lights.lights[0].type == 0 &&
+			g_vk.modernCameraValid && sceneCopyReady;
+		const int modernComposite = modernShadows || legacyLighting;
+		if (modernComposite)
+			RecordGameModernSceneCopy(g_vk.commandBuffer, imageIndex);
 
 		VkRenderPassBeginInfo modernBegin = mainBegin;
 		modernBegin.renderPass = g_vk.modernRenderPass;
@@ -5479,14 +5608,15 @@ int PsyX_Vk_RenderFrame(void)
 		vkCmdSetViewport(g_vk.commandBuffer, 0, 1, &viewport);
 		vkCmdSetScissor(g_vk.commandBuffer, 0, 1, &scissor);
 
-		if (modernShadows)
+		if (modernComposite)
 		{
 			UpdateGameCompositeDescriptorSet();
 			vkCmdBindPipeline(g_vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.gameCompositePipeline);
 			vkCmdBindDescriptorSets(g_vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
 				g_vk.pipelineLayout, 0, 1, &g_vk.gameCompositeSet, 0, NULL);
 			vkCmdDraw(g_vk.commandBuffer, 3, 1, 0, 0);
-			g_vk.gameModernStats.legacyShadowPass = 1;
+			g_vk.gameModernStats.legacyShadowPass = modernShadows ? 1 : 0;
+			g_vk.gameModernStats.legacyLightPass = legacyLighting ? 1 : 0;
 		}
 
 		drawCalls += RecordGameModernMeshes(g_vk.commandBuffer);

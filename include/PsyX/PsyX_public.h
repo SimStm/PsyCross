@@ -163,6 +163,16 @@ extern void PsyX_SetCursorRelative(int enable);
 /* Returns the SDL window owned by PsyCross. Do not destroy it. */
 extern SDL_Window* PsyX_GetSDLWindow(void);
 
+/* Applies a window mode at runtime and resets the render device so the viewport
+   and the game's screen-size consumers follow it: `fullscreen` selects desktop
+   fullscreen (the size arguments are ignored), otherwise the window is resized
+   to width x height (best effort; read the applied size back). Pass
+   outWidth/outHeight (either may be NULL) to read back the size SDL actually
+   applied, which is what callers must persist. Returns 1 when the window mode
+   was reached, 0 when there is no window or SDL refused the fullscreen switch,
+   leaving the previous mode in place. */
+extern int PsyX_ApplyWindowMode(int fullscreen, int width, int height, int* outWidth, int* outHeight);
+
 /* Hooks are invoked on the render thread. An event handler may return non-zero
    to consume keyboard, mouse, or text input before game debug callbacks. */
 extern void PsyX_SetSDLEventHandler(PsyXSDLEventHandlerFunc handler);
@@ -316,6 +326,12 @@ typedef struct
 	int aoEnabled;
 	float shadowCenter[3];	/* world-space centre of the shadow volume */
 	float shadowExtent;		/* half-size of the orthographic shadow volume */
+	/* Legacy-geometry light receptivity (roadmap: legacy-lighting-receptivity).
+	   When non-zero, the already-rendered legacy scene is additionally lit by
+	   the modern light set in the composite pass: a diffuse sun term (light 0
+	   when it is directional) scaled by this factor. The legacy shading itself
+	   is preserved; 0 keeps the shipped look. */
+	float legacyLightingScale;
 } PsyXModernLightSet;
 
 extern void PsyX_ModernMesh_SetLights(const PsyXModernLightSet* lights);
@@ -326,7 +342,8 @@ extern void PsyX_ModernMesh_SetLights(const PsyXModernLightSet* lights);
    (same fixed-point-derived transform the instances use, no translation) and
    `cameraPosition` is the world-space camera position. It is used to project
    the modern shadow map onto pixels of the already-rendered legacy scene, so
-   legacy scenery receives shadows cast by modern meshes. */
+   legacy scenery receives shadows cast by modern meshes, and to reconstruct
+   the world position/normal used by legacy lighting receptivity. */
 extern void PsyX_ModernMesh_SetCamera(const float viewRotation[16],
                                       const float cameraPosition[3]);
 
@@ -355,6 +372,7 @@ typedef struct
 	int lastFrameMicros;	/* CPU submission cost last frame */
 	int depthShared;		/* legacy depth buffer was available */
 	int legacyShadowPass;	/* shadow projection ran over the legacy scene */
+	int legacyLightPass;	/* lighting receptivity ran over the legacy scene */
 } PsyXModernMeshStats;
 
 extern void PsyX_ModernMesh_GetStats(PsyXModernMeshStats* stats);

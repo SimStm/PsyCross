@@ -722,6 +722,44 @@ SDL_Window* PsyX_GetSDLWindow(void)
 	return g_window;
 }
 
+int PsyX_ApplyWindowMode(int fullscreen, int width, int height, int* outWidth, int* outHeight)
+{
+	if (!g_window)
+		return 0;
+
+	int applied = 1;
+	if (fullscreen)
+	{
+		applied = SDL_SetWindowFullscreen(g_window, SDL_WINDOW_FULLSCREEN_DESKTOP) == 0;
+	}
+	else
+	{
+		applied = SDL_SetWindowFullscreen(g_window, 0) == 0;
+		if (width > 0 && height > 0)
+		{
+			// SDL_SetWindowSize is best effort and has no result; the window
+			// manager's answer is read back below.
+			SDL_SetWindowSize(g_window, width, height);
+		}
+	}
+
+	// Read the size SDL settled on rather than the requested one: a driver or
+	// window manager may refuse part of the request, and every consumer of the
+	// window size (viewport, aspect, picking) must follow the real window.
+	SDL_GetWindowSize(g_window, &g_windowWidth, &g_windowHeight);
+	GR_ResetDevice();
+
+	if (outWidth)
+		*outWidth = g_windowWidth;
+	if (outHeight)
+		*outHeight = g_windowHeight;
+
+	PsyX_Log_Info("display mode: %s %dx%d (%s)\n",
+		fullscreen ? "fullscreen" : "windowed", g_windowWidth, g_windowHeight,
+		applied ? "applied" : "kept previous");
+	return applied;
+}
+
 void PsyX_SetSDLEventHandler(PsyXSDLEventHandlerFunc handler)
 {
 	g_cfg_sdlEventHandler = handler;
