@@ -5250,17 +5250,15 @@ static void BuildShadowMatrix(float out[16])
 	length = length > 1e-5f ? length : 1.0f;
 	sunDir[0] /= length; sunDir[1] /= length; sunDir[2] /= length;
 
-	const float* c = g_vk.lights.shadowCenter;
-	const float eye[3] = { c[0] + sunDir[0] * extent * 2.0f, c[1] + sunDir[1] * extent * 2.0f, c[2] + sunDir[2] * extent * 2.0f };
+	float centre[3], up[3];
+	PsyX_ModernShadowSnapCentre(sunDir, g_vk.lights.shadowCenter, extent, kShadowSize, centre, up);
+	const float eye[3] = { centre[0] + sunDir[0] * extent * 2.0f, centre[1] + sunDir[1] * extent * 2.0f, centre[2] + sunDir[2] * extent * 2.0f };
 
 	// Reuse the OpenGL path's look-at/ortho construction (column-major).
-	float f[3] = { c[0] - eye[0], c[1] - eye[1], c[2] - eye[2] };
+	float f[3] = { centre[0] - eye[0], centre[1] - eye[1], centre[2] - eye[2] };
 	float fl = sqrtf(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
 	fl = fl > 1e-5f ? fl : 1.0f;
 	f[0] /= fl; f[1] /= fl; f[2] /= fl;
-
-	const int vertical = (sunDir[1] > 0.95f || sunDir[1] < -0.95f);
-	const float up[3] = { 0.0f, vertical ? 0.0f : 1.0f, vertical ? 1.0f : 0.0f };
 
 	float s[3] = { f[1] * up[2] - f[2] * up[1], f[2] * up[0] - f[0] * up[2], f[0] * up[1] - f[1] * up[0] };
 	float sl = sqrtf(s[0] * s[0] + s[1] * s[1] + s[2] * s[2]);
@@ -5429,7 +5427,8 @@ int PsyX_Vk_RenderFrame(void)
 
 	if (!VkOk(vkWaitForFences(g_vk.device, 1, &g_vk.frameFence, VK_TRUE, UINT64_MAX), "vkWaitForFences"))
 		return 0;
-	vkResetFences(g_vk.device, 1, &g_vk.frameFence);
+	// Not reset here: early exits below must leave the fence signaled. It is
+	// reset immediately before the submission that signals it again.
 
 	uint32_t imageIndex = 0;
 	VkResult acquire = vkAcquireNextImageKHR(g_vk.device, g_vk.swapchain, UINT64_MAX,
@@ -5816,8 +5815,24 @@ int PsyX_Vk_RenderFrame(void)
 	submit.signalSemaphoreCount = 1;
 	submit.pSignalSemaphores = &g_vk.renderFinished[imageIndex];
 
-	if (!VkOk(vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.frameFence), "vkQueueSubmit"))
+	// The fence is the previous frame's completion signal, so it is reset only
+	// here, right before the submission that signals it again. Resetting it at
+	// the top of the frame left it unsignaled whenever the frame exited early
+	// (an out-of-date acquire while a minimized window is restored, an
+	// unexpected image index) and the next frame then waited on a signal that
+	// nothing would ever produce.
+	if (!VkOk(vkResetFences(g_vk.device, 1, &g_vk.frameFence), "vkResetFences"))
 		return 0;
+	if (!VkOk(vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.frameFence), "vkQueueSubmit"))
+	{
+		// A submission that never happened cannot signal the fence; an empty
+		// one keeps the wait at the next frame from blocking forever.
+		VkSubmitInfo empty;
+		memset(&empty, 0, sizeof(empty));
+		empty.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+		vkQueueSubmit(g_vk.queue, 1, &empty, g_vk.frameFence);
+		return 0;
+	}
 
 	VkPresentInfoKHR present;
 	memset(&present, 0, sizeof(present));

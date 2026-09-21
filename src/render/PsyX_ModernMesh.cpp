@@ -12,6 +12,7 @@
 
 #include <string.h>
 #include <chrono>
+#include <math.h>
 
 /* The legacy 3D path feeds the projection vertices scaled by the GTE screen
    distance (scr_h = C2_H) after dividing the camera-space position by 128
@@ -28,6 +29,57 @@
 static inline int ModernMeshUsesVulkan(void)
 {
 	return PsyX_GetRenderBackend() == PSYX_BACKEND_VULKAN;
+}
+
+/* The shadow volume follows the receiver, so its light-space origin advances by
+   a fraction of a texel every frame. Both backends sample the shadow map with
+   NEAREST filtering, and that fraction flips the compared texel back and forth,
+   which reads as shadow edges swimming over otherwise stable silhouettes.
+   Rounding the centre to the light-space texel grid removes the fraction; the
+   grid is perpendicular to the light, so a shift of `2 * extent / shadowSize`
+   units moves every lookup by exactly one texel and leaves the depth map
+   itself aligned. Only the plane is snapped: the coordinate along the light
+   keeps following the receiver exactly. */
+void PsyX_ModernShadowSnapCentre(const float lightDirection[3], const float centre[3],
+	float extent, int shadowSize, float outCentre[3], float outUp[3])
+{
+	float dir[3] = { lightDirection[0], lightDirection[1], lightDirection[2] };
+	float length = sqrtf(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+	length = length > 1e-5f ? length : 1.0f;
+	dir[0] /= length; dir[1] /= length; dir[2] /= length;
+
+	/* Both backends look at the volume centre while standing on the light, so
+	   the view axis is the reverse of the light direction. A light nearly
+	   straight up or down needs a different up vector, or the basis collapses
+	   and `s` comes out null. */
+	const int vertical = (dir[1] > 0.95f || dir[1] < -0.95f);
+	const float up[3] = { 0.0f, vertical ? 0.0f : 1.0f, vertical ? 1.0f : 0.0f };
+
+	const float f[3] = { -dir[0], -dir[1], -dir[2] };
+	float s[3] = { f[1] * up[2] - f[2] * up[1], f[2] * up[0] - f[0] * up[2], f[0] * up[1] - f[1] * up[0] };
+	float sl = sqrtf(s[0] * s[0] + s[1] * s[1] + s[2] * s[2]);
+	sl = sl > 1e-5f ? sl : 1.0f;
+	s[0] /= sl; s[1] /= sl; s[2] /= sl;
+
+	const float u[3] = { s[1] * f[2] - s[2] * f[1], s[2] * f[0] - s[0] * f[2], s[0] * f[1] - s[1] * f[0] };
+
+	/* Doubles keep the rounding of a large world coordinate well below a texel:
+	   Driver 2 worlds reach ~2 * 10^5 units, where a single float ulp is
+	   already ~0.016 units. */
+	const double texelWorld = (2.0 * (double)extent) / (double)shadowSize;
+	const double alongS = (double)centre[0] * s[0] + (double)centre[1] * s[1] + (double)centre[2] * s[2];
+	const double alongU = (double)centre[0] * u[0] + (double)centre[1] * u[1] + (double)centre[2] * u[2];
+	const double alongF = (double)centre[0] * f[0] + (double)centre[1] * f[1] + (double)centre[2] * f[2];
+	const double snappedS = floor(alongS / texelWorld + 0.5) * texelWorld;
+	const double snappedU = floor(alongU / texelWorld + 0.5) * texelWorld;
+
+	outCentre[0] = (float)(snappedS * s[0] + snappedU * u[0] + alongF * f[0]);
+	outCentre[1] = (float)(snappedS * s[1] + snappedU * u[1] + alongF * f[1]);
+	outCentre[2] = (float)(snappedS * s[2] + snappedU * u[2] + alongF * f[2]);
+
+	outUp[0] = up[0];
+	outUp[1] = up[1];
+	outUp[2] = up[2];
 }
 
 #if defined(USE_OPENGL)
@@ -1252,10 +1304,9 @@ void PsyX_ModernMesh_RenderFrame(void)
 			float dl = sqrtf(sun->direction[0] * sun->direction[0] + sun->direction[1] * sun->direction[1] + sun->direction[2] * sun->direction[2]);
 			dl = dl > 1e-5f ? dl : 1.0f;
 			const float dir[3] = { sun->direction[0] / dl, sun->direction[1] / dl, sun->direction[2] / dl };
-			const float c[3] = { g_lights.shadowCenter[0], g_lights.shadowCenter[1], g_lights.shadowCenter[2] };
+			float c[3], up[3];
+			PsyX_ModernShadowSnapCentre(dir, g_lights.shadowCenter, extent, g_shadowSize, c, up);
 			const float eye[3] = { c[0] + dir[0] * extent * 2.0f, c[1] + dir[1] * extent * 2.0f, c[2] + dir[2] * extent * 2.0f };
-			const int vertical = (dir[1] > 0.95f || dir[1] < -0.95f);
-			const float up[3] = { 0.0f, vertical ? 0.0f : 1.0f, vertical ? 1.0f : 0.0f };
 			float lightView[16], lightProj[16];
 			MakeLookAt(eye, c, up, lightView);
 			MakeOrtho(-extent, extent, -extent, extent, 0.05f, extent * 4.0f, lightProj);

@@ -9,6 +9,14 @@
 extern float g_psyxModernProjection[16];
 extern int   g_psyxModernProjectionValid;
 
+/* Directional shadow volume alignment shared by the OpenGL and Vulkan modern
+   paths: snap a world-space shadow-volume centre to the light-space texel grid
+   of a `shadowSize` map covering `extent` units either way. `outUp` returns the
+   up vector of the light basis the snap used, so the caller's look-at matrix
+   and the snap agree. */
+void PsyX_ModernShadowSnapCentre(const float lightDirection[3], const float centre[3],
+	float extent, int shadowSize, float outCentre[3], float outUp[3]);
+
 void PsyX_ModernMesh_SetProjection(const float matrix[16]);
 void PsyX_ModernMesh_RenderFrame(void);
 void PsyX_ModernMesh_Shutdown(void);
