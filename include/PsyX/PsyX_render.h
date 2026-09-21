@@ -178,6 +178,7 @@ extern TextureID	g_whiteTexture;
 extern TextureID	g_vramTexture;
 
 extern void			GR_SwapWindow();
+extern void			GR_ComposeModernScene();
 
 // PSX VRAM operations
 extern void			GR_SaveVRAM(const char* outputFileName, int x, int y, int width, int height, int bReadFromFrameBuffer);

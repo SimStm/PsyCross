@@ -217,6 +217,7 @@ void PsyX_Vk_GameModernMeshSetEnabled(int enabled);
 int  PsyX_Vk_GameModernMeshGetEnabled(void);
 void PsyX_Vk_GameModernMeshGetStats(PsyXModernMeshStats* stats);
 void PsyX_Vk_GameModernMeshShutdown(void);
+void PsyX_Vk_GameModernSceneBoundary(void);
 
 /* Submits the queued draws into the main render pass and presents. */
 void PsyX_Vk_GameEndFrame(void);

@@ -182,6 +182,11 @@ extern void PsyX_SetInputCapture(int captureFlags);
 /* Returns aggregate primitive data for the current rendered frame. */
 extern void PsyX_GetRenderStats(PsyXRenderStats* stats);
 
+/* Insert modern scene composition when the next ordering-table traversal
+   reaches this tag. NULL cancels it. The caller owns the world/overlay split;
+   screen-space vertex encoding alone does not identify an overlay. */
+extern void PsyX_SetModernSceneBoundary(const void* tag);
+
 /* Saves the current window contents to SCREENSHOT.BMP in the working
    directory. Used by scripted debug captures; unavailable on web/Android. */
 extern void PsyX_TakeScreenshot(void);

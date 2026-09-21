@@ -526,8 +526,17 @@ static void PrepareTextureOverrideRect(short page, short clut, unsigned char* uv
 	PrepareTextureOverride(page, clut, uv0, uv1, uv2, uv3, 4);
 }
 
+static const void* g_modernSceneBoundaryTag = NULL;
+static int g_modernSceneBoundaryVertex = -1;
+
+void PsyX_SetModernSceneBoundary(const void* tag)
+{
+	g_modernSceneBoundaryTag = tag;
+}
+
 void ClearSplits()
 {
+	g_modernSceneBoundaryVertex = -1;
 	currentSplitDebugText = nullptr;
 	g_automaticOverrideTexture = 0;
 	g_automaticOverrideTextureWidth = 0;
@@ -1246,7 +1255,21 @@ void DrawSplit(const GPUDrawSplit& split)
 
 	GR_SetBlendMode(split.blendMode);
 
-	GR_DrawTriangles(split.startVertex, split.numVerts / 3);
+	// A state batch can span the boundary (and mix 2D/3D primitives).
+	// Split by the exact vertex position, never by its first vertex's scr_h.
+	const int boundary = g_modernSceneBoundaryVertex;
+	if (boundary >= split.startVertex && boundary <= split.startVertex + split.numVerts)
+	{
+		const int prefix = boundary - split.startVertex;
+		if (prefix)
+			GR_DrawTriangles(split.startVertex, prefix / 3);
+		GR_ComposeModernScene();
+		g_modernSceneBoundaryVertex = -1;
+		if (split.numVerts > prefix)
+			GR_DrawTriangles(boundary, (split.numVerts - prefix) / 3);
+	}
+	else
+		GR_DrawTriangles(split.startVertex, split.numVerts / 3);
 
 	if (split.debugText)
 		GR_PopDebugLabel();
@@ -2005,6 +2028,11 @@ void ParsePrimitivesLinkedList(u_long* p, int singlePrimitive)
 		// walk OT_TAG linked list
 		for (uintptr_t basePacket = reinterpret_cast<uintptr_t>(p);; basePacket = reinterpret_cast<uintptr_t>(nextPrim(basePacket)))
 		{
+			if (reinterpret_cast<const void*>(basePacket) == g_modernSceneBoundaryTag)
+			{
+				g_modernSceneBoundaryVertex = g_vertexIndex;
+				g_modernSceneBoundaryTag = NULL;
+			}
 			const int tagLength = getlen(basePacket);
 			if (tagLength > 0)
 			{

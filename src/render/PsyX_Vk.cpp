@@ -393,6 +393,7 @@ typedef struct
 	void* offscreenReadbackMapped;
 	VkDeviceSize offscreenReadbackSize;
 	int frameIndex;			// g_vk frame the queued draw list belongs to
+	int modernSceneBoundary;	// first final-overlay draw, -1 when absent
 	int offscreenActive;
 	int offscreenRect[4];
 	int offscreenGroupPendingDraw;
@@ -2694,6 +2695,7 @@ void PsyX_Vk_GameBeginFrame(void)
 	g_vk.psx.vertexUploadBase = 0;
 	g_vk.psx.vertexUploadedTotal = 0;
 	g_vk.psx.drawCount = 0;
+	g_vk.psx.modernSceneBoundary = -1;
 	// VRAM writes queued before this frame have already been replayed (or are
 	// irrelevant now); each frame starts from the image the GPU holds.
 	g_vk.psx.vramUploadGeneration = 0;
@@ -2706,6 +2708,11 @@ void PsyX_Vk_GameBeginFrame(void)
 	g_vk.psx.offscreenActive = 0;
 	g_vk.psx.offscreenGroupPendingDraw = 0;
 	g_vk.psx.offscreenGroupCount = 0;
+}
+
+void PsyX_Vk_GameModernSceneBoundary(void)
+{
+	g_vk.psx.modernSceneBoundary = g_vk.psx.drawCount;
 }
 
 static void UploadVramMirror(const unsigned short* vram)
@@ -4068,7 +4075,7 @@ static void ResumeMainPass(VkCommandBuffer cmd)
 // queued inside a GR_SetOffscreenState render-to-VRAM run, and the main pass
 // records the complement so those draws are not also drawn on screen.
 static void RecordPsxDraws(VkCommandBuffer cmd, int offscreen, int frame,
-	int targetWidth, int targetHeight)
+	int targetWidth, int targetHeight, int firstDraw = 0, int drawLimit = -1)
 {
 	VkPsxState* psx = &g_vk.psx;
 	// A frame can carry VRAM writes without any draw (level loading); those
@@ -4076,7 +4083,7 @@ static void RecordPsxDraws(VkCommandBuffer cmd, int offscreen, int frame,
 	if (!psx->ready || (psx->drawCount == 0 && (offscreen != 0 || psx->vramUploadCount == 0)))
 		return;
 
-	const int endDraw = psx->drawCount;
+	const int endDraw = drawLimit >= 0 ? drawLimit : psx->drawCount;
 
 	// One vertex buffer per frame, as the game uploads it once.
 	const VkDeviceSize offset = 0;
@@ -4092,7 +4099,7 @@ static void RecordPsxDraws(VkCommandBuffer cmd, int offscreen, int frame,
 	int stencilDraws = 0;
 	int recordedDraws = 0;
 
-	for (int i = 0; i < endDraw; i++)
+	for (int i = firstDraw; i < endDraw; i++)
 	{
 		const VkPsxDraw* draw = &psx->draws[i];
 		if (draw->frame != frame)
@@ -4177,12 +4184,13 @@ static void RecordPsxDraws(VkCommandBuffer cmd, int offscreen, int frame,
 
 	if (!offscreen)
 	{
-		psx->lastDraws = recordedDraws;
-		psx->lastStencilDraws = stencilDraws;
+		psx->lastDraws += recordedDraws;
+		psx->lastStencilDraws += stencilDraws;
 
 		// Writes queued after the last draw still have to land in the image so
 		// the next frame starts from the memory the game expects.
-		ApplyVramUploadsUpTo(cmd, psx->vramUploadGeneration + 1, &passClosed);
+		if (endDraw == psx->drawCount)
+			ApplyVramUploadsUpTo(cmd, psx->vramUploadGeneration + 1, &passClosed);
 	}
 }
 
@@ -4657,25 +4665,37 @@ int PsyX_Vk_GameSelfTest(char* report, int reportSize)
 
 	// All PSX blend modes must blend in display space, like OpenGL. An sRGB
 	// attachment gives different answers even if the shader inverse-encodes.
-	for (int mode = 0; mode < PSYX_VK_PSX_BLEND_COUNT; mode++) {
-		beginUiFrame();
-		drawUiQuad(64, 64, 64, 0, (float)width);
-		drawUiQuad(128, 0, 0, mode, (float)width);
-		const float dst = white * 64.0f / 255.0f;
-		const float src = white * 128.0f / 255.0f;
-		float expected[4] = { src, 0, 0, alpha };
-		if (mode == 1) {
-			expected[0] = src * alpha + dst * (1 - alpha);
-			expected[1] = expected[2] = dst * (1 - alpha);
-		} else if (mode >= 2) {
-			expected[0] = mode == 3 ? 0 : dst + src * (mode == 4 ? 0.5f : 1.0f);
-			expected[1] = expected[2] = dst;
-			expected[3] = alpha * (mode == 4 ? 1.5f : 2.0f);
+	const int savedModernEnabled = g_vk.gameModernEnabled;
+	for (int splitComposition = 0; splitComposition < 2; ++splitComposition) {
+		g_vk.gameModernEnabled = splitComposition;
+		for (int mode = 0; mode < PSYX_VK_PSX_BLEND_COUNT; mode++) {
+			beginUiFrame();
+			drawUiQuad(64, 64, 64, 0, (float)width);
+			if (splitComposition) {
+				PsyX_Vk_GameModernSceneBoundary();
+				// A transfer in the overlay tail must restart the loaded pass,
+				// preserve the world colour, and restore the PSX draw bindings.
+				PsyX_Vk_GameCopyVRAM(vram, PSYX_VK_VRAM_WIDTH, 0, 0, 1, 1, 0, 0);
+			}
+			drawUiQuad(128, 0, 0, mode, (float)width);
+			const float dst = white * 64.0f / 255.0f;
+			const float src = white * 128.0f / 255.0f;
+			float expected[4] = { src, 0, 0, alpha };
+			if (mode == 1) {
+				expected[0] = src * alpha + dst * (1 - alpha);
+				expected[1] = expected[2] = dst * (1 - alpha);
+			} else if (mode >= 2) {
+				expected[0] = mode == 3 ? 0 : dst + src * (mode == 4 ? 0.5f : 1.0f);
+				expected[1] = expected[2] = dst;
+				expected[3] = alpha * (mode == 4 ? 1.5f : 2.0f);
+			}
+			char label[64];
+			snprintf(label, sizeof(label), "%s blend mode %d",
+				splitComposition ? "composition boundary" : "untextured", mode);
+			checkUiFrame(label, width / 2, expected);
 		}
-		char label[64];
-		snprintf(label, sizeof(label), "untextured blend mode %d", mode);
-		checkUiFrame(label, width / 2, expected);
 	}
+	g_vk.gameModernEnabled = savedModernEnabled;
 
 	// DrawPrim protection must survive multiple VRAM transfers/pass restarts.
 	// Later non-DrawPrim draws must still render outside the protected region.
@@ -5570,7 +5590,11 @@ int PsyX_Vk_RenderFrame(void)
 	g_vk.mainPassBegin = mainBegin;
 	g_vk.mainPassImageIndex = imageIndex;
 	g_vk.mainPassOpen = 1;
-	RecordPsxDraws(g_vk.commandBuffer, 0, g_vk.psx.frameIndex, g_vk.width, g_vk.height);
+	const int overlayBegin = g_vk.gameMode && g_vk.gameModernEnabled &&
+		g_vk.psx.modernSceneBoundary >= 0 ? g_vk.psx.modernSceneBoundary : g_vk.psx.drawCount;
+	g_vk.psx.lastDraws = 0;
+	g_vk.psx.lastStencilDraws = 0;
+	RecordPsxDraws(g_vk.commandBuffer, 0, g_vk.psx.frameIndex, g_vk.width, g_vk.height, 0, overlayBegin);
 	drawCalls += g_vk.psx.drawCount;
 
 	if (g_vk.gameMode)
@@ -5605,6 +5629,7 @@ int PsyX_Vk_RenderFrame(void)
 		modernBegin.clearValueCount = 0;
 		modernBegin.pClearValues = NULL;
 		vkCmdBeginRenderPass(g_vk.commandBuffer, &modernBegin, VK_SUBPASS_CONTENTS_INLINE);
+		g_vk.mainPassOpen = 1;
 		vkCmdSetViewport(g_vk.commandBuffer, 0, 1, &viewport);
 		vkCmdSetScissor(g_vk.commandBuffer, 0, 1, &scissor);
 
@@ -5620,6 +5645,13 @@ int PsyX_Vk_RenderFrame(void)
 		}
 
 		drawCalls += RecordGameModernMeshes(g_vk.commandBuffer);
+		// Blend HUD, menus and lens flare over both kinds of geometry. Keeping
+		// them out of the scene copy also prevents their colour/depth from
+		// being interpreted as lit world surfaces.
+		if (overlayBegin < g_vk.psx.drawCount)
+			RecordPsxDraws(g_vk.commandBuffer, 0, g_vk.psx.frameIndex,
+				g_vk.width, g_vk.height, overlayBegin);
+		ResumeMainPass(g_vk.commandBuffer);
 	}
 	else
 	{

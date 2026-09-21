@@ -495,8 +495,22 @@ void GR_UpdateSwapIntervalState(int swapInterval)
 #endif
 }
 
+static bool g_modernSceneComposed = false;
+
+void GR_ComposeModernScene()
+{
+	if (g_modernSceneComposed)
+		return;
+	g_modernSceneComposed = true;
+	if (GR_UseVulkan())
+		PsyX_Vk_GameModernSceneBoundary();
+	else
+		PsyX_ModernMesh_RenderFrame();
+}
+
 void GR_BeginScene()
 {
+	g_modernSceneComposed = false;
 	g_lastBoundTexture = 0;
 
 	if (GR_UseVulkan())
@@ -548,8 +562,8 @@ void GR_EndScene()
 		if (PsyX_Vk_GameResolveOffscreen(vram))
 			vram_need_update = 0;
 
-		// The modern mesh scene is still an OpenGL-only slice of the fixture;
-		// the Vulkan game frame ends in GR_SwapWindow.
+		// Vulkan records modern composition at the queued boundary when
+		// GR_SwapWindow submits the game frame.
 		return;
 	}
 
@@ -557,10 +571,9 @@ void GR_EndScene()
 	glBindVertexArray(0);
 #endif
 
-	// The legacy scene is complete in the shared framebuffer; draw the
-	// experimental modern meshes into the same colour/depth before the frame
-	// is handed to the overlay and swapped.
-	PsyX_ModernMesh_RenderFrame();
+	// Fallback for callers without an explicit world/overlay boundary.
+	// Gameplay that already composed its world must not draw the meshes twice.
+	GR_ComposeModernScene();
 }
 
 //----------------------------------------------------------------------------------------

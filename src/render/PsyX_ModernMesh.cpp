@@ -1135,6 +1135,15 @@ void PsyX_ModernMesh_RenderFrame(void)
 	GLboolean prevDepthMask = GL_TRUE;
 	GLint prevProgram = 0;
 	GLint prevVao = 0;
+	GLint prevActiveTexture = GL_TEXTURE0;
+	GLint prevTextures[5];
+	glGetIntegerv(GL_ACTIVE_TEXTURE, &prevActiveTexture);
+	for (int unit = 0; unit < 5; ++unit)
+	{
+		glActiveTexture(GL_TEXTURE0 + unit);
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTextures[unit]);
+	}
+	glActiveTexture(prevActiveTexture);
 	GLint prevViewport[4] = { 0, 0, 0, 0 };
 	GLint prevBlendSrcRgb = GL_SRC_ALPHA, prevBlendDstRgb = GL_ONE_MINUS_SRC_ALPHA;
 	GLint prevBlendSrcAlpha = GL_ONE, prevBlendDstAlpha = GL_ONE_MINUS_SRC_ALPHA;
@@ -1449,6 +1458,12 @@ void PsyX_ModernMesh_RenderFrame(void)
 
 	glBindVertexArray((GLuint)prevVao);
 	glUseProgram((GLuint)prevProgram);
+	for (int unit = 0; unit < 5; ++unit)
+	{
+		glActiveTexture(GL_TEXTURE0 + unit);
+		glBindTexture(GL_TEXTURE_2D, (GLuint)prevTextures[unit]);
+	}
+	glActiveTexture(prevActiveTexture);
 	glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
 	glDepthFunc(prevDepthFunc);
 	glDepthMask(prevDepthMask);
