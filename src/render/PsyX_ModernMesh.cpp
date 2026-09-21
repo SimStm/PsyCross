@@ -295,9 +295,17 @@ static const char* kCompositeFragmentShader =
 	"uniform float u_strength;\n"
 	"uniform int u_debugMode;\n"
 	"uniform float u_legacyLightScale;\n"
+	"uniform int u_lightIsSun;\n"
 	"uniform vec3 u_lightDir;\n"
 	"uniform vec3 u_lightColor;\n"
 	"uniform vec3 u_cameraPos;\n"
+	// Point lights of the legacy receptivity term (roadmap point-light-sources).
+	// The directional sun above is light 0 of the set; these are the remaining
+	// lights, already capped by the caller.
+	"uniform int u_pointLightCount;\n"
+	"uniform vec3 u_pointLightPos[4];\n"
+	"uniform vec3 u_pointLightColor[4];\n"
+	"uniform float u_pointLightRange[4];\n"
 	"out vec4 fragColor;\n"
 	// Reconstructs the view-space position of a scene pixel from its depth. The
 	// PSX depth is a function of camera-space z, so the inverse of the
@@ -337,6 +345,7 @@ static const char* kCompositeFragmentShader =
 	"	vec3 tint = vec3(1.0);\n"
 	"	vec3 N = vec3(0.0, 1.0, 0.0);\n"
 	"	float legacyNdl = 0.0;\n"
+	"	float legacyPointNdl = 0.0;\n"
 	// Reconstruct the view position for every pixel: screen-space derivatives
 	// (used by the legacy lighting normal) are undefined inside non-uniform
 	// control flow. Only world pixels consume the result.
@@ -387,7 +396,9 @@ static const char* kCompositeFragmentShader =
 	// world positions. Screen-space derivatives at a single pixel amplify the
 	// PGXP depth quantisation and the polygon-edge steps, which showed up as
 	// flickering light on moving vehicles; the wider taps average that out and
-	// an edge test keeps a neighbouring surface from bending the normal.
+	// an edge test keeps a neighbouring surface from bending the normal. Each
+	// light term scales the already-lit legacy colour; it does not replace the
+	// legacy shading model.
 	"		if (sunPixel && u_legacyLightScale > 0.0)\n"
 	"		{\n"
 	"			vec2 tapStep = 2.0 / u_viewport;\n"
@@ -408,16 +419,38 @@ static const char* kCompositeFragmentShader =
 	"				if (dot(Nview, V) < 0.0)\n"
 	"					Nview = -Nview;\n"
 	"				N = mat3(u_cameraViewInverse) * Nview;\n"
-	"				vec3 Lview = normalize(transpose(mat3(u_cameraViewInverse)) * u_lightDir);\n"
-	"				legacyNdl = max(dot(Nview, Lview), 0.0);\n"
+	// The directional sun (light 0). Its term fades out with distance: beyond
+	// the shadow volume the reconstruction loses precision and a hard cutoff
+	// left a visible edge. The volume half-size is read from the shadow matrix
+	// itself, so the fade follows the size the panel sets.
+	"				if (u_lightIsSun != 0)\n"
+	"				{\n"
+	"					vec3 Lview = normalize(transpose(mat3(u_cameraViewInverse)) * u_lightDir);\n"
+	"					legacyNdl = max(dot(Nview, Lview), 0.0);\n"
+	"					float extent = 1.0 / max(u_shadowMatrix[0][0], 1e-6);\n"
+	"					float sunRange = 1.0 - smoothstep(extent * 2.0, extent * 4.0, length(world - u_cameraPos));\n"
+	"					tint *= vec3(1.0) + u_legacyLightScale * legacyNdl * u_lightColor * sunRange;\n"
+	"				}\n"
+	// Point lights (roadmap point-light-sources): the same reconstructed
+	// normal, with distance attenuation from the light's range. The game
+	// publishes at most a few, nearest first, so the loop rejects the rest with
+	// one distance test. Point lights cast no shadow: only the directional map
+	// exists.
+	"				for (int i = 0; i < 4; i++)\n"
+	"				{\n"
+	"					if (i >= u_pointLightCount)\n"
+	"						break;\n"
+	"					vec3 toLight = u_pointLightPos[i] - world;\n"
+	"					float dist = length(toLight);\n"
+	"					float atten = clamp(1.0 - dist / max(u_pointLightRange[i], 1.0), 0.0, 1.0);\n"
+	"					if (atten <= 0.0)\n"
+	"						continue;\n"
+	"					vec3 Lview = normalize(transpose(mat3(u_cameraViewInverse)) * toLight);\n"
+	"					float pointNdl = max(dot(Nview, Lview), 0.0);\n"
+	"					legacyPointNdl = max(legacyPointNdl, pointNdl * atten * atten);\n"
+	"					tint *= vec3(1.0) + u_legacyLightScale * pointNdl * u_pointLightColor[i] * atten * atten;\n"
+	"				}\n"
 	"			}\n"
-	// The sun term fades out with distance: beyond the shadow volume the
-	// reconstruction loses precision and a hard cutoff left a visible edge. The
-	// volume half-size is read from the shadow matrix itself, so the fade
-	// follows the size the panel sets.
-	"			float extent = 1.0 / max(u_shadowMatrix[0][0], 1e-6);\n"
-	"			float sunRange = 1.0 - smoothstep(extent * 2.0, extent * 4.0, length(world - u_cameraPos));\n"
-	"			tint *= vec3(1.0) + u_legacyLightScale * legacyNdl * u_lightColor * sunRange;\n"
 	"		}\n"
 	// Receptivity diagnostics. Each probe replaces the tint, so the frame it is
 	// captured in shows the untouched scene scaled by the probe: divide by a
@@ -440,6 +473,11 @@ static const char* kCompositeFragmentShader =
 	"		if (u_debugMode == 10)\n"
 	"		{\n"
 	"			fragColor = vec4(scene * vec3(sunPixel ? 0.35 : 1.0), 1.0);\n"
+	"			return;\n"
+	"		}\n"
+	"		if (u_debugMode == 11)\n"
+	"		{\n"
+	"			fragColor = vec4(scene * vec3(sunPixel ? 0.25 + 0.75 * legacyPointNdl : 1.0), 1.0);\n"
 	"			return;\n"
 	"		}\n"
 	"	}\n"
@@ -523,8 +561,9 @@ static GLint  g_cuSceneDepth = -1, g_cuShadowMap = -1, g_cuSceneColor = -1, g_cu
 static GLint  g_cuCameraViewInverse = -1, g_cuXyScale = -1, g_cuZScale = -1;
 static GLint  g_cuShadowMatrix = -1, g_cuViewport = -1, g_cuShadowTexel = -1, g_cuStrength = -1;
 static GLint  g_cuDebugMode = -1;
-static GLint  g_cuLegacyLightScale = -1, g_cuLightDir = -1, g_cuLightColor = -1;
+static GLint  g_cuLegacyLightScale = -1, g_cuLightIsSun = -1, g_cuLightDir = -1, g_cuLightColor = -1;
 static GLint  g_cuCameraPos = -1;
+static GLint  g_cuPointLightCount = -1, g_cuPointLightPos = -1, g_cuPointLightColor = -1, g_cuPointLightRange = -1;
 
 static float g_modernCameraRotation[16] =
 {
@@ -872,9 +911,14 @@ static int CreateCompositeProgram()
 	g_cuStrength = glGetUniformLocation(g_compositeProgram, "u_strength");
 	g_cuDebugMode = glGetUniformLocation(g_compositeProgram, "u_debugMode");
 	g_cuLegacyLightScale = glGetUniformLocation(g_compositeProgram, "u_legacyLightScale");
+	g_cuLightIsSun = glGetUniformLocation(g_compositeProgram, "u_lightIsSun");
 	g_cuLightDir = glGetUniformLocation(g_compositeProgram, "u_lightDir");
 	g_cuLightColor = glGetUniformLocation(g_compositeProgram, "u_lightColor");
 	g_cuCameraPos = glGetUniformLocation(g_compositeProgram, "u_cameraPos");
+	g_cuPointLightCount = glGetUniformLocation(g_compositeProgram, "u_pointLightCount");
+	g_cuPointLightPos = glGetUniformLocation(g_compositeProgram, "u_pointLightPos");
+	g_cuPointLightColor = glGetUniformLocation(g_compositeProgram, "u_pointLightColor");
+	g_cuPointLightRange = glGetUniformLocation(g_compositeProgram, "u_pointLightRange");
 
 	glGenVertexArrays(1, &g_fullscreenVao);
 	return 1;
@@ -1344,10 +1388,10 @@ void PsyX_ModernMesh_RenderFrame(void)
 	// Legacy receivers: project the shadow map onto the pixels of the already
 	// rendered legacy scene. The modern meshes draw after this pass and shade
 	// their own shadows, so they are not darkened twice. The same pass applies
-	// the modern sun to legacy geometry when receptivity is enabled, with or
-	// without shadows.
-	const int legacyLighting = (g_lights.legacyLightingScale > 0.0f && g_lights.count > 0 &&
-		g_lights.lights[0].type == 0);
+	// the modern light set to legacy geometry when receptivity is enabled, with
+	// or without shadows: the shader decides which published lights are sun and
+	// point, so a set without a directional light still counts.
+	const int legacyLighting = (g_lights.legacyLightingScale > 0.0f && lightCount > 0);
 	if ((shadowActive || legacyLighting) && g_modernCameraValid && g_psyxModernProjectionInverseValid)
 	{
 		if (!g_compositeProgram)
@@ -1410,11 +1454,47 @@ void PsyX_ModernMesh_RenderFrame(void)
 			glUniform1f(g_cuShadowTexel, 1.0f / (float)g_shadowSize);
 			glUniform1f(g_cuStrength, 0.45f);
 			glUniform1f(g_cuLegacyLightScale, legacyLighting ? g_lights.legacyLightingScale : 0.0f);
-			glUniform3f(g_cuLightDir, g_lights.lights[0].direction[0], g_lights.lights[0].direction[1], g_lights.lights[0].direction[2]);
+
+			// Light 0 is the sun when it is directional; the remaining lights
+			// are uploaded as the composite's point lights.
+			const int sunIsDirectional = (lightCount > 0 && g_lights.lights[0].type == 0);
+			glUniform1i(g_cuLightIsSun, sunIsDirectional ? 1 : 0);
+			glUniform3f(g_cuLightDir,
+				sunIsDirectional ? g_lights.lights[0].direction[0] : 0.0f,
+				sunIsDirectional ? g_lights.lights[0].direction[1] : 0.0f,
+				sunIsDirectional ? g_lights.lights[0].direction[2] : 0.0f);
 			glUniform3f(g_cuLightColor,
-				g_lights.lights[0].color[0] * g_lights.lights[0].intensity,
-				g_lights.lights[0].color[1] * g_lights.lights[0].intensity,
-				g_lights.lights[0].color[2] * g_lights.lights[0].intensity);
+				sunIsDirectional ? g_lights.lights[0].color[0] * g_lights.lights[0].intensity : 0.0f,
+				sunIsDirectional ? g_lights.lights[0].color[1] * g_lights.lights[0].intensity : 0.0f,
+				sunIsDirectional ? g_lights.lights[0].color[2] * g_lights.lights[0].intensity : 0.0f);
+
+			float pointPositions[PSYX_MODERN_COMPOSITE_POINT_LIGHTS * 3];
+			float pointColors[PSYX_MODERN_COMPOSITE_POINT_LIGHTS * 3];
+			float pointRanges[PSYX_MODERN_COMPOSITE_POINT_LIGHTS];
+			int pointLightCount = 0;
+			for (int i = 1; i < lightCount && pointLightCount < PSYX_MODERN_COMPOSITE_POINT_LIGHTS; i++)
+			{
+				const PsyXModernLight& light = g_lights.lights[i];
+				if (light.type == 0)
+					continue;
+
+				pointPositions[pointLightCount * 3 + 0] = light.position[0];
+				pointPositions[pointLightCount * 3 + 1] = light.position[1];
+				pointPositions[pointLightCount * 3 + 2] = light.position[2];
+				pointColors[pointLightCount * 3 + 0] = light.color[0] * light.intensity;
+				pointColors[pointLightCount * 3 + 1] = light.color[1] * light.intensity;
+				pointColors[pointLightCount * 3 + 2] = light.color[2] * light.intensity;
+				pointRanges[pointLightCount] = light.range > 0.0f ? light.range : 1000.0f;
+				pointLightCount++;
+			}
+			glUniform1i(g_cuPointLightCount, pointLightCount);
+			if (pointLightCount > 0)
+			{
+				glUniform3fv(g_cuPointLightPos, pointLightCount, pointPositions);
+				glUniform3fv(g_cuPointLightColor, pointLightCount, pointColors);
+				glUniform1fv(g_cuPointLightRange, pointLightCount, pointRanges);
+			}
+
 			glUniform3f(g_cuCameraPos, g_modernCameraPosition[0], g_modernCameraPosition[1], g_modernCameraPosition[2]);
 
 			glBindVertexArray(g_fullscreenVao);

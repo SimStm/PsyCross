@@ -86,6 +86,7 @@ void main()
 	vec3 tint = vec3(1.0);
 	vec3 N = vec3(0.0, 1.0, 0.0);
 	float legacyNdl = 0.0;
+	float legacyPointNdl = 0.0;
 
 	// Reconstruct the view position for every pixel: the legacy lighting normal
 	// needs the neighbouring positions too, and only world pixels consume the
@@ -146,10 +147,11 @@ void main()
 		// amplify the PGXP depth quantisation and the polygon-edge steps, which
 		// showed up as flickering light on moving vehicles; the wider taps
 		// average that out and an edge test keeps a neighbouring surface from
-		// bending the normal. The sun term scales the already-lit legacy
+		// bending the normal. Each light term scales the already-lit legacy
 		// colour; it does not replace the legacy shading model.
 		float legacyScale = u.lightInfo.w;
-		if (sunPixel && legacyScale > 0.0 && u.lightInfo.x >= 1.0 && u.lights[0].dirType.w < 0.5)
+		int lightCount = int(u.lightInfo.x + 0.5);
+		if (sunPixel && legacyScale > 0.0 && lightCount > 0)
 		{
 			vec2 tapStep = 2.0 / u.viewport.xy;
 			float dL = texture(s_sceneDepth, uv - vec2(tapStep.x, 0.0)).r;
@@ -169,17 +171,45 @@ void main()
 				if (dot(Nview, V) < 0.0)
 					Nview = -Nview;
 				N = mat3(u.cameraViewInverse) * Nview;
-				vec3 Lview = normalize(transpose(mat3(u.cameraViewInverse)) * u.lights[0].dirType.xyz);
-				legacyNdl = max(dot(Nview, Lview), 0.0);
-			}
 
-			// The sun term fades out with distance: beyond the shadow volume
-			// the reconstruction loses precision and a hard cutoff left a
-			// visible edge. The volume half-size is read from the shadow matrix
-			// itself, so the fade follows the size the panel sets.
-			float extent = 1.0 / max(u.shadowMatrix[0][0], 1e-6);
-			float sunRange = 1.0 - smoothstep(extent * 2.0, extent * 4.0, length(world - u.cameraPos.xyz));
-			tint *= vec3(1.0) + legacyScale * legacyNdl * u.lights[0].color.rgb * sunRange;
+				// The directional sun (light 0). Its term fades out with
+				// distance: beyond the shadow volume the reconstruction loses
+				// precision and a hard cutoff left a visible edge. The volume
+				// half-size is read from the shadow matrix itself, so the fade
+				// follows the size the panel sets.
+				if (u.lights[0].dirType.w < 0.5)
+				{
+					vec3 Lview = normalize(transpose(mat3(u.cameraViewInverse)) * u.lights[0].dirType.xyz);
+					legacyNdl = max(dot(Nview, Lview), 0.0);
+					float extent = 1.0 / max(u.shadowMatrix[0][0], 1e-6);
+					float sunRange = 1.0 - smoothstep(extent * 2.0, extent * 4.0, length(world - u.cameraPos.xyz));
+					tint *= vec3(1.0) + legacyScale * legacyNdl * u.lights[0].color.rgb * sunRange;
+				}
+
+				// Point lights (roadmap point-light-sources): the same
+				// reconstructed normal, with distance attenuation from the
+				// light's range. The game publishes at most a few, nearest
+				// first, so the loop rejects the rest with one distance test.
+				// Point lights cast no shadow: only the directional map exists.
+				for (int i = 1; i < PSYX_VK_MAX_LIGHTS; i++)
+				{
+					if (i >= lightCount)
+						break;
+					if (u.lights[i].dirType.w < 0.5)
+						continue;
+
+					vec3 toLight = u.lights[i].posRange.xyz - world;
+					float dist = length(toLight);
+					float atten = clamp(1.0 - dist / max(u.lights[i].posRange.w, 1.0), 0.0, 1.0);
+					if (atten <= 0.0)
+						continue;
+
+					vec3 Lview = normalize(transpose(mat3(u.cameraViewInverse)) * toLight);
+					float pointNdl = max(dot(Nview, Lview), 0.0);
+					legacyPointNdl = max(legacyPointNdl, pointNdl * atten * atten);
+					tint *= vec3(1.0) + legacyScale * pointNdl * u.lights[i].color.rgb * atten * atten;
+				}
+			}
 		}
 
 		// Receptivity diagnostics. Each probe replaces the tint, so the frame
@@ -203,6 +233,11 @@ void main()
 		if (debugMode == 10)
 		{
 			fragColor = vec4(scene * vec3(sunPixel ? 0.35 : 1.0), 1.0);
+			return;
+		}
+		if (debugMode == 11)
+		{
+			fragColor = vec4(scene * vec3(sunPixel ? 0.25 + 0.75 * legacyPointNdl : 1.0), 1.0);
 			return;
 		}
 	}

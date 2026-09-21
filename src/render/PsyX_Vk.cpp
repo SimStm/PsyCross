@@ -5651,10 +5651,11 @@ int PsyX_Vk_RenderFrame(void)
 		const int modernShadows = g_vk.gameModernEnabled && g_vk.lights.shadowsEnabled &&
 			g_vk.modernCameraValid && sceneCopyReady;
 		// Legacy lighting receptivity shares the composite pass (and therefore
-		// the scene copy) but is independent of the shadow toggle.
+		// the scene copy) but is independent of the shadow toggle. The shader
+		// decides which published lights are sun and point, so any non-empty
+		// light set counts.
 		const int legacyLighting = g_vk.gameModernEnabled &&
 			g_vk.lights.legacyLightingScale > 0.0f && g_vk.lights.count > 0 &&
-			g_vk.lights.lights[0].type == 0 &&
 			g_vk.modernCameraValid && sceneCopyReady;
 		const int modernComposite = modernShadows || legacyLighting;
 		if (modernComposite)

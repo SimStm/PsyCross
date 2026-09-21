@@ -311,6 +311,12 @@ extern int  PsyX_ModernMesh_CreateEx(const PsyXModernMeshDesc* desc);
    light (world-space position, linear falloff over `range`). */
 #define PSYX_MODERN_MAX_LIGHTS 8
 
+/* Point lights the legacy lighting composite shades in one pass, on top of the
+   directional sun (light 0). The OpenGL composite's uniform arrays are sized by
+   this number, and the Vulkan composite reads the same light set, so a publisher
+   must not exceed it or the two backends shade different lights. */
+#define PSYX_MODERN_COMPOSITE_POINT_LIGHTS 4
+
 typedef struct
 {
 	int type;
