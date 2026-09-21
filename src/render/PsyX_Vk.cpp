@@ -1171,26 +1171,41 @@ static VkFormat PickDepthStencilFormat(int* stencilSupported)
 	return VK_FORMAT_D16_UNORM;
 }
 
-static int CreateSwapchain(void)
+// Resolve the extent a new swapchain would receive from the current surface.
+// A minimised window reports a 0x0 surface, in which case no swapchain can be
+// created; callers use the failure to decide before destroying an existing one.
+static int ResolveSwapchainExtent(VkSurfaceCapabilitiesKHR* capabilities, uint32_t* outWidth, uint32_t* outHeight)
 {
-	VkSurfaceCapabilitiesKHR capabilities;
-	if (!VkOk(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.physicalDevice, g_vk.surface, &capabilities), "surface capabilities"))
+	if (!VkOk(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.physicalDevice, g_vk.surface, capabilities), "surface capabilities"))
 		return 0;
 
 	uint32_t width = (uint32_t)g_vk.windowWidth;
 	uint32_t height = (uint32_t)g_vk.windowHeight;
-	if (capabilities.currentExtent.width != 0xFFFFFFFFu)
+	if (capabilities->currentExtent.width != 0xFFFFFFFFu)
 	{
-		width = capabilities.currentExtent.width;
-		height = capabilities.currentExtent.height;
+		width = capabilities->currentExtent.width;
+		height = capabilities->currentExtent.height;
 	}
 	if (width == 0 || height == 0)
 		return 0;
 
-	if (width < capabilities.minImageExtent.width) width = capabilities.minImageExtent.width;
-	if (height < capabilities.minImageExtent.height) height = capabilities.minImageExtent.height;
-	if (width > capabilities.maxImageExtent.width) width = capabilities.maxImageExtent.width;
-	if (height > capabilities.maxImageExtent.height) height = capabilities.maxImageExtent.height;
+	if (width < capabilities->minImageExtent.width) width = capabilities->minImageExtent.width;
+	if (height < capabilities->minImageExtent.height) height = capabilities->minImageExtent.height;
+	if (width > capabilities->maxImageExtent.width) width = capabilities->maxImageExtent.width;
+	if (height > capabilities->maxImageExtent.height) height = capabilities->maxImageExtent.height;
+
+	*outWidth = width;
+	*outHeight = height;
+	return 1;
+}
+
+static int CreateSwapchain(void)
+{
+	VkSurfaceCapabilitiesKHR capabilities;
+	uint32_t width = 0;
+	uint32_t height = 0;
+	if (!ResolveSwapchainExtent(&capabilities, &width, &height))
+		return 0;
 
 	uint32_t imageCount = capabilities.minImageCount + 1;
 	if (capabilities.maxImageCount > 0 && imageCount > capabilities.maxImageCount)
@@ -1399,8 +1414,19 @@ static void DestroySwapchain(void)
 // the previous ones still reference the old swapchain views and depth image
 // leaks both and leaves dangling attachments. The device is idle before any of
 // it so nothing in flight still uses the images being released.
+//
+// The surface is checked before anything is destroyed: a minimised window has
+// no extent, so no replacement could be created, and tearing the current
+// swapchain down would leave the frame path holding VK_NULL_HANDLE. Keeping the
+// old swapchain is harmless because a minimised window presents nothing.
 static int RecreateSwapchain(void)
 {
+	VkSurfaceCapabilitiesKHR capabilities;
+	uint32_t width = 0;
+	uint32_t height = 0;
+	if (!ResolveSwapchainExtent(&capabilities, &width, &height))
+		return 0;
+
 	vkDeviceWaitIdle(g_vk.device);
 	DestroySwapchainResources();
 	DestroySwapchain();
@@ -5388,6 +5414,18 @@ int PsyX_Vk_RenderFrame(void)
 		if (!RecreateSwapchain())
 			return 1;	// try again next frame
 	}
+
+	// A minimised window has no drawable to present to and a 0x0 surface, so
+	// acquiring or recreating would fail. Nothing on it is visible; skip the
+	// frame until it is restored.
+	if (g_vk.window && (SDL_GetWindowFlags(g_vk.window) & SDL_WINDOW_MINIMIZED))
+		return 1;
+
+	// Recovery path for a swapchain that could not be created earlier (for
+	// example while the window had no usable extent). Acquiring from a null
+	// handle is invalid and crashes in the driver, so never pass it on.
+	if (!g_vk.swapchain && !RecreateSwapchain())
+		return 1;
 
 	if (!VkOk(vkWaitForFences(g_vk.device, 1, &g_vk.frameFence, VK_TRUE, UINT64_MAX), "vkWaitForFences"))
 		return 0;
