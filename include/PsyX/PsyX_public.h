@@ -376,6 +376,13 @@ extern void PsyX_ModernMesh_SetInstanceWorld(int mesh, const float worldMatrix[1
 extern void PsyX_ModernMesh_SetEnabled(int enabled);
 extern int  PsyX_ModernMesh_GetEnabled(void);
 
+/* Vulkan source-world opaque caster slice. Copies a triangle list (3 floats per
+   vertex); no camera projection or texture semantics. Call each game frame;
+   NULL/0 clears it. Bounded to this capacity, returns 0 on rejection/unsupported
+   backend. CPU data is copied immediately; GPU upload follows the frame fence. */
+#define PSYX_WORLD_SHADOW_MAX_VERTICES 196608
+extern int PsyX_ModernShadow_SetWorldTriangles(const float* positions, int vertexCount);
+
 typedef struct
 {
 	int meshCount;			/* live meshes */
@@ -388,6 +395,7 @@ typedef struct
 	int legacyLightPass;	/* lighting receptivity ran over the legacy scene */
 	int legacyCasterDrawCalls;	/* legacy shadow-map draws last frame */
 	int legacyCasterTriangles;	/* accepted opaque legacy caster triangles */
+	int worldCasterTriangles;	/* source-world opaque caster triangles */
 } PsyXModernMeshStats;
 
 extern void PsyX_ModernMesh_GetStats(PsyXModernMeshStats* stats);

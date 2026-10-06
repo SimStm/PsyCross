@@ -259,6 +259,7 @@ typedef struct
 	float ambientExposure[4];	// rgb = ambient, w = exposure
 	float cameraPos[4];
 	float viewport[4];		// width, height
+	float shadowVolume[4];	// world-space centre xyz, configured half-size
 	VkLightStd140 lights[PSYX_VK_MAX_LIGHTS];
 } VkGameModernUbo;
 
@@ -566,6 +567,12 @@ static struct
 	uint32_t* legacyShadowIndexMapped;
 	VkPsxVertex* legacyShadowVertices;
 	uint32_t legacyShadowVertexCount;
+	VkPipeline worldShadowPipeline;
+	VkBuffer worldShadowBuffer;
+	VkDeviceMemory worldShadowMemory;
+	float* worldShadowMapped;
+	float* worldShadowPositions;
+	int worldShadowVertexCount;
 
 	VkDescriptorSetLayout descriptorSetLayout;
 	VkDescriptorPool descriptorPool;
@@ -1726,6 +1733,16 @@ static int CreatePipelines(void)
 	pipeline.renderPass = g_vk.shadowRenderPass;
 
 	if (!VkOk(vkCreateGraphicsPipelines(g_vk.device, VK_NULL_HANDLE, 1, &pipeline, NULL, &g_vk.shadowPipeline), "vkCreateGraphicsPipelines(shadow)"))
+		return 0;
+
+	// Source-world triangle batches share the depth program, but use packed xyz
+	// rather than the modern material vertex layout. Keep them independently biased.
+	shadowBinding.stride = 3 * sizeof(float);
+	shadowRaster.depthBiasEnable = VK_TRUE;
+	shadowRaster.depthBiasConstantFactor = 1.25f;
+	shadowRaster.depthBiasSlopeFactor = 1.5f;
+	if (!VkOk(vkCreateGraphicsPipelines(g_vk.device, VK_NULL_HANDLE, 1, &pipeline,
+		NULL, &g_vk.worldShadowPipeline), "vkCreateGraphicsPipelines(world shadow)"))
 		return 0;
 
 	vkDestroyShaderModule(g_vk.device, shadowVertex, NULL);
@@ -3870,6 +3887,29 @@ void PsyX_Vk_GameModernMeshShutdown(void)
 	}
 }
 
+int PsyX_Vk_GameSetWorldShadowTriangles(const float* positions, int vertexCount)
+{
+	g_vk.worldShadowVertexCount = 0;
+	if (!g_vk.initialised || !g_vk.gameMode || vertexCount < 0 ||
+		vertexCount > PSYX_WORLD_SHADOW_MAX_VERTICES || vertexCount % 3 != 0 ||
+		(vertexCount && !positions))
+		return 0;
+	if (vertexCount == 0)
+		return 1;
+	if (!g_vk.worldShadowPositions)
+	{
+		g_vk.worldShadowPositions = (float*)malloc(PSYX_WORLD_SHADOW_MAX_VERTICES * 3 * sizeof(float));
+		if (!g_vk.worldShadowPositions)
+		{
+			eprinterr("PsyX Vulkan: world shadow CPU allocation failed\n");
+			return 0;
+		}
+	}
+	memcpy(g_vk.worldShadowPositions, positions, (size_t)vertexCount * 3 * sizeof(float));
+	g_vk.worldShadowVertexCount = vertexCount;
+	return 1;
+}
+
 // Builds the frame's modern UBO: the legacy Projection3D captured by
 // GR_Perspective3D, the GTE screen scales, the frame camera, the light set and
 // the shadow volume.
@@ -3930,6 +3970,8 @@ static void UpdateGameModernUbo(void)
 	}
 
 	BuildShadowMatrix(ubo->shadowMatrix);
+	memcpy(ubo->shadowVolume, g_vk.lights.shadowCenter, 3 * sizeof(float));
+	ubo->shadowVolume[3] = g_vk.lights.shadowExtent > 0.0f ? g_vk.lights.shadowExtent : 4000.0f;
 
 	ubo->shadowParams[0] = g_vk.lights.shadowsEnabled ? 1.0f : 0.0f;
 	ubo->shadowParams[1] = 1.0f / (float)kShadowSize;
@@ -4139,6 +4181,20 @@ static void RecordGameLegacyShadowPass(VkCommandBuffer cmd)
 		}
 	}
 }
+
+static void RecordGameWorldShadowPass(VkCommandBuffer cmd)
+{
+	if (!g_vk.gameModernEnabled || !g_vk.worldShadowVertexCount ||
+		!g_vk.worldShadowMapped || !g_vk.gameModernUboMapped)
+		return;
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.worldShadowPipeline);
+	vkCmdPushConstants(cmd, g_vk.shadowPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
+		0, 64, g_vk.gameModernUboMapped->shadowMatrix);
+	const VkDeviceSize offset = 0;
+	vkCmdBindVertexBuffers(cmd, 0, 1, &g_vk.worldShadowBuffer, &offset);
+	vkCmdDraw(cmd, (uint32_t)g_vk.worldShadowVertexCount, 1, 0, 0);
+	g_vk.gameModernStats.worldCasterTriangles = g_vk.worldShadowVertexCount / 3;
+}
 // Records the modern shadow casters into the already-open shadow pass. Casters
 // use their world matrix, so an instance casts where it stands.
 static void RecordGameModernShadowPass(VkCommandBuffer cmd)
@@ -4264,11 +4320,13 @@ static int RecordGameModernMeshes(VkCommandBuffer cmd)
 	const int legacyLightPass = stats->legacyLightPass;
 	const int legacyCasterDrawCalls = stats->legacyCasterDrawCalls;
 	const int legacyCasterTriangles = stats->legacyCasterTriangles;
+	const int worldCasterTriangles = stats->worldCasterTriangles;
 	memset(stats, 0, sizeof(*stats));
 	stats->legacyShadowPass = legacyShadowPass;
 	stats->legacyLightPass = legacyLightPass;
 	stats->legacyCasterDrawCalls = legacyCasterDrawCalls;
 	stats->legacyCasterTriangles = legacyCasterTriangles;
+	stats->worldCasterTriangles = worldCasterTriangles;
 	stats->meshCount = g_vk.gameModernMeshCount;
 	stats->depthShared = 1;
 
@@ -5754,6 +5812,19 @@ int PsyX_Vk_RenderFrame(void)
 		UpdateGameCompositeDescriptorSet();
 		g_vk.gameModernStats.legacyCasterDrawCalls = 0;
 		g_vk.gameModernStats.legacyCasterTriangles = 0;
+		g_vk.gameModernStats.worldCasterTriangles = 0;
+		// CPU submission is ordinary RAM. Refill the GPU buffer only here, after
+		// the previous frame fence; host-coherent writes are visible on submit.
+		if (g_vk.worldShadowVertexCount)
+		{
+			if (!g_vk.worldShadowBuffer && !CreateBuffer(PSYX_WORLD_SHADOW_MAX_VERTICES * 3 * sizeof(float),
+				VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+				&g_vk.worldShadowBuffer, &g_vk.worldShadowMemory, (void**)&g_vk.worldShadowMapped))
+				return 0;
+			memcpy(g_vk.worldShadowMapped, g_vk.worldShadowPositions,
+				(size_t)g_vk.worldShadowVertexCount * 3 * sizeof(float));
+		}
 	}
 
 	// Command buffer.
@@ -5835,8 +5906,11 @@ int PsyX_Vk_RenderFrame(void)
 		{
 			RecordGameModernShadowPass(g_vk.commandBuffer);
 			RecordGameLegacyShadowPass(g_vk.commandBuffer);
+			RecordGameWorldShadowPass(g_vk.commandBuffer);
 		}
 	}
+	// World casters are a one-frame submission, never retained into frontend/UI.
+	g_vk.worldShadowVertexCount = 0;
 
 	// The render pass moves the shadow map to SHADER_READ_ONLY_OPTIMAL.
 	vkCmdEndRenderPass(g_vk.commandBuffer);
@@ -6841,6 +6915,11 @@ void PsyX_Vk_Shutdown(void)
 	if (g_vk.legacyShadowIndices) vkDestroyBuffer(g_vk.device, g_vk.legacyShadowIndices, NULL);
 	if (g_vk.legacyShadowIndexMemory) vkFreeMemory(g_vk.device, g_vk.legacyShadowIndexMemory, NULL);
 	free(g_vk.legacyShadowVertices);
+	if (g_vk.worldShadowPipeline) vkDestroyPipeline(g_vk.device, g_vk.worldShadowPipeline, NULL);
+	if (g_vk.worldShadowMapped) vkUnmapMemory(g_vk.device, g_vk.worldShadowMemory);
+	if (g_vk.worldShadowBuffer) vkDestroyBuffer(g_vk.device, g_vk.worldShadowBuffer, NULL);
+	if (g_vk.worldShadowMemory) vkFreeMemory(g_vk.device, g_vk.worldShadowMemory, NULL);
+	free(g_vk.worldShadowPositions);
 	if (g_vk.pipelineLayout) vkDestroyPipelineLayout(g_vk.device, g_vk.pipelineLayout, NULL);
 	if (g_vk.shadowPipelineLayout) vkDestroyPipelineLayout(g_vk.device, g_vk.shadowPipelineLayout, NULL);
 	if (g_vk.descriptorPool) vkDestroyDescriptorPool(g_vk.device, g_vk.descriptorPool, NULL);
@@ -6969,6 +7048,7 @@ void PsyX_Vk_GameModernMeshGetStats(PsyXModernMeshStats* stats)
 	if (stats) memset(stats, 0, sizeof(*stats));
 }
 void PsyX_Vk_GameModernMeshShutdown(void) {}
+int PsyX_Vk_GameSetWorldShadowTriangles(const float*, int) { return 0; }
 void PsyX_Vk_GameEndFrame(void) {}
 void PsyX_Vk_GameResetDevice(void) {}
 int PsyX_Vk_GameIsActive(void) { return 0; }

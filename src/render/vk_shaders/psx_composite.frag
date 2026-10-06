@@ -36,6 +36,7 @@ layout(set = 0, binding = 0) uniform ModernUBO
 	vec4 ambientExposure;
 	vec4 cameraPos;
 	vec4 viewport;
+	vec4 shadowVolume;	// world-space centre xyz, configured half-size
 	VkLight lights[PSYX_VK_MAX_LIGHTS];
 } u;
 
@@ -120,7 +121,7 @@ void main()
 		vec4 sc = u.shadowMatrix * vec4(world, 1.0);
 		// Vulkan shadow clip: xy in [-1,1], z already in [0,1].
 		vec3 proj = vec3(sc.xy / sc.w * 0.5 + 0.5, sc.z / sc.w);
-		bool inside = (proj.x >= 0.0 && proj.x <= 1.0 && proj.y >= 0.0 && proj.y <= 1.0 && proj.z <= 1.0);
+		bool inside = (proj.x >= 0.0 && proj.x <= 1.0 && proj.y >= 0.0 && proj.y <= 1.0 && proj.z >= 0.0 && proj.z <= 1.0);
 		debugColour = inside ? vec3(0.0, 0.2 + 0.8 * proj.z, 0.0) : vec3(1.0, 0.0, 0.0);
 
 		if (debugMode == 4)
@@ -175,14 +176,14 @@ void main()
 				// The directional sun (light 0). Its term fades out with
 				// distance: beyond the shadow volume the reconstruction loses
 				// precision and a hard cutoff left a visible edge. The volume
-				// half-size is read from the shadow matrix itself, so the fade
-				// follows the size the panel sets.
+				// half-size and centre are supplied explicitly; a rotated matrix
+				// element cannot recover the configured half-size.
 				if (u.lights[0].dirType.w < 0.5)
 				{
 					vec3 Lview = normalize(transpose(mat3(u.cameraViewInverse)) * u.lights[0].dirType.xyz);
 					legacyNdl = max(dot(Nview, Lview), 0.0);
-					float extent = 1.0 / max(u.shadowMatrix[0][0], 1e-6);
-					float sunRange = 1.0 - smoothstep(extent * 2.0, extent * 4.0, length(world - u.cameraPos.xyz));
+					float extent = max(u.shadowVolume.w, 1.0);
+					float sunRange = 1.0 - smoothstep(extent * 2.0, extent * 4.0, length(world - u.shadowVolume.xyz));
 					tint *= vec3(1.0) + legacyScale * legacyNdl * u.lights[0].color.rgb * sunRange;
 				}
 

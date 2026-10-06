@@ -35,6 +35,7 @@ layout(set = 0, binding = 0) uniform ModernUBO
 	vec4 ambientExposure;	// rgb = ambient, w = exposure
 	vec4 cameraPos;
 	vec4 viewport;
+	vec4 shadowVolume;	// world-space centre xyz, configured half-size
 	VkLight lights[PSYX_VK_MAX_LIGHTS];
 } u;
 
@@ -65,12 +66,18 @@ float ShadowFactor(float NdotL)
 	vec4 sc = u.shadowMatrix * vec4(vWorldPos, 1.0);
 	// Vulkan clip space: xy in [-1,1] but z already in [0,1].
 	vec3 proj = vec3(sc.xy / sc.w * 0.5 + 0.5, sc.z / sc.w);
-	if (proj.x < 0.0 || proj.x > 1.0 || proj.y < 0.0 || proj.y > 1.0 || proj.z > 1.0)
+	if (proj.x < 0.0 || proj.x > 1.0 || proj.y < 0.0 || proj.y > 1.0 || proj.z < 0.0 || proj.z > 1.0)
 		return 1.0;
 
 	float bias = max(0.0015 * (1.0 - NdotL), 0.0004);
-	float depth = texture(s_shadowMap, proj.xy).r;
-	return (proj.z - bias) > depth ? (1.0 - u.shadowParams.z) : 1.0;
+	float lit = 0.0;
+	for (int y = -1; y <= 1; y++)
+		for (int x = -1; x <= 1; x++)
+		{
+			float depth = texture(s_shadowMap, proj.xy + vec2(x, y) * u.shadowParams.y).r;
+			lit += (proj.z - bias) > depth ? 0.0 : 1.0;
+		}
+	return mix(1.0 - u.shadowParams.z, 1.0, lit / 9.0);
 }
 
 vec3 ShadeLight(vec3 N, vec3 V, vec3 base, float metallic, float roughness, vec3 L, vec3 radiance)

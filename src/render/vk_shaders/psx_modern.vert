@@ -48,6 +48,7 @@ layout(set = 0, binding = 0) uniform ModernUBO
 	vec4 ambientExposure;	// rgb = ambient, w = exposure
 	vec4 cameraPos;		// world-space camera position
 	vec4 viewport;		// x = width, y = height
+	vec4 shadowVolume;	// world-space centre xyz, configured half-size
 	VkLight lights[PSYX_VK_MAX_LIGHTS];
 } u;
 
