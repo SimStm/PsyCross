@@ -302,9 +302,18 @@ typedef struct
 	const float* emissiveFactor;	/* 3 floats, optional (default black) */
 	float metallicFactor;			/* default 1 */
 	float roughnessFactor;			/* default 1 */
+	/* Vulkan only: 0 = existing lit material, 1 = display-referred unlit.
+	   Unlit samples exact texels and ignores exposure, AO and lights. */
+	int unlit;
+	float unlitColorScale;		/* <= 0 defaults to 1 */
+	int unlitDither;			/* original 4x4 display-colour pattern */
 } PsyXModernMeshDesc;
 
 extern int  PsyX_ModernMesh_CreateEx(const PsyXModernMeshDesc* desc);
+/* Vulkan-only visibility for the next rendered frame, consumed after recording.
+   Camera and shadow visibility are independent; SetInstance must also be visible.
+   Returns 0 on other backends so callers can retain their legacy fallback. */
+extern int PsyX_ModernMesh_SetFrameVisibility(int mesh, int colorVisible, int shadowVisible);
 
 /* Forward light set for the experimental modern path. `type` 0 is a
    directional light (world-space direction towards the light), 1 is a point

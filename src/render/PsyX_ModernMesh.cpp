@@ -14,6 +14,12 @@
 #include <chrono>
 #include <math.h>
 
+int PsyX_ModernMesh_SetFrameVisibility(int mesh, int colorVisible, int shadowVisible)
+{
+	return PsyX_GetRenderBackend() == PSYX_BACKEND_VULKAN ?
+		PsyX_Vk_GameModernMeshSetFrameVisibility(mesh, colorVisible, shadowVisible) : 0;
+}
+
 int PsyX_ModernShadow_SetWorldTriangles(const float* positions, int vertexCount)
 {
 	if (PsyX_GetRenderBackend() == PSYX_BACKEND_VULKAN)
@@ -989,7 +995,8 @@ int PsyX_ModernMesh_CreateEx(const PsyXModernMeshDesc* desc)
 	if (ModernMeshUsesVulkan())
 		return PsyX_Vk_GameModernMeshCreate(desc);
 
-	if (!desc || !desc->positions || desc->vertexCount <= 0 || g_meshCount >= PSYX_MODERN_MAX_MESHES)
+	// Preserve fallback until the display-referred material is ported.
+	if (!desc || desc->unlit || !desc->positions || desc->vertexCount <= 0 || g_meshCount >= PSYX_MODERN_MAX_MESHES)
 		return -1;
 
 	if (!g_program && !CreateProgram())

@@ -236,11 +236,15 @@ typedef struct
 	VkDeviceMemory indexMemory;
 	VkDescriptorSet descriptorSet;
 	int textureSlots[4];		// 1-based PSX texture handles, 0 = neutral
-	float factors[2];		// metallic, roughness
+	float factors[4];		// metallic, roughness, unlit, unlit colour scale
 	float emissive[3];		// emissive factor
 	float world[16];
 	float color[4];
 	int visible;
+	int colorVisible;
+	int shadowVisible;
+	int frameVisibility;
+	int unlitDither;
 } VkGameMesh;
 
 // Uniform block shared by the modern mesh shaders and the shadow composite.
@@ -3785,6 +3789,9 @@ int PsyX_Vk_GameModernMeshCreate(const PsyXModernMeshDesc* desc)
 
 	mesh->factors[0] = desc->metallicFactor;
 	mesh->factors[1] = desc->roughnessFactor;
+	mesh->unlitDither = desc->unlitDither != 0;
+	mesh->factors[2] = desc->unlit ? 1.0f : 0.0f;
+	mesh->factors[3] = desc->unlitColorScale > 0.0f ? desc->unlitColorScale : 1.0f;
 	mesh->emissive[0] = desc->emissiveFactor ? desc->emissiveFactor[0] : 0.0f;
 	mesh->emissive[1] = desc->emissiveFactor ? desc->emissiveFactor[1] : 0.0f;
 	mesh->emissive[2] = desc->emissiveFactor ? desc->emissiveFactor[2] : 0.0f;
@@ -3792,11 +3799,22 @@ int PsyX_Vk_GameModernMeshCreate(const PsyXModernMeshDesc* desc)
 	mesh->world[0] = mesh->world[5] = mesh->world[10] = mesh->world[15] = 1.0f;
 	mesh->color[0] = mesh->color[1] = mesh->color[2] = mesh->color[3] = 1.0f;
 	mesh->visible = 1;
+	mesh->colorVisible = mesh->shadowVisible = 1;
 	mesh->used = 1;
 	g_vk.gameModernMeshCount++;
 
 	UpdateGameMeshDescriptorSet(mesh);
 	return slot;
+}
+
+int PsyX_Vk_GameModernMeshSetFrameVisibility(int mesh, int colorVisible, int shadowVisible)
+{
+	if (mesh < 0 || mesh >= PSYX_VK_GAME_MODERN_MAX_MESHES || !g_vk.gameMeshes[mesh].used)
+		return 0;
+	g_vk.gameMeshes[mesh].colorVisible = colorVisible != 0;
+	g_vk.gameMeshes[mesh].shadowVisible = shadowVisible != 0;
+	g_vk.gameMeshes[mesh].frameVisibility = 1;
+	return 1;
 }
 
 void PsyX_Vk_GameModernMeshDestroy(int mesh)
@@ -4207,7 +4225,7 @@ static void RecordGameModernShadowPass(VkCommandBuffer cmd)
 	for (int i = 0; i < PSYX_VK_GAME_MODERN_MAX_MESHES; i++)
 	{
 		VkGameMesh* mesh = &g_vk.gameMeshes[i];
-		if (!mesh->used || !mesh->visible || mesh->vertexCount == 0)
+		if (!mesh->used || !mesh->visible || !mesh->shadowVisible || mesh->vertexCount == 0)
 			continue;
 
 		float lightWorld[16];
@@ -4341,7 +4359,7 @@ static int RecordGameModernMeshes(VkCommandBuffer cmd)
 	for (int i = 0; i < PSYX_VK_GAME_MODERN_MAX_MESHES; i++)
 	{
 		VkGameMesh* mesh = &g_vk.gameMeshes[i];
-		if (!mesh->used || !mesh->visible || mesh->vertexCount == 0)
+		if (!mesh->used || !mesh->visible || !mesh->colorVisible || mesh->vertexCount == 0)
 			continue;
 
 		float push[28];
@@ -4349,12 +4367,12 @@ static int RecordGameModernMeshes(VkCommandBuffer cmd)
 		memcpy(push + 16, mesh->color, sizeof(mesh->color));
 		push[20] = mesh->factors[0];
 		push[21] = mesh->factors[1];
-		push[22] = 0.0f;
-		push[23] = 0.0f;
+		push[22] = mesh->factors[2];
+		push[23] = mesh->factors[3];
 		push[24] = mesh->emissive[0];
 		push[25] = mesh->emissive[1];
 		push[26] = mesh->emissive[2];
-		push[27] = 0.0f;
+		push[27] = mesh->unlitDither ? 1.0f : 0.0f;
 
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
 			g_vk.pipelineLayout, 0, 1, &mesh->descriptorSet, 0, NULL);
@@ -6122,6 +6140,12 @@ int PsyX_Vk_RenderFrame(void)
 		VkStage(line);
 	}
 
+	// Frame-managed scene adapters must republish both visibility decisions.
+	// Consume after recording: BeginFrame occurs after the game builds its OT.
+	for (int i = 0; i < PSYX_VK_GAME_MODERN_MAX_MESHES; i++)
+		if (g_vk.gameMeshes[i].frameVisibility)
+			g_vk.gameMeshes[i].colorVisible = g_vk.gameMeshes[i].shadowVisible = 0;
+
 	// Overlay.
 	if (g_vk.imguiActive)
 	{
@@ -7025,6 +7049,7 @@ void PsyX_Vk_GameGetTextureSize(int texture, int* width, int* height)
 	if (height) *height = 0;
 }
 int PsyX_Vk_GameModernMeshCreate(const PsyXModernMeshDesc* desc) { (void)desc; return -1; }
+int PsyX_Vk_GameModernMeshSetFrameVisibility(int, int, int) { return 0; }
 void PsyX_Vk_GameModernMeshDestroy(int mesh) { (void)mesh; }
 void PsyX_Vk_GameModernMeshSetInstance(int mesh, const float viewMatrix[16],
 	const float color[4], int visible)

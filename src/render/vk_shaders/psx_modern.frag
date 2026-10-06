@@ -103,6 +103,25 @@ vec3 ShadeLight(vec3 N, vec3 V, vec3 base, float metallic, float roughness, vec3
 
 void main()
 {
+	if (pc.factors.z > 0.5)
+	{
+		// Original display colour is already shaded. Cancel attachment sRGB
+		// encoding, rather than applying the PBR/exposure calculation again.
+		ivec2 size = textureSize(s_texture, 0);
+		ivec2 pixel = clamp(ivec2(floor(vUv * vec2(size))), ivec2(0), size - 1);
+		vec4 texel = texelFetch(s_texture, pixel, 0);
+		vec3 display = texel.rgb * vColor.rgb * pc.factors.w;
+		if (pc.emissive.w > 0.5)
+		{
+			const mat4 pattern = mat4(-4, 0, -3, 1, 2, -2, 3, -1, -3, 1, -4, 0, 3, -1, 2, -2) / 255.0;
+			ivec2 pixel = ivec2(fract(gl_FragCoord.xy / 4.0) * 4.0);
+			display += vec3(pattern[pixel.x][pixel.y]);
+		}
+		display = clamp(display, 0.0, 1.0);
+		fragColor = vec4(u.lightInfo.y > 0.5 ? ToLinear(display) : display, 1.0);
+		return;
+	}
+
 	vec3 base = ToLinear(vColor.rgb);
 	float alpha = vColor.a;
 
