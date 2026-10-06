@@ -20,6 +20,18 @@ int PsyX_ModernMesh_SetFrameVisibility(int mesh, int colorVisible, int shadowVis
 		PsyX_Vk_GameModernMeshSetFrameVisibility(mesh, colorVisible, shadowVisible) : 0;
 }
 
+int PsyX_ModernMesh_SetOriginalLighting(int mesh, int enabled, float strength)
+{
+	return PsyX_GetRenderBackend() == PSYX_BACKEND_VULKAN ?
+		PsyX_Vk_GameModernMeshSetOriginalLighting(mesh, enabled, strength) : 0;
+}
+
+int PsyX_ModernMesh_SetFrameInstances(int mesh, const PsyXModernMeshInstance* instances, int count)
+{
+	return PsyX_GetRenderBackend() == PSYX_BACKEND_VULKAN ?
+		PsyX_Vk_GameModernMeshSetFrameInstances(mesh, instances, count) : 0;
+}
+
 int PsyX_ModernShadow_SetWorldTriangles(const float* positions, int vertexCount)
 {
 	if (PsyX_GetRenderBackend() == PSYX_BACKEND_VULKAN)

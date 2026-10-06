@@ -50,6 +50,8 @@ layout(set = 0, binding = 0) uniform ModernUBO
 	vec4 viewport;		// x = width, y = height
 	vec4 shadowVolume;	// world-space centre xyz, configured half-size
 	VkLight lights[PSYX_VK_MAX_LIGHTS];
+	mat4 shadowFarMatrix;
+	vec4 shadowCascade; // x = distant half-size (0 off), y = atlas width
 } u;
 
 layout(location = 0) out vec4 vColor;
@@ -57,6 +59,7 @@ layout(location = 1) out vec3 vViewPos;
 layout(location = 2) out vec3 vNormal;
 layout(location = 3) out vec2 vUv;
 layout(location = 4) out vec3 vWorldPos;
+layout(location = 5) out vec3 vWorldNormal;
 
 void main()
 {
@@ -76,4 +79,5 @@ void main()
 	vNormal = normalize(mat3(u.cameraRotation) * mat3(pc.world) * inNormal);
 	vUv = inUv;
 	vWorldPos = world.xyz;
+	vWorldNormal = normalize(mat3(pc.world) * inNormal);
 }

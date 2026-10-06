@@ -223,7 +223,8 @@ static VkTexture g_textures[PSYX_VK_MAX_TEXTURES];
 // game's PsyX_CreateRGBATexture handles, which the Vulkan backend stores in its
 // PSX texture table, not the fixture's separate VkTexture table.
 
-#define PSYX_VK_GAME_MODERN_MAX_MESHES 16
+// 32 bounded source-material meshes plus 16 slots for existing fixtures/users.
+#define PSYX_VK_GAME_MODERN_MAX_MESHES 48
 
 typedef struct
 {
@@ -245,6 +246,9 @@ typedef struct
 	int shadowVisible;
 	int frameVisibility;
 	int unlitDither;
+	int frameInstancesManaged;
+	int frameInstanceCount;
+	PsyXModernMeshInstance frameInstances[PSYX_MODERN_MAX_FRAME_INSTANCES];
 } VkGameMesh;
 
 // Uniform block shared by the modern mesh shaders and the shadow composite.
@@ -265,6 +269,8 @@ typedef struct
 	float viewport[4];		// width, height
 	float shadowVolume[4];	// world-space centre xyz, configured half-size
 	VkLightStd140 lights[PSYX_VK_MAX_LIGHTS];
+	float shadowFarMatrix[16];
+	float shadowCascade[4]; // far half-size (0 = disabled), atlas width, reserved
 } VkGameModernUbo;
 
 // ---------------------------------------------------------------------------
@@ -655,6 +661,7 @@ static int g_supported = -1;
 // Shared helpers defined with their owners further down.
 static void FillMeshVertices(const PsyXModernMeshDesc* desc, VkVertex* vertices);
 static void BuildShadowMatrix(float out[16]);
+static void BuildShadowMatrixForExtent(float out[16], float extent);
 
 // PsyCross logging is only wired up once the game has started, so the Vulkan
 // initialisation stages also go to a small side log for developer runs.
@@ -3790,11 +3797,13 @@ int PsyX_Vk_GameModernMeshCreate(const PsyXModernMeshDesc* desc)
 	mesh->factors[0] = desc->metallicFactor;
 	mesh->factors[1] = desc->roughnessFactor;
 	mesh->unlitDither = desc->unlitDither != 0;
-	mesh->factors[2] = desc->unlit ? 1.0f : 0.0f;
+	mesh->factors[2] = desc->unlit == 2 ? 2.0f : (desc->unlit ? 1.0f : 0.0f);
 	mesh->factors[3] = desc->unlitColorScale > 0.0f ? desc->unlitColorScale : 1.0f;
 	mesh->emissive[0] = desc->emissiveFactor ? desc->emissiveFactor[0] : 0.0f;
 	mesh->emissive[1] = desc->emissiveFactor ? desc->emissiveFactor[1] : 0.0f;
 	mesh->emissive[2] = desc->emissiveFactor ? desc->emissiveFactor[2] : 0.0f;
+	if (desc->unlit)
+		mesh->emissive[0] = fmaxf(0.0f, fminf(desc->originalLightingStrength, 1.0f));
 
 	mesh->world[0] = mesh->world[5] = mesh->world[10] = mesh->world[15] = 1.0f;
 	mesh->color[0] = mesh->color[1] = mesh->color[2] = mesh->color[3] = 1.0f;
@@ -3814,6 +3823,31 @@ int PsyX_Vk_GameModernMeshSetFrameVisibility(int mesh, int colorVisible, int sha
 	g_vk.gameMeshes[mesh].colorVisible = colorVisible != 0;
 	g_vk.gameMeshes[mesh].shadowVisible = shadowVisible != 0;
 	g_vk.gameMeshes[mesh].frameVisibility = 1;
+	return 1;
+}
+
+int PsyX_Vk_GameModernMeshSetOriginalLighting(int mesh, int enabled, float strength)
+{
+	if (mesh < 0 || mesh >= PSYX_VK_GAME_MODERN_MAX_MESHES ||
+		!g_vk.gameMeshes[mesh].used || g_vk.gameMeshes[mesh].factors[2] < 0.5f)
+		return 0;
+	g_vk.gameMeshes[mesh].factors[2] = enabled ? 2.0f : 1.0f;
+	g_vk.gameMeshes[mesh].emissive[0] = fmaxf(0.0f, fminf(strength, 1.0f));
+	return 1;
+}
+
+int PsyX_Vk_GameModernMeshSetFrameInstances(int mesh, const PsyXModernMeshInstance* instances, int count)
+{
+	if (mesh < 0 || mesh >= PSYX_VK_GAME_MODERN_MAX_MESHES ||
+		!g_vk.gameMeshes[mesh].used || count < 0 || count > PSYX_MODERN_MAX_FRAME_INSTANCES ||
+		(count && !instances))
+		return 0;
+	VkGameMesh* resource = &g_vk.gameMeshes[mesh];
+	if (count) memcpy(resource->frameInstances, instances, count * sizeof(*instances));
+	resource->frameInstanceCount = count;
+	resource->frameInstancesManaged = 1;
+	resource->frameVisibility = 1;
+	resource->colorVisible = resource->shadowVisible = 1;
 	return 1;
 }
 
@@ -3990,6 +4024,10 @@ static void UpdateGameModernUbo(void)
 	BuildShadowMatrix(ubo->shadowMatrix);
 	memcpy(ubo->shadowVolume, g_vk.lights.shadowCenter, 3 * sizeof(float));
 	ubo->shadowVolume[3] = g_vk.lights.shadowExtent > 0.0f ? g_vk.lights.shadowExtent : 4000.0f;
+	const float farExtent = fminf(g_vk.lights.shadowFarExtent, 40000.0f);
+	ubo->shadowCascade[0] = farExtent > ubo->shadowVolume[3] ? farExtent : 0.0f;
+	ubo->shadowCascade[1] = (float)(kShadowSize * 2);
+	BuildShadowMatrixForExtent(ubo->shadowFarMatrix, farExtent > 0.0f ? farExtent : ubo->shadowVolume[3]);
 
 	ubo->shadowParams[0] = g_vk.lights.shadowsEnabled ? 1.0f : 0.0f;
 	ubo->shadowParams[1] = 1.0f / (float)kShadowSize;
@@ -4200,14 +4238,14 @@ static void RecordGameLegacyShadowPass(VkCommandBuffer cmd)
 	}
 }
 
-static void RecordGameWorldShadowPass(VkCommandBuffer cmd)
+static void RecordGameWorldShadowPass(VkCommandBuffer cmd, const float shadowMatrix[16])
 {
 	if (!g_vk.gameModernEnabled || !g_vk.worldShadowVertexCount ||
 		!g_vk.worldShadowMapped || !g_vk.gameModernUboMapped)
 		return;
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.worldShadowPipeline);
 	vkCmdPushConstants(cmd, g_vk.shadowPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
-		0, 64, g_vk.gameModernUboMapped->shadowMatrix);
+		0, 64, shadowMatrix);
 	const VkDeviceSize offset = 0;
 	vkCmdBindVertexBuffers(cmd, 0, 1, &g_vk.worldShadowBuffer, &offset);
 	vkCmdDraw(cmd, (uint32_t)g_vk.worldShadowVertexCount, 1, 0, 0);
@@ -4215,7 +4253,20 @@ static void RecordGameWorldShadowPass(VkCommandBuffer cmd)
 }
 // Records the modern shadow casters into the already-open shadow pass. Casters
 // use their world matrix, so an instance casts where it stands.
-static void RecordGameModernShadowPass(VkCommandBuffer cmd)
+static void DrawGameMeshGeometry(VkCommandBuffer cmd, const VkGameMesh* mesh)
+{
+	const VkDeviceSize offset = 0;
+	vkCmdBindVertexBuffers(cmd, 0, 1, &mesh->vertexBuffer, &offset);
+	if (mesh->indexCount > 0)
+	{
+		vkCmdBindIndexBuffer(cmd, mesh->indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+		vkCmdDrawIndexed(cmd, (uint32_t)mesh->indexCount, 1, 0, 0, 0);
+	}
+	else
+		vkCmdDraw(cmd, (uint32_t)mesh->vertexCount, 1, 0, 0);
+}
+
+static void RecordGameModernShadowPass(VkCommandBuffer cmd, const float shadowMatrix[16])
 {
 	if (!g_vk.gameModernEnabled || !g_vk.lights.shadowsEnabled || !g_vk.gameModernUboMapped)
 		return;
@@ -4228,21 +4279,15 @@ static void RecordGameModernShadowPass(VkCommandBuffer cmd)
 		if (!mesh->used || !mesh->visible || !mesh->shadowVisible || mesh->vertexCount == 0)
 			continue;
 
-		float lightWorld[16];
-		MulMatrix4(g_vk.gameModernUboMapped->shadowMatrix, mesh->world, lightWorld);
-
-		vkCmdPushConstants(cmd, g_vk.shadowPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, lightWorld);
-
-		VkDeviceSize offset = 0;
-		vkCmdBindVertexBuffers(cmd, 0, 1, &mesh->vertexBuffer, &offset);
-		if (mesh->indexCount > 0)
+		const int count = mesh->frameInstancesManaged ? mesh->frameInstanceCount : 1;
+		for (int instance = 0; instance < count; instance++)
 		{
-			vkCmdBindIndexBuffer(cmd, mesh->indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-			vkCmdDrawIndexed(cmd, (uint32_t)mesh->indexCount, 1, 0, 0, 0);
-		}
-		else
-		{
-			vkCmdDraw(cmd, (uint32_t)mesh->vertexCount, 1, 0, 0);
+			const PsyXModernMeshInstance* placement = mesh->frameInstancesManaged ? &mesh->frameInstances[instance] : NULL;
+			if (placement && !placement->shadowVisible) continue;
+			float lightWorld[16];
+			MulMatrix4(shadowMatrix, placement ? placement->world : mesh->world, lightWorld);
+			vkCmdPushConstants(cmd, g_vk.shadowPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, lightWorld);
+			DrawGameMeshGeometry(cmd, mesh);
 		}
 	}
 }
@@ -4347,6 +4392,9 @@ static int RecordGameModernMeshes(VkCommandBuffer cmd)
 	stats->worldCasterTriangles = worldCasterTriangles;
 	stats->meshCount = g_vk.gameModernMeshCount;
 	stats->depthShared = 1;
+	stats->shadowVolumeCount = g_vk.gameModernEnabled && g_vk.lights.shadowsEnabled ?
+		(g_vk.gameModernUboMapped->shadowCascade[0] > 0.0f ? 2 : 1) : 0;
+	stats->shadowFarExtent = stats->shadowVolumeCount == 2 ? g_vk.gameModernUboMapped->shadowCascade[0] : 0.0f;
 
 	if (!g_vk.gameModernEnabled || g_vk.gameModernMeshCount == 0 || !g_vk.gameModernPipeline)
 		return 0;
@@ -4363,8 +4411,6 @@ static int RecordGameModernMeshes(VkCommandBuffer cmd)
 			continue;
 
 		float push[28];
-		memcpy(push, mesh->world, sizeof(mesh->world));
-		memcpy(push + 16, mesh->color, sizeof(mesh->color));
 		push[20] = mesh->factors[0];
 		push[21] = mesh->factors[1];
 		push[22] = mesh->factors[2];
@@ -4376,25 +4422,22 @@ static int RecordGameModernMeshes(VkCommandBuffer cmd)
 
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
 			g_vk.pipelineLayout, 0, 1, &mesh->descriptorSet, 0, NULL);
-		vkCmdPushConstants(cmd, g_vk.pipelineLayout,
-			VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
-
-		VkDeviceSize offset = 0;
-		vkCmdBindVertexBuffers(cmd, 0, 1, &mesh->vertexBuffer, &offset);
-		if (mesh->indexCount > 0)
+		const int count = mesh->frameInstancesManaged ? mesh->frameInstanceCount : 1;
+		for (int instance = 0; instance < count; instance++)
 		{
-			vkCmdBindIndexBuffer(cmd, mesh->indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-			vkCmdDrawIndexed(cmd, (uint32_t)mesh->indexCount, 1, 0, 0, 0);
+			const PsyXModernMeshInstance* placement = mesh->frameInstancesManaged ? &mesh->frameInstances[instance] : NULL;
+			if (placement && !placement->colorVisible) continue;
+			memcpy(push, placement ? placement->world : mesh->world, sizeof(mesh->world));
+			for (int channel = 0; channel < 4; channel++)
+				push[16 + channel] = mesh->color[channel] * (placement ? placement->color[channel] : 1.0f);
+			vkCmdPushConstants(cmd, g_vk.pipelineLayout,
+				VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
+			DrawGameMeshGeometry(cmd, mesh);
+			stats->visibleInstances++;
+			stats->vertexCount += mesh->vertexCount;
+			stats->drawCalls++;
+			draws++;
 		}
-		else
-		{
-			vkCmdDraw(cmd, (uint32_t)mesh->vertexCount, 1, 0, 0);
-		}
-
-		stats->visibleInstances++;
-		stats->vertexCount += mesh->vertexCount;
-		stats->drawCalls++;
-		draws++;
 	}
 
 	const Uint64 end = SDL_GetPerformanceCounter();
@@ -5533,6 +5576,7 @@ void PsyX_Vk_SetOverlayText(const char* text)
 // Frame rendering
 
 static void BuildShadowMatrix(float out[16]);
+static void BuildShadowMatrixForExtent(float out[16], float extent);
 
 static void UpdateSceneUbo(void)
 {
@@ -5594,6 +5638,11 @@ static void UpdateSceneUbo(void)
 // modern UBO so both shadow paths match the OpenGL construction.
 static void BuildShadowMatrix(float out[16])
 {
+	BuildShadowMatrixForExtent(out, g_vk.lights.shadowExtent > 0.0f ? g_vk.lights.shadowExtent : 4000.0f);
+}
+
+static void BuildShadowMatrixForExtent(float out[16], float extent)
+{
 	int lightCount = g_vk.lights.count;
 	if (lightCount < 0) lightCount = 0;
 	if (lightCount > PSYX_VK_MAX_LIGHTS) lightCount = PSYX_VK_MAX_LIGHTS;
@@ -5603,8 +5652,6 @@ static void BuildShadowMatrix(float out[16])
 		memset(out, 0, 16 * sizeof(float));
 		return;
 	}
-
-	const float extent = g_vk.lights.shadowExtent > 0.0f ? g_vk.lights.shadowExtent : 4000.0f;
 
 	const PsyXModernLight* sun = NULL;
 	for (int i = 0; i < lightCount; i++)
@@ -5868,7 +5915,7 @@ int PsyX_Vk_RenderFrame(void)
 	shadowBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
 	shadowBegin.renderPass = g_vk.shadowRenderPass;
 	shadowBegin.framebuffer = g_vk.shadowFramebuffer;
-	shadowBegin.renderArea.extent.width = (uint32_t)kShadowSize;
+	shadowBegin.renderArea.extent.width = (uint32_t)(kShadowSize * (g_vk.gameMode ? 2 : 1));
 	shadowBegin.renderArea.extent.height = (uint32_t)kShadowSize;
 	shadowBegin.clearValueCount = 1;
 	shadowBegin.pClearValues = &shadowClear;
@@ -5922,9 +5969,19 @@ int PsyX_Vk_RenderFrame(void)
 
 		if (g_vk.gameMode)
 		{
-			RecordGameModernShadowPass(g_vk.commandBuffer);
+			const VkGameModernUbo shadows = *g_vk.gameModernUboMapped;
+			RecordGameModernShadowPass(g_vk.commandBuffer, shadows.shadowMatrix);
 			RecordGameLegacyShadowPass(g_vk.commandBuffer);
-			RecordGameWorldShadowPass(g_vk.commandBuffer);
+			RecordGameWorldShadowPass(g_vk.commandBuffer, shadows.shadowMatrix);
+			if (shadows.shadowCascade[0] > 0.0f)
+			{
+				shadowViewport.x = (float)kShadowSize;
+				shadowScissor.offset.x = kShadowSize;
+				vkCmdSetViewport(g_vk.commandBuffer, 0, 1, &shadowViewport);
+				vkCmdSetScissor(g_vk.commandBuffer, 0, 1, &shadowScissor);
+				RecordGameModernShadowPass(g_vk.commandBuffer, shadows.shadowFarMatrix);
+				RecordGameWorldShadowPass(g_vk.commandBuffer, shadows.shadowFarMatrix);
+			}
 		}
 	}
 	// World casters are a one-frame submission, never retained into frontend/UI.
@@ -6144,7 +6201,10 @@ int PsyX_Vk_RenderFrame(void)
 	// Consume after recording: BeginFrame occurs after the game builds its OT.
 	for (int i = 0; i < PSYX_VK_GAME_MODERN_MAX_MESHES; i++)
 		if (g_vk.gameMeshes[i].frameVisibility)
+		{
 			g_vk.gameMeshes[i].colorVisible = g_vk.gameMeshes[i].shadowVisible = 0;
+			g_vk.gameMeshes[i].frameInstanceCount = 0;
+		}
 
 	// Overlay.
 	if (g_vk.imguiActive)
@@ -6543,7 +6603,15 @@ static int CreateDevice()
 
 static int CreateShadowResources(void)
 {
-	if (!CreateImage2D((uint32_t)kShadowSize, (uint32_t)kShadowSize, VK_FORMAT_D32_SFLOAT,
+	const uint32_t width = (uint32_t)(kShadowSize * (g_vk.gameMode ? 2 : 1));
+	VkPhysicalDeviceProperties properties;
+	vkGetPhysicalDeviceProperties(g_vk.physicalDevice, &properties);
+	if (width > properties.limits.maxImageDimension2D || width > properties.limits.maxFramebufferWidth)
+	{
+		eprinterr("PsyX Vulkan: shadow atlas exceeds device dimensions\n");
+		return 0;
+	}
+	if (!CreateImage2D(width, (uint32_t)kShadowSize, VK_FORMAT_D32_SFLOAT,
 		VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
 		&g_vk.shadowImage, &g_vk.shadowMemory))
 		return 0;
@@ -6571,7 +6639,7 @@ static int CreateShadowResources(void)
 	framebuffer.renderPass = g_vk.shadowRenderPass;
 	framebuffer.attachmentCount = 1;
 	framebuffer.pAttachments = &g_vk.shadowView;
-	framebuffer.width = (uint32_t)kShadowSize;
+	framebuffer.width = width;
 	framebuffer.height = (uint32_t)kShadowSize;
 	framebuffer.layers = 1;
 
@@ -7050,6 +7118,8 @@ void PsyX_Vk_GameGetTextureSize(int texture, int* width, int* height)
 }
 int PsyX_Vk_GameModernMeshCreate(const PsyXModernMeshDesc* desc) { (void)desc; return -1; }
 int PsyX_Vk_GameModernMeshSetFrameVisibility(int, int, int) { return 0; }
+int PsyX_Vk_GameModernMeshSetOriginalLighting(int, int, float) { return 0; }
+int PsyX_Vk_GameModernMeshSetFrameInstances(int, const PsyXModernMeshInstance*, int) { return 0; }
 void PsyX_Vk_GameModernMeshDestroy(int mesh) { (void)mesh; }
 void PsyX_Vk_GameModernMeshSetInstance(int mesh, const float viewMatrix[16],
 	const float color[4], int visible)

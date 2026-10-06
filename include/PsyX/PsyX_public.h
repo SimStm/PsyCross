@@ -302,11 +302,12 @@ typedef struct
 	const float* emissiveFactor;	/* 3 floats, optional (default black) */
 	float metallicFactor;			/* default 1 */
 	float roughnessFactor;			/* default 1 */
-	/* Vulkan only: 0 = existing lit material, 1 = display-referred unlit.
-	   Unlit samples exact texels and ignores exposure, AO and lights. */
+	/* Vulkan only: 0 = PBR, 1 = original unlit, 2 = original diffuse lighting.
+	   Original modes sample exact display-colour texels and preserve dithering. */
 	int unlit;
 	float unlitColorScale;		/* <= 0 defaults to 1 */
 	int unlitDither;			/* original 4x4 display-colour pattern */
+	float originalLightingStrength; /* original mode 2: blend 0..1 */
 } PsyXModernMeshDesc;
 
 extern int  PsyX_ModernMesh_CreateEx(const PsyXModernMeshDesc* desc);
@@ -314,6 +315,21 @@ extern int  PsyX_ModernMesh_CreateEx(const PsyXModernMeshDesc* desc);
    Camera and shadow visibility are independent; SetInstance must also be visible.
    Returns 0 on other backends so callers can retain their legacy fallback. */
 extern int PsyX_ModernMesh_SetFrameVisibility(int mesh, int colorVisible, int shadowVisible);
+/* Changes original unlit/diffuse response without rebuilding geometry. */
+extern int PsyX_ModernMesh_SetOriginalLighting(int mesh, int enabled, float strength);
+
+#define PSYX_MODERN_MAX_FRAME_INSTANCES 128
+typedef struct
+{
+	float world[16];
+	float color[4];
+	int colorVisible;
+	int shadowVisible;
+} PsyXModernMeshInstance;
+/* Vulkan: copies a bounded list, reusing the mesh/texture resources for each
+   placement. Consumed after recording; count 0 clears this frame's instances.
+   All-or-nothing validation, returns 0 on failure/unsupported backends. */
+extern int PsyX_ModernMesh_SetFrameInstances(int mesh, const PsyXModernMeshInstance* instances, int count);
 
 /* Forward light set for the experimental modern path. `type` 0 is a
    directional light (world-space direction towards the light), 1 is a point
@@ -354,6 +370,8 @@ typedef struct
 	float legacyLightingScale;
 	/* Opt-in opaque legacy casters; implemented by Vulkan only for now. */
 	int legacyShadowCastersEnabled;
+	/* Vulkan game atlas: distant half-size; 0 disables the second volume. */
+	float shadowFarExtent;
 } PsyXModernLightSet;
 
 extern void PsyX_ModernMesh_SetLights(const PsyXModernLightSet* lights);
@@ -405,6 +423,8 @@ typedef struct
 	int legacyCasterDrawCalls;	/* legacy shadow-map draws last frame */
 	int legacyCasterTriangles;	/* accepted opaque legacy caster triangles */
 	int worldCasterTriangles;	/* source-world opaque caster triangles */
+	int shadowVolumeCount;		/* Vulkan game: 0, 1 near, or 2 near/distant */
+	float shadowFarExtent;		/* effective distant half-size, 0 when inactive */
 } PsyXModernMeshStats;
 
 extern void PsyX_ModernMesh_GetStats(PsyXModernMeshStats* stats);

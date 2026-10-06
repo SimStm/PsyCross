@@ -206,6 +206,8 @@ void PsyX_Vk_GameGetTextureSize(int texture, int* width, int* height);
  * when Vulkan is the active backend.
  */
 int PsyX_Vk_GameModernMeshSetFrameVisibility(int mesh, int colorVisible, int shadowVisible);
+int PsyX_Vk_GameModernMeshSetOriginalLighting(int mesh, int enabled, float strength);
+int PsyX_Vk_GameModernMeshSetFrameInstances(int mesh, const PsyXModernMeshInstance* instances, int count);
 int  PsyX_Vk_GameModernMeshCreate(const PsyXModernMeshDesc* desc);
 void PsyX_Vk_GameModernMeshDestroy(int mesh);
 void PsyX_Vk_GameModernMeshSetInstance(int mesh, const float viewMatrix[16],

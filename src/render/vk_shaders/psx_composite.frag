@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 // Vulkan port of the modern shadow composite (renderer roadmap R5) and of the
 // legacy lighting receptivity term (roadmap legacy-lighting-receptivity):
 // rewrites the already-rendered legacy scene with the modern shadow map and,
@@ -38,9 +39,12 @@ layout(set = 0, binding = 0) uniform ModernUBO
 	vec4 viewport;
 	vec4 shadowVolume;	// world-space centre xyz, configured half-size
 	VkLight lights[PSYX_VK_MAX_LIGHTS];
+	mat4 shadowFarMatrix;
+	vec4 shadowCascade; // x = distant half-size (0 off), y = atlas width
 } u;
 
 layout(set = 0, binding = 1) uniform sampler2D s_shadowMap;
+#include "game_shadow.glsl"
 layout(set = 0, binding = 2) uniform sampler2D s_sceneDepth;
 layout(set = 0, binding = 3) uniform sampler2D s_sceneColor;
 
@@ -126,21 +130,13 @@ void main()
 
 		if (debugMode == 4)
 		{
-			float shadowDepth = inside ? texture(s_shadowMap, proj.xy).r : 1.0;
+			float shadowDepth = inside ? texture(s_shadowMap, GameShadowUv(proj.xy, 0)).r : 1.0;
 			fragColor = vec4(scene * vec3(proj.z, shadowDepth, 0.0), 1.0);
 			return;
 		}
 
-		if (inside)
-		{
-			float ref = proj.z - 0.002;
-			float lit = 0.0;
-			for (int y = -1; y <= 1; y++)
-				for (int x = -1; x <= 1; x++)
-					lit += (ref > texture(s_shadowMap, proj.xy + vec2(float(x), float(y)) * u.shadowParams.y).r) ? 0.0 : 1.0;
-			lit /= 9.0;
-			tint = vec3(mix(1.0 - u.shadowParams.z, 1.0, lit));
-		}
+		float lit = GameShadowLit(world, 0.002);
+		tint = vec3(mix(1.0 - u.shadowParams.z, 1.0, lit));
 
 		// Legacy lighting receptivity: the legacy depth buffer has no surface
 		// normal, so one is reconstructed from a five-tap cross of the

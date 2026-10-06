@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 // Vulkan port of the in-game modern mesh fragment path: the reference Forward
 // metallic/roughness shader (GGX + Schlick, one directional shadow-casting
 // light, point lights, ambient/exposure/AO), matching the OpenGL modern path
@@ -12,6 +13,7 @@ layout(location = 1) in vec3 vViewPos;
 layout(location = 2) in vec3 vNormal;
 layout(location = 3) in vec2 vUv;
 layout(location = 4) in vec3 vWorldPos;
+layout(location = 5) in vec3 vWorldNormal;
 
 layout(location = 0) out vec4 fragColor;
 
@@ -37,9 +39,12 @@ layout(set = 0, binding = 0) uniform ModernUBO
 	vec4 viewport;
 	vec4 shadowVolume;	// world-space centre xyz, configured half-size
 	VkLight lights[PSYX_VK_MAX_LIGHTS];
+	mat4 shadowFarMatrix;
+	vec4 shadowCascade; // x = distant half-size (0 off), y = atlas width
 } u;
 
 layout(set = 0, binding = 1) uniform sampler2D s_shadowMap;
+#include "game_shadow.glsl"
 layout(set = 0, binding = 2) uniform sampler2D s_texture;
 layout(set = 0, binding = 3) uniform sampler2D s_normalMap;
 layout(set = 0, binding = 4) uniform sampler2D s_mrMap;
@@ -63,21 +68,9 @@ float ShadowFactor(float NdotL)
 	if (u.shadowParams.x < 0.5)
 		return 1.0;
 
-	vec4 sc = u.shadowMatrix * vec4(vWorldPos, 1.0);
-	// Vulkan clip space: xy in [-1,1] but z already in [0,1].
-	vec3 proj = vec3(sc.xy / sc.w * 0.5 + 0.5, sc.z / sc.w);
-	if (proj.x < 0.0 || proj.x > 1.0 || proj.y < 0.0 || proj.y > 1.0 || proj.z < 0.0 || proj.z > 1.0)
-		return 1.0;
-
 	float bias = max(0.0015 * (1.0 - NdotL), 0.0004);
-	float lit = 0.0;
-	for (int y = -1; y <= 1; y++)
-		for (int x = -1; x <= 1; x++)
-		{
-			float depth = texture(s_shadowMap, proj.xy + vec2(x, y) * u.shadowParams.y).r;
-			lit += (proj.z - bias) > depth ? 0.0 : 1.0;
-		}
-	return mix(1.0 - u.shadowParams.z, 1.0, lit / 9.0);
+	float lit = GameShadowLit(vWorldPos, bias);
+	return mix(1.0 - u.shadowParams.z, 1.0, lit);
 }
 
 vec3 ShadeLight(vec3 N, vec3 V, vec3 base, float metallic, float roughness, vec3 L, vec3 radiance)
@@ -101,6 +94,33 @@ vec3 ShadeLight(vec3 N, vec3 V, vec3 base, float metallic, float roughness, vec3
 	return (diffuse + spec) * radiance * NdotL;
 }
 
+vec3 OriginalDiffuse(vec3 N)
+{
+	// Original art already contains shading; blend this response deliberately.
+	// Shadow the direct sun only, preserving ambient fill and unrelated lights.
+	vec3 illumination = u.ambientExposure.rgb;
+	for (int i = 0; i < min(int(u.lightInfo.x), PSYX_VK_MAX_LIGHTS); i++)
+	{
+		vec3 L;
+		vec3 radiance = u.lights[i].color.rgb;
+		if (u.lights[i].dirType.w < 0.5)
+		{
+			L = normalize(u.lights[i].dirType.xyz);
+			radiance *= ShadowFactor(max(dot(N, L), 0.0));
+		}
+		else
+		{
+			vec3 delta = u.lights[i].posRange.xyz - vWorldPos;
+			float distance = length(delta);
+			L = delta / max(distance, 1e-4);
+			float attenuation = clamp(1.0 - distance / max(u.lights[i].posRange.w, 1.0), 0.0, 1.0);
+			radiance *= attenuation * attenuation;
+		}
+		illumination += radiance * max(dot(N, L), 0.0);
+	}
+	return mix(vec3(1.0), illumination * u.ambientExposure.w, pc.emissive.x);
+}
+
 void main()
 {
 	if (pc.factors.z > 0.5)
@@ -111,6 +131,18 @@ void main()
 		ivec2 pixel = clamp(ivec2(floor(vUv * vec2(size))), ivec2(0), size - 1);
 		vec4 texel = texelFetch(s_texture, pixel, 0);
 		vec3 display = texel.rgb * vColor.rgb * pc.factors.w;
+		if (pc.factors.z > 1.5)
+		{
+			vec3 N = normalize(vWorldNormal);
+			display = ToSrgb(ToLinear(display) * OriginalDiffuse(N));
+			int debug = int(u.lightInfo.z);
+			vec3 L = normalize(u.lights[0].dirType.xyz);
+			float sun = max(dot(N, L), 0.0);
+			if (debug == 4) display = vec3(ShadowFactor(sun));
+			else if (debug == 5) display = vec3(sun);
+			else if (debug == 6) display = N * 0.5 + 0.5;
+			else if (debug == 7) display = OriginalDiffuse(N) / 2.0;
+		}
 		if (pc.emissive.w > 0.5)
 		{
 			const mat4 pattern = mat4(-4, 0, -3, 1, 2, -2, 3, -1, -3, 1, -4, 0, 3, -1, 2, -2) / 255.0;
