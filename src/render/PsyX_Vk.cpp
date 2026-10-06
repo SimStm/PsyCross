@@ -39,6 +39,8 @@
 #include <string.h>
 #include <math.h>
 #include <new>
+#include <algorithm>
+#include <functional>
 
 #if !defined(PSYX_VK_DISABLE_IMGUI)
 #	define PSYX_VK_IMGUI 1
@@ -325,6 +327,22 @@ typedef struct
 	uint32_t vramGeneration;	// VRAM writes visible to this draw
 } VkPsxDraw;
 
+struct VkPsxTextureConstants
+{
+	int texFormat;
+	int bilinearFilter;
+	float texelSize[2];
+	int overrideAlphaMode;
+	int srgbEncode;
+};
+
+static VkPsxTextureConstants PsxTextureConstants(const VkPsxDraw& draw)
+{
+	VkPsxTextureConstants constants = { draw.texFormat, draw.bilinearFilter,
+		{ draw.texelSize[0], draw.texelSize[1] }, draw.overrideAlphaMode, draw.srgbEncode };
+	return constants;
+}
+
 // One VRAM rectangle rewritten between draw flushes. `generation` orders the
 // write against the deferred draws: a draw sees every write with a smaller
 // generation. The pixels are RG32F in `vramUploadStaging`, matching the VRAM
@@ -541,6 +559,13 @@ static struct
 	VkPipelineLayout shadowPipelineLayout;
 	VkPipeline pbrPipeline;
 	VkPipeline shadowPipeline;
+	VkPipeline legacyShadowPipeline;
+	VkPipelineLayout legacyShadowLayout;
+	VkBuffer legacyShadowIndices;
+	VkDeviceMemory legacyShadowIndexMemory;
+	uint32_t* legacyShadowIndexMapped;
+	VkPsxVertex* legacyShadowVertices;
+	uint32_t legacyShadowVertexCount;
 
 	VkDescriptorSetLayout descriptorSetLayout;
 	VkDescriptorPool descriptorPool;
@@ -1733,6 +1758,116 @@ static int CreatePipelines(void)
 
 // Pipelines for the in-game modern mesh path. Both draw into the load render
 // pass so they see the legacy scene colour and share its depth buffer.
+static int CreateLegacyShadowPipeline(void)
+{
+	// Host-coherent Vulkan memory need not be CPU-cached. Selection reads the
+	// upload source copied into normal RAM, never the write-combined GPU mapping.
+	g_vk.legacyShadowVertices = (VkPsxVertex*)malloc(PSYX_VK_PSX_VERTEX_CAPACITY);
+	if (!g_vk.legacyShadowVertices)
+	{
+		eprinterr("PsyX Vulkan: legacy shadow CPU vertex allocation failed\n");
+		return 0;
+	}
+	if (!CreateBuffer(PSYX_VK_PSX_VERTEX_CAPACITY / sizeof(VkPsxVertex) * sizeof(uint32_t),
+		VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		&g_vk.legacyShadowIndices, &g_vk.legacyShadowIndexMemory,
+		(void**)&g_vk.legacyShadowIndexMapped))
+		return 0;
+	VkDescriptorSetLayout layouts[2] = { g_vk.psx.setLayout, g_vk.descriptorSetLayout };
+	VkPushConstantRange push = { VK_SHADER_STAGE_FRAGMENT_BIT, 0, 24 };
+	VkPipelineLayoutCreateInfo layout = {};
+	layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	layout.setLayoutCount = 2;
+	layout.pSetLayouts = layouts;
+	layout.pushConstantRangeCount = 1;
+	layout.pPushConstantRanges = &push;
+	if (!VkOk(vkCreatePipelineLayout(g_vk.device, &layout, NULL, &g_vk.legacyShadowLayout),
+		"vkCreatePipelineLayout(legacy shadow)"))
+		return 0;
+	VkShaderModule vertex = CreateShaderModuleFromSpirv(psx_shadow_vert_spv, psx_shadow_vert_spv_size);
+	VkShaderModule fragment = CreateShaderModuleFromSpirv(psx_shadow_frag_spv, psx_shadow_frag_spv_size);
+	if (!vertex || !fragment)
+	{
+		if (vertex) vkDestroyShaderModule(g_vk.device, vertex, NULL);
+		if (fragment) vkDestroyShaderModule(g_vk.device, fragment, NULL);
+		return 0;
+	}
+
+	VkPipelineShaderStageCreateInfo stages[2] = {};
+	for (int i = 0; i < 2; i++)
+	{
+		stages[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+		stages[i].stage = i == 0 ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT;
+		stages[i].module = i == 0 ? vertex : fragment;
+		stages[i].pName = "main";
+	}
+
+	VkVertexInputBindingDescription binding = { 0, sizeof(VkPsxVertex), VK_VERTEX_INPUT_RATE_VERTEX };
+	VkVertexInputAttributeDescription attributes[4] =
+	{
+		{ 0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0 },
+		{ 1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 16 },
+		{ 2, 0, VK_FORMAT_R8G8B8A8_UINT, 32 },
+		{ 4, 0, VK_FORMAT_R8G8B8A8_SINT, 40 }
+	};
+	VkPipelineVertexInputStateCreateInfo input = {};
+	input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+	input.vertexBindingDescriptionCount = 1;
+	input.pVertexBindingDescriptions = &binding;
+	input.vertexAttributeDescriptionCount = 4;
+	input.pVertexAttributeDescriptions = attributes;
+
+	VkPipelineInputAssemblyStateCreateInfo assembly = {};
+	assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+	assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+	VkPipelineViewportStateCreateInfo viewport = {};
+	viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+	viewport.viewportCount = viewport.scissorCount = 1;
+	VkPipelineRasterizationStateCreateInfo raster = {};
+	raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+	raster.polygonMode = VK_POLYGON_MODE_FILL;
+	raster.cullMode = VK_CULL_MODE_NONE;
+	raster.lineWidth = 1.0f;
+	raster.depthBiasEnable = VK_TRUE;
+	raster.depthBiasConstantFactor = 1.25f;
+	raster.depthBiasSlopeFactor = 1.5f;
+	VkPipelineMultisampleStateCreateInfo samples = {};
+	samples.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+	samples.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+	VkPipelineDepthStencilStateCreateInfo depth = {};
+	depth.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+	depth.depthTestEnable = depth.depthWriteEnable = VK_TRUE;
+	depth.depthCompareOp = VK_COMPARE_OP_LESS;
+	VkPipelineColorBlendStateCreateInfo blend = {};
+	blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+	VkDynamicState states[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+	VkPipelineDynamicStateCreateInfo dynamic = {};
+	dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+	dynamic.dynamicStateCount = 2;
+	dynamic.pDynamicStates = states;
+
+	VkGraphicsPipelineCreateInfo pipeline = {};
+	pipeline.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+	pipeline.stageCount = 2; // Fragment shader preserves PSX/override texture cutouts.
+	pipeline.pStages = stages;
+	pipeline.pVertexInputState = &input;
+	pipeline.pInputAssemblyState = &assembly;
+	pipeline.pViewportState = &viewport;
+	pipeline.pRasterizationState = &raster;
+	pipeline.pMultisampleState = &samples;
+	pipeline.pDepthStencilState = &depth;
+	pipeline.pColorBlendState = &blend;
+	pipeline.pDynamicState = &dynamic;
+	pipeline.layout = g_vk.legacyShadowLayout;
+	pipeline.renderPass = g_vk.shadowRenderPass;
+	const int ok = VkOk(vkCreateGraphicsPipelines(g_vk.device, VK_NULL_HANDLE, 1,
+		&pipeline, NULL, &g_vk.legacyShadowPipeline), "vkCreateGraphicsPipelines(legacy shadow)");
+	vkDestroyShaderModule(g_vk.device, vertex, NULL);
+	vkDestroyShaderModule(g_vk.device, fragment, NULL);
+	return ok;
+}
+
 static int CreateGameModernPipelines(void)
 {
 	if (!g_vk.modernRenderPass)
@@ -2720,6 +2855,7 @@ void PsyX_Vk_GameBeginFrame(void)
 	g_vk.psx.vertexCount = 0;
 	g_vk.psx.vertexUploadBase = 0;
 	g_vk.psx.vertexUploadedTotal = 0;
+	g_vk.legacyShadowVertexCount = 0;
 	g_vk.psx.drawCount = 0;
 	g_vk.psx.modernSceneBoundary = -1;
 	// VRAM writes queued before this frame have already been replayed (or are
@@ -2868,6 +3004,7 @@ void PsyX_Vk_GameUpdateVertexBuffer(const void* vertices, int vertexCount)
 		eprintwarn("PsyX Vulkan: PSX vertex buffer full (%u + %d), reusing from the start\n",
 			psx->vertexUploadedTotal, vertexCount);
 		psx->vertexUploadedTotal = 0;
+		g_vk.legacyShadowVertexCount = 0;
 	}
 
 	psx->vertexUploadBase = psx->vertexUploadedTotal;
@@ -2875,6 +3012,12 @@ void PsyX_Vk_GameUpdateVertexBuffer(const void* vertices, int vertexCount)
 
 	const VkDeviceSize bytes = (VkDeviceSize)vertexCount * sizeof(VkPsxVertex);
 	memcpy(psx->vertexMapped + (size_t)psx->vertexUploadBase * sizeof(VkPsxVertex), vertices, (size_t)bytes);
+	if (g_vk.legacyShadowVertices && g_vk.gameModernEnabled && g_vk.lights.shadowsEnabled &&
+		g_vk.lights.legacyShadowCastersEnabled && g_vk.legacyShadowVertexCount == psx->vertexUploadBase)
+	{
+		memcpy(g_vk.legacyShadowVertices + psx->vertexUploadBase, vertices, (size_t)bytes);
+		g_vk.legacyShadowVertexCount = psx->vertexUploadedTotal;
+	}
 	psx->vertexSize = (VkDeviceSize)psx->vertexUploadedTotal * sizeof(VkPsxVertex);
 	psx->vertexCount = psx->vertexUploadedTotal;
 }
@@ -3829,6 +3972,173 @@ static void UpdateGameModernUbo(void)
 	}
 }
 
+// Reconstruct the same camera-space point as psx_shadow.vert, including the
+// per-vertex projection offset. encodedToLight combines the shared transforms.
+static int LegacyShadowClip(const VkPsxVertex& vertex, const VkGameModernUbo& ubo,
+	const float encodedToLight[16], float clip[4])
+{
+	if (!(vertex.scr_h > 100.0f) || !(vertex.z > 0.0f))
+		return 0;
+	float encoded[4] = { (vertex.x + 0.5f) * vertex.scr_h,
+		-(vertex.y + 0.5f) * vertex.scr_h, vertex.z, 1.0f };
+	const float w = ubo.proj[3] * encoded[0] + ubo.proj[7] * encoded[1] +
+		ubo.proj[11] * encoded[2] + ubo.proj[15];
+	for (int row = 0; row < 4; row++)
+		encoded[row] += (ubo.projInverse[row] * vertex.ofsX -
+			ubo.projInverse[4 + row] * vertex.ofsY) * w;
+	if (!(encoded[3] > 0.0f))
+		return 0;
+	const float inverseW = 1.0f / encoded[3];
+	for (int row = 0; row < 4; row++)
+	{
+		clip[row] = 0.0f;
+		for (int column = 0; column < 4; column++)
+			clip[row] += encodedToLight[column * 4 + row] * encoded[column];
+		clip[row] *= inverseW;
+		if (!isfinite(clip[row]))
+			return 0;
+	}
+	return clip[3] > 0.0f;
+}
+
+static unsigned int ShadowOutsidePlanes(const float clip[4])
+{
+	unsigned int mask = 0;
+	if (clip[0] < -clip[3]) mask |= 1;
+	if (clip[0] >  clip[3]) mask |= 2;
+	if (clip[1] < -clip[3]) mask |= 4;
+	if (clip[1] >  clip[3]) mask |= 8;
+	if (clip[2] < 0.0f) mask |= 16;
+	if (clip[2] > clip[3]) mask |= 32;
+	return mask;
+}
+
+static int LegacyTriangleCasts(const VkPsxVertex* triangle, const VkGameModernUbo& ubo,
+	const float encodedToLight[16])
+{
+	unsigned int outside = 63;
+	for (int vertex = 0; vertex < 3; vertex++)
+	{
+		float clip[4];
+		if (!LegacyShadowClip(triangle[vertex], ubo, encodedToLight, clip))
+			return 0;
+		outside &= ShadowOutsidePlanes(clip);
+	}
+	// Conservative rejection: a triangle spanning the volume still casts even
+	// when all three vertices lie outside. Reject only a shared outside plane.
+	return outside == 0;
+}
+
+// Opaque depth writes can be reordered. Group texture-compatible draws so OT
+// state splits do not turn a few hundred triangles into hundreds of commands.
+static int CompareLegacyShadowTexture(const VkPsxDraw& a, const VkPsxDraw& b)
+{
+	if (a.textureSet != b.textureSet)
+		return std::less<VkDescriptorSet>()(a.textureSet, b.textureSet) ? -1 : 1;
+	const VkPsxTextureConstants ca = PsxTextureConstants(a);
+	const VkPsxTextureConstants cb = PsxTextureConstants(b);
+	if (ca.texFormat != cb.texFormat) return ca.texFormat < cb.texFormat ? -1 : 1;
+	if (ca.bilinearFilter != cb.bilinearFilter) return ca.bilinearFilter < cb.bilinearFilter ? -1 : 1;
+	if (ca.overrideAlphaMode != cb.overrideAlphaMode) return ca.overrideAlphaMode < cb.overrideAlphaMode ? -1 : 1;
+	for (int i = 0; i < 2; i++)
+		if (ca.texelSize[i] != cb.texelSize[i]) return ca.texelSize[i] < cb.texelSize[i] ? -1 : 1;
+	return 0;
+}
+
+static void RecordLegacyShadowBatch(VkCommandBuffer cmd, const VkPsxDraw& draw,
+	uint32_t first, uint32_t count)
+{
+	if (count == 0)
+		return;
+	VkDescriptorSet texture = draw.textureSet ? draw.textureSet : g_vk.psx.dummySet;
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.legacyShadowLayout,
+		0, 1, &texture, 0, NULL);
+	VkPsxTextureConstants constants = PsxTextureConstants(draw);
+	constants.srgbEncode = 0;
+	vkCmdPushConstants(cmd, g_vk.legacyShadowLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
+		0, sizeof(constants), &constants);
+	vkCmdDrawIndexed(cmd, count, 1, first, 0, 0);
+	g_vk.gameModernStats.legacyCasterDrawCalls++;
+	g_vk.gameModernStats.legacyCasterTriangles += (int)(count / 3);
+}
+
+static void RecordGameLegacyShadowPass(VkCommandBuffer cmd)
+{
+	VkPsxState& psx = g_vk.psx;
+	g_vk.gameModernStats.legacyCasterDrawCalls = 0;
+	g_vk.gameModernStats.legacyCasterTriangles = 0;
+	if (!g_vk.gameModernEnabled || !g_vk.lights.shadowsEnabled ||
+		!g_vk.lights.legacyShadowCastersEnabled || !g_vk.modernCameraValid ||
+		!g_psyxModernProjectionValid || !g_vk.gameModernUboMapped ||
+		!g_vk.legacyShadowPipeline || !g_vk.legacyShadowIndexMapped ||
+		!psx.ready || !g_vk.legacyShadowVertices || psx.modernSceneBoundary < 0 ||
+		g_vk.legacyShadowVertexCount != psx.vertexUploadedTotal)
+		return;
+
+	// Read mapped constants once; per-vertex reads must stay in cached CPU RAM.
+	const VkGameModernUbo ubo = *g_vk.gameModernUboMapped;
+	if (!(ubo.xyScale[0] > 0.0f) || !(ubo.xyScale[1] > 0.0f))
+		return;
+	float encodedToLight[16];
+	MulMatrix4(ubo.shadowMatrix, ubo.cameraViewInverse, encodedToLight);
+	for (int row = 0; row < 4; row++)
+	{
+		encodedToLight[row] /= ubo.xyScale[0];
+		encodedToLight[4 + row] /= -ubo.xyScale[1];
+		encodedToLight[8 + row] /= ubo.xyScale[2];
+	}
+
+	const VkPsxDraw* draws[PSYX_VK_PSX_MAX_DRAWS];
+	int drawCount = 0;
+	for (int i = 0; i < psx.modernSceneBoundary && i < psx.drawCount; i++)
+	{
+		const VkPsxDraw& draw = psx.draws[i];
+		// VRAM uploads belong to the main pass. Never reorder them or sample
+		// an earlier snapshot in the shadow pass; stable RGBA/white is safe.
+		if (draw.frame != psx.frameIndex || draw.offscreen || !draw.depthTest || draw.blendMode != 0 ||
+			(draw.texFormat < 3 && psx.vramUploadCount > 0) ||
+			draw.firstVertex > psx.vertexUploadedTotal ||
+			draw.vertexCount > psx.vertexUploadedTotal - draw.firstVertex)
+			continue;
+		draws[drawCount++] = &draw;
+	}
+	std::sort(draws, draws + drawCount, [](const VkPsxDraw* a, const VkPsxDraw* b)
+	{
+		return CompareLegacyShadowTexture(*a, *b) < 0;
+	});
+
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.legacyShadowPipeline);
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.legacyShadowLayout,
+		1, 1, &g_vk.gameCompositeSet, 0, NULL);
+	const VkDeviceSize offset = 0;
+	vkCmdBindVertexBuffers(cmd, 0, 1, &psx.vertexBuffer, &offset);
+	vkCmdBindIndexBuffer(cmd, g_vk.legacyShadowIndices, 0, VK_INDEX_TYPE_UINT32);
+	const VkPsxVertex* vertices = g_vk.legacyShadowVertices;
+	const uint32_t capacity = PSYX_VK_PSX_VERTEX_CAPACITY / sizeof(VkPsxVertex);
+	uint32_t indexCount = 0, batchFirst = 0;
+	for (int i = 0; i < drawCount; i++)
+	{
+		const VkPsxDraw& draw = *draws[i];
+		for (uint32_t v = draw.firstVertex; v + 2 < draw.firstVertex + draw.vertexCount; v += 3)
+		{
+			if (!LegacyTriangleCasts(vertices + v, ubo, encodedToLight))
+				continue;
+			if (indexCount + 3 > capacity)
+			{
+				eprinterr("PsyX Vulkan: legacy shadow index capacity exceeded\n");
+				RecordLegacyShadowBatch(cmd, draw, batchFirst, indexCount - batchFirst);
+				return;
+			}
+			for (uint32_t corner = 0; corner < 3; corner++)
+				g_vk.legacyShadowIndexMapped[indexCount++] = v + corner;
+		}
+		if (i + 1 == drawCount || CompareLegacyShadowTexture(draw, *draws[i + 1]) != 0)
+		{
+			RecordLegacyShadowBatch(cmd, draw, batchFirst, indexCount - batchFirst);
+			batchFirst = indexCount;
+		}
+	}
+}
 // Records the modern shadow casters into the already-open shadow pass. Casters
 // use their world matrix, so an instance casts where it stands.
 static void RecordGameModernShadowPass(VkCommandBuffer cmd)
@@ -3952,9 +4262,13 @@ static int RecordGameModernMeshes(VkCommandBuffer cmd)
 	PsyXModernMeshStats* stats = &g_vk.gameModernStats;
 	const int legacyShadowPass = stats->legacyShadowPass;
 	const int legacyLightPass = stats->legacyLightPass;
+	const int legacyCasterDrawCalls = stats->legacyCasterDrawCalls;
+	const int legacyCasterTriangles = stats->legacyCasterTriangles;
 	memset(stats, 0, sizeof(*stats));
 	stats->legacyShadowPass = legacyShadowPass;
 	stats->legacyLightPass = legacyLightPass;
+	stats->legacyCasterDrawCalls = legacyCasterDrawCalls;
+	stats->legacyCasterTriangles = legacyCasterTriangles;
 	stats->meshCount = g_vk.gameModernMeshCount;
 	stats->depthShared = 1;
 
@@ -4187,20 +4501,7 @@ static void RecordPsxDraws(VkCommandBuffer cmd, int offscreen, int frame,
 		scissor.extent.height = (uint32_t)(draw->scissorEnable ? draw->scissor[3] : targetHeight);
 		vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-		struct
-		{
-			int texFormat;
-			int bilinearFilter;
-			float texelSize[2];
-			int overrideAlphaMode;
-			int srgbEncode;
-		} constants;
-		constants.texFormat = draw->texFormat;
-		constants.bilinearFilter = draw->bilinearFilter;
-		constants.texelSize[0] = draw->texelSize[0];
-		constants.texelSize[1] = draw->texelSize[1];
-		constants.overrideAlphaMode = draw->overrideAlphaMode;
-		constants.srgbEncode = draw->srgbEncode;
+		const VkPsxTextureConstants constants = PsxTextureConstants(*draw);
 
 		vkCmdPushConstants(cmd, psx->layout,
 			VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(constants), &constants);
@@ -5448,7 +5749,12 @@ int PsyX_Vk_RenderFrame(void)
 
 	UpdateSceneUbo();
 	if (g_vk.gameMode)
+	{
 		UpdateGameModernUbo();
+		UpdateGameCompositeDescriptorSet();
+		g_vk.gameModernStats.legacyCasterDrawCalls = 0;
+		g_vk.gameModernStats.legacyCasterTriangles = 0;
+	}
 
 	// Command buffer.
 	vkResetCommandBuffer(g_vk.commandBuffer, 0);
@@ -5526,7 +5832,10 @@ int PsyX_Vk_RenderFrame(void)
 		}
 
 		if (g_vk.gameMode)
+		{
 			RecordGameModernShadowPass(g_vk.commandBuffer);
+			RecordGameLegacyShadowPass(g_vk.commandBuffer);
+		}
 	}
 
 	// The render pass moves the shadow map to SHADER_READ_ONLY_OPTIMAL.
@@ -5673,7 +5982,6 @@ int PsyX_Vk_RenderFrame(void)
 
 		if (modernComposite)
 		{
-			UpdateGameCompositeDescriptorSet();
 			vkCmdBindPipeline(g_vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.gameCompositePipeline);
 			vkCmdBindDescriptorSets(g_vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
 				g_vk.pipelineLayout, 0, 1, &g_vk.gameCompositeSet, 0, NULL);
@@ -6347,7 +6655,11 @@ int PsyX_Vk_Initialise(const PsyXVkConfig* config)
 	// The emulated PSX path is additive: the modern scene must keep working if
 	// it cannot be created, so a failure only disables that path.
 	if (CreatePsxResources())
+	{
 		VkStage("initialise: psx resources");
+		if (!CreateLegacyShadowPipeline())
+			VkStage("initialise: legacy shadow pipeline failed");
+	}
 	else
 	{
 		VkStage("initialise: psx resources failed");
@@ -6524,6 +6836,11 @@ void PsyX_Vk_Shutdown(void)
 
 	if (g_vk.pbrPipeline) vkDestroyPipeline(g_vk.device, g_vk.pbrPipeline, NULL);
 	if (g_vk.shadowPipeline) vkDestroyPipeline(g_vk.device, g_vk.shadowPipeline, NULL);
+	if (g_vk.legacyShadowPipeline) vkDestroyPipeline(g_vk.device, g_vk.legacyShadowPipeline, NULL);
+	if (g_vk.legacyShadowLayout) vkDestroyPipelineLayout(g_vk.device, g_vk.legacyShadowLayout, NULL);
+	if (g_vk.legacyShadowIndices) vkDestroyBuffer(g_vk.device, g_vk.legacyShadowIndices, NULL);
+	if (g_vk.legacyShadowIndexMemory) vkFreeMemory(g_vk.device, g_vk.legacyShadowIndexMemory, NULL);
+	free(g_vk.legacyShadowVertices);
 	if (g_vk.pipelineLayout) vkDestroyPipelineLayout(g_vk.device, g_vk.pipelineLayout, NULL);
 	if (g_vk.shadowPipelineLayout) vkDestroyPipelineLayout(g_vk.device, g_vk.shadowPipelineLayout, NULL);
 	if (g_vk.descriptorPool) vkDestroyDescriptorPool(g_vk.device, g_vk.descriptorPool, NULL);

@@ -343,6 +343,8 @@ typedef struct
 	   when it is directional) scaled by this factor. The legacy shading itself
 	   is preserved; 0 keeps the shipped look. */
 	float legacyLightingScale;
+	/* Opt-in opaque legacy casters; implemented by Vulkan only for now. */
+	int legacyShadowCastersEnabled;
 } PsyXModernLightSet;
 
 extern void PsyX_ModernMesh_SetLights(const PsyXModernLightSet* lights);
@@ -384,6 +386,8 @@ typedef struct
 	int depthShared;		/* legacy depth buffer was available */
 	int legacyShadowPass;	/* shadow projection ran over the legacy scene */
 	int legacyLightPass;	/* lighting receptivity ran over the legacy scene */
+	int legacyCasterDrawCalls;	/* legacy shadow-map draws last frame */
+	int legacyCasterTriangles;	/* accepted opaque legacy caster triangles */
 } PsyXModernMeshStats;
 
 extern void PsyX_ModernMesh_GetStats(PsyXModernMeshStats* stats);

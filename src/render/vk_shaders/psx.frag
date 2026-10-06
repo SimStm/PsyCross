@@ -7,9 +7,11 @@
 // done here, exactly as in the OpenGL renderer.
 
 layout(location = 0) in vec4 v_texcoord;
-layout(location = 1) in vec4 v_color;
 layout(location = 2) in vec4 v_page_clut;
+#ifndef PSYX_SHADOW_PASS
+layout(location = 1) in vec4 v_color;
 layout(location = 3) in float v_z;
+#endif
 
 layout(set = 0, binding = 1) uniform sampler2D s_vram;
 layout(set = 0, binding = 2) uniform sampler2D s_rgLut;
@@ -24,7 +26,9 @@ layout(push_constant) uniform Push
 	int srgbEncode;
 } pc;
 
+#ifndef PSYX_SHADOW_PASS
 layout(location = 0) out vec4 fragColor;
+#endif
 
 const vec2 c_VRAMTexel = vec2(1.0 / 1024.0, 1.0 / 512.0);
 const vec2 c_LUTTexel = vec2(1.0 / 256.0, 1.0 / 256.0);
@@ -144,7 +148,9 @@ void main()
 			: nearestTextureSample(v_texcoord.xy);
 	}
 
+#ifndef PSYX_SHADOW_PASS
 	fragColor = dither(color * v_color);
 	if (pc.srgbEncode != 0)
 		fragColor.rgb = ToLinear(fragColor.rgb);
+#endif
 }
