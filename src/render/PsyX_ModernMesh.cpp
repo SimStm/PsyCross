@@ -39,6 +39,12 @@ int PsyX_ModernShadow_SetWorldTriangles(const float* positions, int vertexCount)
 	return 0;
 }
 
+int PsyX_ModernShadow_GetVolume(float extent, PsyXModernShadowVolume* volume)
+{
+	return PsyX_GetRenderBackend() == PSYX_BACKEND_VULKAN ?
+		PsyX_Vk_GameGetShadowVolume(extent, volume) : 0;
+}
+
 /* The legacy 3D path feeds the projection vertices scaled by the GTE screen
    distance (scr_h = C2_H) after dividing the camera-space position by 128
    (512 * 1024 / 4096 = the GTE fixed-point normalisation used by PGXP).

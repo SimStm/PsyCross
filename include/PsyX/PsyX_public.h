@@ -412,6 +412,18 @@ extern int PsyX_ModernShadow_SetWorldTriangles(const float* positions, int verte
 
 typedef struct
 {
+	float worldToClip[16]; /* column-major, Vulkan depth range [0,1] */
+	float boundsMin[3];
+	float boundsMax[3];
+} PsyXModernShadowVolume;
+/* Vulkan: CPU query of the current light's snapped orthographic volume at the
+   requested half-size. Uses the exact map matrix, without GPU mapped reads.
+   Half-size must be in (0, 1000000] world units. Returns 0 on invalid input/
+   unsupported backends; output is unchanged. */
+extern int PsyX_ModernShadow_GetVolume(float extent, PsyXModernShadowVolume* volume);
+
+typedef struct
+{
 	int meshCount;			/* live meshes */
 	int visibleInstances;	/* instances drawn last frame */
 	int vertexCount;		/* vertices submitted last frame */

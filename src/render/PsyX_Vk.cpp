@@ -5711,6 +5711,40 @@ static void BuildShadowMatrixForExtent(float out[16], float extent)
 	MulMatrix4(lightProj, lightView, out);
 }
 
+int PsyX_Vk_GameGetShadowVolume(float extent, PsyXModernShadowVolume* volume)
+{
+	if (!volume || !(extent > 0.0f && extent <= 1000000.0f) || g_vk.lights.count <= 0)
+		return 0;
+	PsyXModernShadowVolume candidate;
+	BuildShadowMatrixForExtent(candidate.worldToClip, extent);
+	// Normalize the small orthographic scales before the generic inverse's
+	// singularity test; a large, valid volume has a very small determinant.
+	float scaled[16];
+	memcpy(scaled, candidate.worldToClip, sizeof(scaled));
+	for (int column = 0; column < 4; column++)
+		for (int row = 0; row < 3; row++) scaled[column * 4 + row] *= extent;
+	float inverse[16];
+	if (!InvertMatrix4(scaled, inverse)) return 0;
+	for (int corner = 0; corner < 8; corner++)
+	{
+		const float clip[3] = { (corner & 1) ? extent : -extent,
+			(corner & 2) ? extent : -extent, (corner & 4) ? extent : 0.0f };
+		for (int axis = 0; axis < 3; axis++)
+		{
+			const float position = inverse[axis] * clip[0] + inverse[axis + 4] * clip[1] +
+				inverse[axis + 8] * clip[2] + inverse[axis + 12];
+			if (!corner) candidate.boundsMin[axis] = candidate.boundsMax[axis] = position;
+			else
+			{
+				candidate.boundsMin[axis] = fminf(candidate.boundsMin[axis], position);
+				candidate.boundsMax[axis] = fmaxf(candidate.boundsMax[axis], position);
+			}
+		}
+	}
+	*volume = candidate;
+	return 1;
+}
+
 static void UpdateDescriptorSetForMesh(VkMesh* mesh)
 {
 	VkDescriptorBufferInfo bufferInfo;
@@ -7120,6 +7154,7 @@ int PsyX_Vk_GameModernMeshCreate(const PsyXModernMeshDesc* desc) { (void)desc; r
 int PsyX_Vk_GameModernMeshSetFrameVisibility(int, int, int) { return 0; }
 int PsyX_Vk_GameModernMeshSetOriginalLighting(int, int, float) { return 0; }
 int PsyX_Vk_GameModernMeshSetFrameInstances(int, const PsyXModernMeshInstance*, int) { return 0; }
+int PsyX_Vk_GameGetShadowVolume(float, PsyXModernShadowVolume*) { return 0; }
 void PsyX_Vk_GameModernMeshDestroy(int mesh) { (void)mesh; }
 void PsyX_Vk_GameModernMeshSetInstance(int mesh, const float viewMatrix[16],
 	const float color[4], int visible)
