@@ -229,6 +229,36 @@ static int NativeTestMips(PsyXNativeSnapshot snapshot, const float background[4]
 		}
 		PsyXNativeStats stats; PsyX_Native_GetStats(&stats);
 		if (stats.ownedMaterialBytes!=(mode<2 ? 32768 : 43692) || stats.residentMaterials!=1) ++failures;
+		if (mode==2)
+		{
+			const VkImage image=g_nativeVk.materials[mesh.material.slot].image;
+			const uint64_t uploads=stats.materialUploads, fallback=stats.fallbackFrames;
+			const PsyXNativeSampling choices[]={PSYX_NATIVE_SAMPLE_NEAREST,PSYX_NATIVE_SAMPLE_TRILINEAR,
+				PSYX_NATIVE_SAMPLE_LINEAR,PSYX_NATIVE_USE_MATERIAL_FILTER};
+			for (unsigned int change=0; change<8; ++change)
+			{
+				instance.sampling=choices[change%4];
+				if (!NativeTestFrame(snapshot,0,pixels,report,reportSize)) { ++failures; continue; }
+				const bool smooth=instance.sampling==PSYX_NATIVE_SAMPLE_TRILINEAR || instance.sampling==PSYX_NATIVE_USE_MATERIAL_FILTER;
+				if (!PsxCheckPixel(pixels.data(),g_vk.width,g_vk.height,g_vk.width/2,g_vk.height/2,
+					smooth ? middle : black,4,"runtime sampler selection changes actual minified pixels",report,reportSize)) ++failures;
+				PsyX_Native_GetStats(&stats);
+				if (stats.materialUploads!=uploads || stats.fallbackFrames!=fallback || stats.ownedMaterialBytes!=43692 ||
+					g_nativeVk.materials[mesh.material.slot].image!=image) ++failures;
+			}
+			PsyXNativeInstance pair[]={instance,instance};
+			pair[0].sampling=PSYX_NATIVE_SAMPLE_NEAREST; pair[1].sampling=PSYX_NATIVE_SAMPLE_TRILINEAR;
+			pair[0].world[12]=-320.0f/g_vk.width; pair[1].world[12]=320.0f/g_vk.width;
+			snapshot.instances=pair; snapshot.instanceCount=2;
+			if (!NativeTestFrame(snapshot,0,pixels,report,reportSize) ||
+				!PsxCheckPixel(pixels.data(),g_vk.width,g_vk.height,g_vk.width/2-40,g_vk.height/2,black,4,
+					"shared image independently samples nearest instance",report,reportSize) ||
+				!PsxCheckPixel(pixels.data(),g_vk.width,g_vk.height,g_vk.width/2+40,g_vk.height/2,middle,4,
+					"shared image independently samples trilinear instance",report,reportSize)) ++failures;
+			snapshot.instances=&instance; snapshot.instanceCount=1; instance.sampling=PSYX_NATIVE_USE_MATERIAL_FILTER;
+			ReportAppend(report,reportSize,failures ? "runtime sampler/image reuse FAIL\n" :
+				"runtime sampler/image reuse: eight changes, independent instances, zero uploads/fallback ok\n");
+		}
 	}
 	PsyX_Native_ResetScene(); PsyX_Vk_GameBeginFrame();
 	PsyXNativeStats stats; PsyX_Native_GetStats(&stats);

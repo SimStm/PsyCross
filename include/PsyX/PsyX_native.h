@@ -9,7 +9,7 @@ extern "C" {
 
 /* R01 native world contributor. All calls belong to the render thread. No
  * Vulkan objects or borrowed game pointers cross this C boundary. */
-#define PSYX_NATIVE_VERSION 5u
+#define PSYX_NATIVE_VERSION 6u
 #define PSYX_NATIVE_MAX_MESHES 512u
 #define PSYX_NATIVE_MAX_INSTANCES 4096u
 #define PSYX_NATIVE_MAX_BYTES (32u * 1024u * 1024u)
@@ -79,6 +79,15 @@ typedef struct PsyXNativeMeshDesc
 } PsyXNativeMeshDesc;
 
 typedef enum PsyXNativeLayer { PSYX_NATIVE_WORLD = 0, PSYX_NATIVE_BACKDROP = 1 } PsyXNativeLayer;
+/* Per-instance selection uses immutable descriptors on the same owned image.
+ * TRILINEAR requires a complete material mip chain; default inherits material. */
+typedef enum PsyXNativeSampling
+{
+	PSYX_NATIVE_USE_MATERIAL_FILTER = 0,
+	PSYX_NATIVE_SAMPLE_NEAREST = 1,
+	PSYX_NATIVE_SAMPLE_LINEAR = 2,
+	PSYX_NATIVE_SAMPLE_TRILINEAR = 3
+} PsyXNativeSampling;
 typedef struct PsyXNativeInstance
 {
 	PsyXNativeMeshHandle mesh;
@@ -86,6 +95,7 @@ typedef struct PsyXNativeInstance
 	float tint[4]; /* linear RGB, alpha=1 */
 	uint64_t identity;
 	PsyXNativeLayer layer; /* backdrop ignores view translation, draws first with no depth test/write */
+	PsyXNativeSampling sampling;
 } PsyXNativeInstance;
 
 typedef struct PsyXNativeView
@@ -133,6 +143,9 @@ typedef struct PsyXNativeStats
 	uint32_t retiringMaterials;
 	uint64_t ownedMaterialBytes;
 	uint32_t nativeBackdropDraws; /* subset of nativeDraws, excluded from world depth/lighting */
+	uint64_t effectiveFrames; /* cumulative submissions since backend initialization */
+	uint64_t fallbackFrames; /* requested native mode but whole legacy frame submitted */
+	uint64_t materialUploads; /* successful owned material image uploads, excludes analytic white */
 } PsyXNativeStats;
 
 /* Pending is a successful owned CPU create, with a valid handle. GPU upload

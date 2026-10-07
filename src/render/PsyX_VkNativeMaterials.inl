@@ -31,9 +31,12 @@ static int ReleaseNativeUpload(VkNativeMaterial& material)
 static int DestroyNativeMaterial(VkNativeMaterial& material)
 {
 	if (!ReleaseNativeUpload(material)) return 0;
-	if (material.set && g_nativeVk.materialPool)
-		VkOk(vkFreeDescriptorSets(g_vk.device, g_nativeVk.materialPool, 1, &material.set), "native material descriptor release");
-	if (material.sampler) vkDestroySampler(g_vk.device, material.sampler, NULL);
+	for (unsigned int filter=0; filter<3; ++filter)
+	{
+		if (material.sets[filter] && g_nativeVk.materialPool)
+			VkOk(vkFreeDescriptorSets(g_vk.device, g_nativeVk.materialPool, 1, &material.sets[filter]), "native material descriptor release");
+		if (material.samplers[filter]) vkDestroySampler(g_vk.device, material.samplers[filter], NULL);
+	}
 	if (material.view) vkDestroyImageView(g_vk.device, material.view, NULL);
 	if (material.image) vkDestroyImage(g_vk.device, material.image, NULL);
 	if (material.memory) vkFreeMemory(g_vk.device, material.memory, NULL);
@@ -53,17 +56,47 @@ static int CreateNativeMaterialDescriptors()
 	layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
 	layout.bindingCount = 1; layout.pBindings = &binding;
 	if (!VkOk(vkCreateDescriptorSetLayout(g_vk.device, &layout, NULL, &g_nativeVk.materialLayout), "native material layout")) return 0;
-	VkDescriptorPoolSize size = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, PSYX_NATIVE_MAX_MATERIALS + 1 };
+	VkDescriptorPoolSize size = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, (PSYX_NATIVE_MAX_MATERIALS + 1)*3 };
 	VkDescriptorPoolCreateInfo pool = {};
 	pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 	pool.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-	pool.maxSets = PSYX_NATIVE_MAX_MATERIALS + 1;
+	pool.maxSets = (PSYX_NATIVE_MAX_MATERIALS + 1)*3;
 	pool.poolSizeCount = 1; pool.pPoolSizes = &size;
 	if (!VkOk(vkCreateDescriptorPool(g_vk.device, &pool, NULL, &g_nativeVk.materialPool), "native material pool"))
 	{
 		vkDestroyDescriptorSetLayout(g_vk.device, g_nativeVk.materialLayout, NULL);
 		g_nativeVk.materialLayout = VK_NULL_HANDLE;
 		return 0;
+	}
+	return 1;
+}
+
+static int CreateNativeSampling(VkNativeMaterial& gpu, uint32_t levelCount, bool linearSupported)
+{
+	// Each descriptor is written once, before use, and retained with the image.
+	// Runtime snapshots choose a set; no descriptor or sampler is mutated in flight.
+	for (unsigned int filter=0; filter<3; ++filter)
+	{
+		if (filter && !linearSupported) continue;
+		VkSamplerCreateInfo sampler = {};
+		sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+		sampler.magFilter = sampler.minFilter = filter ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+		sampler.mipmapMode = filter == PSYX_NATIVE_TRILINEAR ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+		sampler.maxLod=filter==PSYX_NATIVE_TRILINEAR ? float(levelCount-1) : 0;
+		sampler.addressModeU = sampler.addressModeV = sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+		if (!VkOk(vkCreateSampler(g_vk.device, &sampler, NULL, &gpu.samplers[filter]), "native material sampler")) return 0;
+		VkDescriptorSetAllocateInfo allocation = {};
+		allocation.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+		allocation.descriptorPool = g_nativeVk.materialPool;
+		allocation.descriptorSetCount = 1; allocation.pSetLayouts = &g_nativeVk.materialLayout;
+		if (!VkOk(vkAllocateDescriptorSets(g_vk.device, &allocation, &gpu.sets[filter]), "native material descriptor")) return 0;
+		VkDescriptorImageInfo image = { gpu.samplers[filter], gpu.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+		VkWriteDescriptorSet write = {};
+		write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		write.dstSet = gpu.sets[filter]; write.dstBinding = 0;
+		write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		write.descriptorCount = 1; write.pImageInfo = &image;
+		vkUpdateDescriptorSets(g_vk.device, 1, &write, 0, NULL);
 	}
 	return 1;
 }
@@ -149,41 +182,14 @@ static int UploadNativeMaterial(VkNativeMaterial& gpu, const PsyXNativeScene::Ma
 	}
 	if (!ReleaseNativeUpload(gpu)) ok = 0;
 	if (ok) ok = CreateImageView2DLevels(gpu.image, VK_FORMAT_R8G8B8A8_SRGB, int(levelCount), &gpu.view);
-	if (ok)
-	{
-		VkSamplerCreateInfo sampler = {};
-		sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-		sampler.magFilter = sampler.minFilter = source.filter != PSYX_NATIVE_NEAREST ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-		sampler.mipmapMode = source.filter == PSYX_NATIVE_TRILINEAR ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
-		sampler.maxLod=float(levelCount-1);
-		sampler.addressModeU = sampler.addressModeV = sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-		ok = VkOk(vkCreateSampler(g_vk.device, &sampler, NULL, &gpu.sampler), "native material sampler");
-	}
-	if (ok)
-	{
-		VkDescriptorSetAllocateInfo allocation = {};
-		allocation.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-		allocation.descriptorPool = g_nativeVk.materialPool;
-		allocation.descriptorSetCount = 1; allocation.pSetLayouts = &g_nativeVk.materialLayout;
-		ok = VkOk(vkAllocateDescriptorSets(g_vk.device, &allocation, &gpu.set), "native material descriptor");
-	}
-	if (ok)
-	{
-		VkDescriptorImageInfo image = { gpu.sampler, gpu.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-		VkWriteDescriptorSet write = {};
-		write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		write.dstSet = gpu.set; write.dstBinding = 0;
-		write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-		write.descriptorCount = 1; write.pImageInfo = &image;
-		vkUpdateDescriptorSets(g_vk.device, 1, &write, 0, NULL);
-	}
-	else DestroyNativeMaterial(gpu);
+	if (ok) ok=CreateNativeSampling(gpu,levelCount,(format.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)!=0);
+	if (!ok) DestroyNativeMaterial(gpu);
 	return ok;
 }
 
 static int PrepareNativeWhiteMaterial()
 {
-	if (g_nativeVk.white.set) return 1;
+	if (g_nativeVk.white.sets[0]) return 1;
 	const uint8_t white[] = {255,255,255,255};
 	PsyXNativeScene::Material source;
 	source.width = source.height = 1;
@@ -204,6 +210,7 @@ static void NativeMaterialsCompleted()
 		if (source.state == PsyXNativeScene::Failed) DestroyNativeMaterial(g_nativeVk.materials[slot]);
 		if (source.state != PsyXNativeScene::Pending) continue;
 		source.state = UploadNativeMaterial(g_nativeVk.materials[slot], source) ? PsyXNativeScene::Ready : PsyXNativeScene::Failed;
+		if (source.state==PsyXNativeScene::Ready) ++g_nativeVk.materialUploads;
 	}
 }
 

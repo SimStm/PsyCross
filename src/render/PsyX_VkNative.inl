@@ -15,8 +15,8 @@ struct VkNativeMaterial
 	VkImage image;
 	VkDeviceMemory memory;
 	VkImageView view;
-	VkSampler sampler;
-	VkDescriptorSet set;
+	VkSampler samplers[3];
+	VkDescriptorSet sets[3];
 	VkBuffer staging;
 	VkDeviceMemory stagingMemory;
 	VkCommandBuffer uploadCommand;
@@ -40,6 +40,7 @@ static struct
 	VkFramebuffer targets[8];
 	uint64_t submitted;
 	uint64_t completed;
+	uint64_t effectiveFrames, fallbackFrames, materialUploads;
 	PsyXNativeStats frame;
 } g_nativeVk;
 
@@ -293,6 +294,11 @@ static void NativeCompleted()
 	}
 }
 
+static unsigned int NativeSamplingFilter(const PsyXNativeInstance& instance, PsyXNativeFilter materialFilter)
+{
+	return instance.sampling==PSYX_NATIVE_USE_MATERIAL_FILTER ? unsigned(materialFilter) : unsigned(instance.sampling)-1;
+}
+
 static PsyXNativeResult PrepareNativeFrame()
 {
 	g_nativeScene.GetStats(&g_nativeVk.frame);
@@ -314,6 +320,8 @@ static PsyXNativeResult PrepareNativeFrame()
 			const PsyXNativeScene::State materialState = g_nativeScene.materials[material.slot].state;
 			if (materialState == PsyXNativeScene::Failed) return PSYX_NATIVE_UPLOAD_FAILED;
 			if (materialState != PsyXNativeScene::Ready) return PSYX_NATIVE_PENDING;
+			const unsigned int filter=NativeSamplingFilter(g_nativeScene.instances[i],g_nativeScene.materials[material.slot].filter);
+			if (!g_nativeVk.materials[material.slot].sets[filter]) return PSYX_NATIVE_UNSUPPORTED;
 		}
 	}
 	if (!g_nativeVk.pass && (!CreateNativePass() || !CreateNativePipeline()))
@@ -384,7 +392,8 @@ static void RecordNativeWorld(VkCommandBuffer cmd, uint32_t imageIndex)
 			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, activePipeline);
 		}
 		push.alphaCutoff = textured ? g_nativeScene.materials[source.material.slot].alphaCutoff : 0;
-		const VkDescriptorSet descriptor = textured ? g_nativeVk.materials[source.material.slot].set : g_nativeVk.white.set;
+		const unsigned int filter=textured ? NativeSamplingFilter(instance,g_nativeScene.materials[source.material.slot].filter) : PSYX_NATIVE_NEAREST;
+		const VkDescriptorSet descriptor = textured ? g_nativeVk.materials[source.material.slot].sets[filter] : g_nativeVk.white.sets[filter];
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_nativeVk.layout, 0, 1, &descriptor, 0, NULL);
 		vkCmdPushConstants(cmd, g_nativeVk.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 		const VkDeviceSize offset = 0;
@@ -400,6 +409,8 @@ static void RecordNativeWorld(VkCommandBuffer cmd, uint32_t imageIndex)
 static void NativeSubmitted()
 {
 	++g_nativeVk.submitted;
+	if (g_nativeVk.frame.effective) ++g_nativeVk.effectiveFrames;
+	else if (g_nativeScene.requested) ++g_nativeVk.fallbackFrames;
 	if (g_nativeVk.frame.effective)
 		for (uint32_t i = 0; i < g_nativeScene.snapshot.instanceCount; ++i)
 		{
@@ -461,5 +472,8 @@ void PsyX_Native_GetStats(PsyXNativeStats* stats)
 	stats->submittedSerial = g_nativeVk.submitted;
 	stats->completedSerial = g_nativeVk.completed;
 	stats->simulationTick = g_nativeVk.frame.simulationTick;
+	stats->effectiveFrames = g_nativeVk.effectiveFrames;
+	stats->fallbackFrames = g_nativeVk.fallbackFrames;
+	stats->materialUploads = g_nativeVk.materialUploads;
 	if (stats->requested && (!g_vk.initialised || !g_vk.gameMode)) stats->reason = PSYX_NATIVE_UNSUPPORTED;
 }

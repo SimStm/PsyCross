@@ -136,8 +136,15 @@ PsyXNativeResult PsyXNativeScene::Publish(const PsyXNativeSnapshot* source)
 		const PsyXNativeMaterialHandle material = meshes[source->instances[i].mesh.slot].material;
 		if (material.generation && !IsMaterialLive(material)) return Reject(PSYX_NATIVE_STALE);
 		if (!Affine(source->instances[i].world) || !OpaqueColor(source->instances[i].tint) ||
-			(source->instances[i].layer != PSYX_NATIVE_WORLD && source->instances[i].layer != PSYX_NATIVE_BACKDROP))
+			(source->instances[i].layer != PSYX_NATIVE_WORLD && source->instances[i].layer != PSYX_NATIVE_BACKDROP) ||
+			unsigned(source->instances[i].sampling)>PSYX_NATIVE_SAMPLE_TRILINEAR)
 			return Reject(PSYX_NATIVE_INVALID);
+		if (material.generation && source->instances[i].sampling==PSYX_NATIVE_SAMPLE_TRILINEAR)
+		{
+			const std::vector<PsyXNativeMip::Level>& levels=materials[material.slot].levels;
+			if (levels.empty() || levels.back().width!=1 || levels.back().height!=1)
+				return Reject(PSYX_NATIVE_UNSUPPORTED);
+		}
 	}
 	// Commit only after every record passed. A rejected publish leaves the
 	// previous valid snapshot intact; recording still verifies mesh liveness.
