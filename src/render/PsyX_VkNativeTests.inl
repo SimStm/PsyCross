@@ -107,6 +107,50 @@ static int NativeTestFrame(PsyXNativeSnapshot& snapshot, int legacyDepth,
 	return 0;
 }
 
+static int NativeTestLargeOrigin(PsyXNativeSnapshot snapshot, char* report, int reportSize)
+{
+	snapshot.sceneGeneration=PsyX_Native_ResetScene(); PsyX_Vk_GameBeginFrame();
+	const float blue[]={0,0,1,1},red[]={1,0,0,1};
+	PsyXNativeInstance instances[2]={};
+	for (unsigned int i=0;i<2;++i)
+	{
+		std::vector<PsyXNativeVertex> vertices; std::vector<uint32_t> indices;
+		NativeTestRectangle(vertices,indices,-.8f,-.8f,.8f,.8f,8,i ? red : blue,0);
+		// A second local origin describes a genuinely nearer face in the same
+		// view. Its separation is representable locally, not at the city origin.
+		if (i) for(size_t vertex=0;vertex<vertices.size();++vertex) vertices[vertex].position[2]=-1031.996f;
+		PsyXNativeMeshDesc mesh={}; mesh.size=sizeof(mesh); mesh.version=PSYX_NATIVE_VERSION;
+		mesh.vertices=vertices.data(); mesh.vertexCount=uint32_t(vertices.size());
+		mesh.indices=indices.data(); mesh.indexCount=uint32_t(indices.size());
+		for (unsigned int axis=0;axis<3;++axis) { mesh.boundsMin[axis]=-1040; mesh.boundsMax[axis]=1040; }
+		if (PsyX_Native_CreateMesh(&mesh,&instances[i].mesh)!=PSYX_NATIVE_PENDING) return 1;
+		NativeTestIdentity(instances[i].world); for(unsigned int channel=0;channel<4;++channel) instances[i].tint[channel]=1;
+		instances[i].identity=601+i;
+	}
+	snapshot.instances=instances; snapshot.instanceCount=2;
+	std::vector<unsigned char> pixels; int failures=0;
+	for (unsigned int origin=0;origin<2;++origin)
+	for (unsigned int order=0;order<2;++order)
+	{
+		NativeTestIdentity(snapshot.view.view);
+		snapshot.view.view[14]=origin ? 220000.0f : 0;
+		for(unsigned int i=0;i<2;++i) instances[i].world[14]=(origin ? -220000.0f : 0)+(instances[i].identity==602 ? 1024 : 0);
+		if (order) std::swap(instances[0],instances[1]);
+		int width=0,height=0; SDL_GetWindowSize(g_vk.window,&width,&height);
+		PsyXNativePickResult pick={}; PsyX_Native_RequestPick(width/2,height/2);
+		if (!NativeTestFrame(snapshot,0,pixels,report,reportSize)) { ++failures; continue; }
+		PsyX_Vk_GameBeginFrame();
+		if (!PsxCheckPixel(pixels.data(),g_vk.width,g_vk.height,g_vk.width/2,g_vk.height/2,red,3,
+			"native nearer face at local/large city origin",report,reportSize) ||
+			PsyX_Native_GetPickResult(&pick)!=PSYX_NATIVE_OK || !pick.hit || pick.identity!=602) ++failures;
+	}
+	PsyX_Native_ResetScene(); PsyX_Vk_GameBeginFrame(); PsyXNativeStats stats; PsyX_Native_GetStats(&stats);
+	if(stats.ownedBytes || stats.retiringMeshes) ++failures;
+	ReportAppend(report,reportSize,failures ? "native large-origin occlusion/picking/retirement FAIL\n" :
+		"native large-origin occlusion/picking/two orders/retirement PASS\n");
+	return failures;
+}
+
 static int NativeTestCoplanar(PsyXNativeSnapshot snapshot, char* report, int reportSize)
 {
 	snapshot.sceneGeneration=PsyX_Native_ResetScene(); PsyX_Vk_GameBeginFrame();
@@ -775,6 +819,7 @@ int PsyX_Vk_NativeSelfTest(char* report, int reportSize)
 	failures += NativeTestMips(snapshot, background, report, reportSize);
 	failures += NativeTestBackdrop(snapshot, report, reportSize);
 	failures += NativeTestPicking(snapshot, report, reportSize);
+	failures += NativeTestLargeOrigin(snapshot, report, reportSize);
 	failures += NativeTestCoplanar(snapshot, report, reportSize);
 	failures += NativeTestUploadFailure(snapshot, report, reportSize);
 	PsyX_Native_SetRequested(0);

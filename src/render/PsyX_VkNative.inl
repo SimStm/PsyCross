@@ -4,6 +4,7 @@
 
 static PsyXNativeScene g_nativeScene;
 #include "PsyX_NativePick.h"
+#include "PsyX_NativeTransform.h"
 static PsyXNativePick g_nativePick;
 static int g_nativePickReadbackFault = 0; // actual-allocation rollback acceptance hook
 struct VkNativeMesh
@@ -411,16 +412,6 @@ static void DrawNativeFrameDiagnostic()
 	ImGui::End();
 }
 
-static void NativeMultiply(float out[16], const float a[16], const float b[16])
-{
-	for (unsigned int column = 0; column < 4; ++column)
-		for (unsigned int row = 0; row < 4; ++row)
-		{
-			out[column * 4 + row] = 0;
-			for (unsigned int k = 0; k < 4; ++k) out[column * 4 + row] += a[k * 4 + row] * b[column * 4 + k];
-		}
-}
-
 static int PrepareNativePickBuffer()
 {
 	if (g_nativeVk.pickBuffer) return 1;
@@ -488,11 +479,9 @@ static void RecordNativeWorld(VkCommandBuffer cmd, uint32_t imageIndex)
 	vkCmdSetViewport(cmd, 0, 1, &viewport);
 	vkCmdSetScissor(cmd, 0, 1, &scissor);
 	VkPipeline activePipeline = VK_NULL_HANDLE;
-	float viewProjection[2][16], backdropView[16];
+	float backdropView[16];
 	memcpy(backdropView, g_nativeScene.snapshot.view.view, sizeof(backdropView));
 	backdropView[12] = backdropView[13] = backdropView[14] = 0;
-	NativeMultiply(viewProjection[PSYX_NATIVE_WORLD], g_nativeScene.snapshot.view.projection, g_nativeScene.snapshot.view.view);
-	NativeMultiply(viewProjection[PSYX_NATIVE_BACKDROP], g_nativeScene.snapshot.view.projection, backdropView);
 	const PsyXNativeLayer order[] = { PSYX_NATIVE_BACKDROP, PSYX_NATIVE_WORLD };
 	for (unsigned int pass = 0; pass < 2; ++pass)
 	for (uint32_t i = 0; i < g_nativeScene.snapshot.instanceCount; ++i)
@@ -503,7 +492,8 @@ static void RecordNativeWorld(VkCommandBuffer cmd, uint32_t imageIndex)
 		const VkNativeMesh& mesh = g_nativeVk.meshes[instance.mesh.slot];
 		struct { float mvp[16]; float tint[4]; uint32_t encodeSRGB; float alphaCutoff; uint32_t pickId; } push;
 		push.pickId = instance.layer == PSYX_NATIVE_WORLD ? i+1 : 0;
-		NativeMultiply(push.mvp, viewProjection[instance.layer], instance.world);
+		PsyXNativeTransform::Compose(push.mvp,g_nativeScene.snapshot.view.projection,
+			instance.layer==PSYX_NATIVE_BACKDROP ? backdropView : g_nativeScene.snapshot.view.view,instance.world);
 		memcpy(push.tint, instance.tint, sizeof(push.tint));
 		push.encodeSRGB = g_vk.srgbOutput ? 0 : 1;
 		const bool textured = source.material.generation != 0;
