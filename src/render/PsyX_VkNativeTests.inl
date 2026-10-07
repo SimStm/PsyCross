@@ -194,6 +194,8 @@ static int NativeTestMaterials(PsyXNativeSnapshot snapshot, const float backgrou
 		material.rgba = artwork;
 		material.filter = (reload & 1) ? PSYX_NATIVE_LINEAR : PSYX_NATIVE_NEAREST;
 		material.alphaCutoff = .5f;
+		material.cull = reload >= 6 ? PSYX_NATIVE_CULL_NONE : PSYX_NATIVE_CULL_BACK;
+		instance.world[0] = reload >= 6 ? -1.0f : 1.0f;
 		if (reload >= 4) artwork[3] = 0;
 		if (PsyX_Native_CreateMaterial(&material, &mesh.material) != PSYX_NATIVE_PENDING ||
 			PsyX_Native_CreateMesh(&mesh, &instance.mesh) != PSYX_NATIVE_PENDING)
@@ -205,15 +207,23 @@ static int NativeTestMaterials(PsyXNativeSnapshot snapshot, const float backgrou
 		for (int legacyBilinear = 0; legacyBilinear < 2; ++legacyBilinear)
 		{
 			if (!NativeTestFrame(snapshot, 0, pixels, report, reportSize, legacyBilinear)) { ++failures; continue; }
-			if (!PsxCheckPixel(pixels.data(), g_vk.width, g_vk.height, g_vk.width / 4, g_vk.height / 2,
+			if (!PsxCheckPixel(pixels.data(), g_vk.width, g_vk.height, g_vk.width * (reload >= 6 ? 3 : 1) / 4, g_vk.height / 2,
 				reload >= 4 ? background : black, 3, reload >= 4 ? "native cutout reveals background" : "native owns original black texel",
 				report, reportSize)) ++failures;
-			if (!PsxCheckPixel(pixels.data(), g_vk.width, g_vk.height, g_vk.width * 3 / 4, g_vk.height / 2,
-				white, 3, "native white artwork texel", report, reportSize)) ++failures;
+			if (!PsxCheckPixel(pixels.data(), g_vk.width, g_vk.height, g_vk.width * (reload >= 6 ? 1 : 3) / 4, g_vk.height / 2,
+				white, 3, reload >= 6 ? "back-facing two-sided cutout solid texel" : "native white artwork texel", report, reportSize)) ++failures;
 			if ((reload & 1) && reload < 4 && !PsxCheckPixel(pixels.data(), g_vk.width, g_vk.height,
 				g_vk.width / 2, g_vk.height / 2, middle, 3, "native linear filtering in linear light", report, reportSize)) ++failures;
 			if (!legacyBilinear) previous = pixels;
 			else if (previous != pixels) { ReportAppend(report, reportSize, "legacy filter changes native artwork FAIL\n"); ++failures; }
+		}
+		if (reload == 4 || reload == 5)
+		{
+			instance.world[0] = -1;
+			if (!NativeTestFrame(snapshot, 0, pixels, report, reportSize) ||
+				!PsxCheckPixel(pixels.data(), g_vk.width, g_vk.height, g_vk.width / 4, g_vk.height / 2,
+					background, 3, "single-sided reversed cutout is culled", report, reportSize)) ++failures;
+			instance.world[0] = 1;
 		}
 		PsyXNativeStats stats;
 		PsyX_Native_GetStats(&stats);

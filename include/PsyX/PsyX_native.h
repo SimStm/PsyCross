@@ -9,12 +9,12 @@ extern "C" {
 
 /* R01 native world contributor. All calls belong to the render thread. No
  * Vulkan objects or borrowed game pointers cross this C boundary. */
-#define PSYX_NATIVE_VERSION 2u
-#define PSYX_NATIVE_MAX_MESHES 32u
-#define PSYX_NATIVE_MAX_INSTANCES 64u
-#define PSYX_NATIVE_MAX_BYTES (8u * 1024u * 1024u)
-#define PSYX_NATIVE_MAX_MATERIALS 32u
-#define PSYX_NATIVE_MAX_MATERIAL_BYTES (32u * 1024u * 1024u)
+#define PSYX_NATIVE_VERSION 3u
+#define PSYX_NATIVE_MAX_MESHES 512u
+#define PSYX_NATIVE_MAX_INSTANCES 4096u
+#define PSYX_NATIVE_MAX_BYTES (32u * 1024u * 1024u)
+#define PSYX_NATIVE_MAX_MATERIALS 256u
+#define PSYX_NATIVE_MAX_MATERIAL_BYTES (64u * 1024u * 1024u)
 
 typedef enum PsyXNativeResult
 {
@@ -42,6 +42,7 @@ typedef struct PsyXNativeMaterialHandle
 } PsyXNativeMaterialHandle;
 
 typedef enum PsyXNativeFilter { PSYX_NATIVE_NEAREST = 0, PSYX_NATIVE_LINEAR = 1 } PsyXNativeFilter;
+typedef enum PsyXNativeCull { PSYX_NATIVE_CULL_BACK = 0, PSYX_NATIVE_CULL_NONE = 1 } PsyXNativeCull;
 typedef struct PsyXNativeMaterialDesc
 {
 	uint32_t size;
@@ -52,6 +53,7 @@ typedef struct PsyXNativeMaterialDesc
 	uint64_t byteCount; /* actual supplied span; must match dimensions exactly */
 	PsyXNativeFilter filter;
 	float alphaCutoff; /* opaque/cutout slice; alpha does not imply blending */
+	PsyXNativeCull cull; /* explicit two-sided cutouts; no optional GPU feature */
 } PsyXNativeMaterialDesc;
 
 typedef struct PsyXNativeVertex

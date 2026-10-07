@@ -33,7 +33,7 @@ static struct
 	VkDescriptorPool materialPool;
 	VkRenderPass pass;
 	VkPipelineLayout layout;
-	VkPipeline pipeline;
+	VkPipeline pipelines[2];
 	VkImage depth;
 	VkDeviceMemory depthMemory;
 	VkImageView depthView;
@@ -230,8 +230,13 @@ static int CreateNativePipeline()
 	info.pDynamicState = &dynamic;
 	info.layout = g_nativeVk.layout;
 	info.renderPass = g_nativeVk.pass;
-	const int ok = vertex && fragment && VkOk(vkCreateGraphicsPipelines(g_vk.device, VK_NULL_HANDLE, 1, &info, NULL,
-		&g_nativeVk.pipeline), "native unlit pipeline");
+	int ok = vertex && fragment;
+	for (unsigned int cull = 0; cull < 2 && ok; ++cull)
+	{
+		raster.cullMode = cull == PSYX_NATIVE_CULL_NONE ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT;
+		ok = VkOk(vkCreateGraphicsPipelines(g_vk.device, VK_NULL_HANDLE, 1, &info, NULL,
+			&g_nativeVk.pipelines[cull]), "native unlit/cutout pipeline");
+	}
 	if (vertex) vkDestroyShaderModule(g_vk.device, vertex, NULL);
 	if (fragment) vkDestroyShaderModule(g_vk.device, fragment, NULL);
 	return ok;
@@ -239,10 +244,13 @@ static int CreateNativePipeline()
 
 static void DestroyNativePipeline()
 {
-	if (g_nativeVk.pipeline) vkDestroyPipeline(g_vk.device, g_nativeVk.pipeline, NULL);
+	for (unsigned int cull = 0; cull < 2; ++cull)
+	{
+		if (g_nativeVk.pipelines[cull]) vkDestroyPipeline(g_vk.device, g_nativeVk.pipelines[cull], NULL);
+		g_nativeVk.pipelines[cull] = VK_NULL_HANDLE;
+	}
 	if (g_nativeVk.layout) vkDestroyPipelineLayout(g_vk.device, g_nativeVk.layout, NULL);
 	if (g_nativeVk.pass) vkDestroyRenderPass(g_vk.device, g_nativeVk.pass, NULL);
-	g_nativeVk.pipeline = VK_NULL_HANDLE;
 	g_nativeVk.layout = VK_NULL_HANDLE;
 	g_nativeVk.pass = VK_NULL_HANDLE;
 }
@@ -347,7 +355,7 @@ static void RecordNativeWorld(VkCommandBuffer cmd, uint32_t imageIndex)
 	VkRect2D scissor = { { 0, 0 }, { uint32_t(g_vk.width), uint32_t(g_vk.height) } };
 	vkCmdSetViewport(cmd, 0, 1, &viewport);
 	vkCmdSetScissor(cmd, 0, 1, &scissor);
-	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_nativeVk.pipeline);
+	VkPipeline activePipeline = VK_NULL_HANDLE;
 	float viewProjection[16];
 	NativeMultiply(viewProjection, g_nativeScene.snapshot.view.projection, g_nativeScene.snapshot.view.view);
 	for (uint32_t i = 0; i < g_nativeScene.snapshot.instanceCount; ++i)
@@ -360,6 +368,12 @@ static void RecordNativeWorld(VkCommandBuffer cmd, uint32_t imageIndex)
 		memcpy(push.tint, instance.tint, sizeof(push.tint));
 		push.encodeSRGB = g_vk.srgbOutput ? 0 : 1;
 		const bool textured = source.material.generation != 0;
+		const unsigned int cull = textured ? g_nativeScene.materials[source.material.slot].cull : PSYX_NATIVE_CULL_BACK;
+		if (activePipeline != g_nativeVk.pipelines[cull])
+		{
+			activePipeline = g_nativeVk.pipelines[cull];
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, activePipeline);
+		}
 		push.alphaCutoff = textured ? g_nativeScene.materials[source.material.slot].alphaCutoff : 0;
 		const VkDescriptorSet descriptor = textured ? g_nativeVk.materials[source.material.slot].set : g_nativeVk.white.set;
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_nativeVk.layout, 0, 1, &descriptor, 0, NULL);

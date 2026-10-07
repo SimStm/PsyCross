@@ -29,8 +29,9 @@ public:
 		uint32_t width, height;
 		PsyXNativeFilter filter;
 		float alphaCutoff;
+		PsyXNativeCull cull;
 		std::vector<uint8_t> rgba;
-		Material() : state(Empty), generation(0), lastSubmission(0), width(0), height(0), filter(PSYX_NATIVE_NEAREST), alphaCutoff(0.5f) {}
+		Material() : state(Empty), generation(0), lastSubmission(0), width(0), height(0), filter(PSYX_NATIVE_NEAREST), alphaCutoff(0.5f), cull(PSYX_NATIVE_CULL_BACK) {}
 	};
 
 	PsyXNativeScene();

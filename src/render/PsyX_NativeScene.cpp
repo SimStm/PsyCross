@@ -223,6 +223,7 @@ PsyXNativeResult PsyXNativeScene::CreateMaterial(const PsyXNativeMaterialDesc* d
 	if (!desc || !handle || desc->size != sizeof(*desc) || desc->version != PSYX_NATIVE_VERSION ||
 		!desc->rgba || !desc->width || !desc->height || desc->width > 4096 || desc->height > 4096 ||
 		(desc->filter != PSYX_NATIVE_NEAREST && desc->filter != PSYX_NATIVE_LINEAR) ||
+		(desc->cull != PSYX_NATIVE_CULL_BACK && desc->cull != PSYX_NATIVE_CULL_NONE) ||
 		!std::isfinite(desc->alphaCutoff) || desc->alphaCutoff < 0 || desc->alphaCutoff > 1)
 		return Reject(PSYX_NATIVE_INVALID);
 	if (generationExhausted) return Reject(PSYX_NATIVE_OUT_OF_BUDGET);
@@ -241,6 +242,7 @@ PsyXNativeResult PsyXNativeScene::CreateMaterial(const PsyXNativeMaterialDesc* d
 		material.rgba.swap(pixels);
 		material.width = desc->width; material.height = desc->height;
 		material.filter = desc->filter; material.alphaCutoff = desc->alphaCutoff;
+		material.cull = desc->cull;
 		++material.generation;
 		material.lastSubmission = 0; material.state = Pending;
 		ownedMaterialBytes += bytes;
