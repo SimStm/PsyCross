@@ -47,6 +47,8 @@ public:
 	PsyXNativeResult Publish(const PsyXNativeSnapshot* snapshot);
 	uint64_t Reset();
 	void SetRequested(int requested);
+	void SetFrameStatus(PsyXNativeResult reason);
+	PsyXNativeFrameState FrameState(PsyXNativeResult reason, bool worldBoundary) const;
 	bool IsLive(PsyXNativeMeshHandle handle) const;
 	bool CanReclaim(uint32_t slot, uint64_t completed) const;
 	void Reclaim(uint32_t slot); /* only after backend destroys retired GPU objects */
@@ -60,6 +62,8 @@ public:
 	PsyXNativeSnapshot snapshot;
 	bool snapshotPending;
 	bool requested;
+	bool worldExpected;
+	PsyXNativeResult producerReason;
 	uint64_t generation;
 	uint64_t ownedBytes;
 	uint64_t ownedMaterialBytes;

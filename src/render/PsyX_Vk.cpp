@@ -64,6 +64,7 @@
 	X(vkGetPhysicalDeviceQueueFamilyProperties) \
 	X(vkGetPhysicalDeviceMemoryProperties) \
 	X(vkGetPhysicalDeviceFormatProperties) \
+	X(vkGetPhysicalDeviceImageFormatProperties) \
 	X(vkDestroySurfaceKHR) \
 	X(vkGetPhysicalDeviceSurfaceSupportKHR) \
 	X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) \
@@ -5925,9 +5926,12 @@ int PsyX_Vk_RenderFrame(void)
 		return 1;
 	NativeCompleted();
 	const PsyXNativeResult nativeReason = PrepareNativeFrame();
-	const bool nativeActive = g_nativeScene.requested && nativeReason == PSYX_NATIVE_OK;
+	g_nativeVk.frame.frameState = g_nativeScene.FrameState(nativeReason, g_vk.psx.modernSceneBoundary >= 0);
+	const bool nativeActive = g_nativeVk.frame.frameState == PSYX_NATIVE_FRAME_READY;
+	const bool nativeWorldSelected = NativeWorldSelected();
 	g_nativeVk.frame.reason = nativeReason;
 	g_nativeVk.frame.effective = nativeActive;
+	NativeFrameDiagnostic();
 
 	UpdateSceneUbo();
 	if (g_vk.gameMode)
@@ -5939,7 +5943,7 @@ int PsyX_Vk_RenderFrame(void)
 		g_vk.gameModernStats.worldCasterTriangles = 0;
 		// CPU submission is ordinary RAM. Refill the GPU buffer only here, after
 		// the previous frame fence; host-coherent writes are visible on submit.
-		if (g_vk.worldShadowVertexCount)
+		if (g_vk.worldShadowVertexCount && !nativeWorldSelected)
 		{
 			if (!g_vk.worldShadowBuffer && !CreateBuffer(PSYX_WORLD_SHADOW_MAX_VERTICES * 3 * sizeof(float),
 				VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
@@ -5995,7 +5999,7 @@ int PsyX_Vk_RenderFrame(void)
 	vkCmdSetScissor(g_vk.commandBuffer, 0, 1, &shadowScissor);
 
 	int drawCalls = 0;
-	if (g_vk.lights.shadowsEnabled && !nativeActive)
+	if (g_vk.lights.shadowsEnabled && !nativeWorldSelected)
 	{
 		vkCmdBindPipeline(g_vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.shadowPipeline);
 
@@ -6080,6 +6084,15 @@ int PsyX_Vk_RenderFrame(void)
 		clears[0].color.float32[3] = 1.0f;
 		clearColor = g_vk.psx.clearRequested || firstUse;
 		g_vk.psx.clearRequested = 0;
+		if (nativeWorldSelected && !nativeActive)
+		{
+			// Never retain a prior scene or paint old world pixels over failure.
+			const bool loading = g_nativeVk.frame.frameState == PSYX_NATIVE_FRAME_LOADING;
+			clears[0].color.float32[0] = loading ? 0.0f : 32.0f/255;
+			clears[0].color.float32[1] = 0.0f;
+			clears[0].color.float32[2] = 32.0f/255;
+			clearColor = 1;
+		}
 	}
 	else
 	{
@@ -6144,11 +6157,11 @@ int PsyX_Vk_RenderFrame(void)
 	g_vk.mainPassBegin = mainBegin;
 	g_vk.mainPassImageIndex = imageIndex;
 	g_vk.mainPassOpen = 1;
-	const int overlayBegin = g_vk.gameMode && (g_vk.gameModernEnabled || nativeActive) &&
+	const int overlayBegin = g_vk.gameMode && (g_vk.gameModernEnabled || nativeWorldSelected) &&
 		g_vk.psx.modernSceneBoundary >= 0 ? g_vk.psx.modernSceneBoundary : g_vk.psx.drawCount;
 	g_vk.psx.lastDraws = 0;
 	g_vk.psx.lastStencilDraws = 0;
-	RecordPsxDraws(g_vk.commandBuffer, 0, g_vk.psx.frameIndex, g_vk.width, g_vk.height, 0, overlayBegin, nativeActive);
+	RecordPsxDraws(g_vk.commandBuffer, 0, g_vk.psx.frameIndex, g_vk.width, g_vk.height, 0, overlayBegin, nativeWorldSelected);
 	g_nativeVk.frame.legacyWorldDraws = g_vk.psx.lastDraws;
 
 	if (g_vk.gameMode)
@@ -6166,13 +6179,13 @@ int PsyX_Vk_RenderFrame(void)
 
 		const int sceneCopyReady = g_vk.sceneDepthImage != VK_NULL_HANDLE &&
 			g_vk.sceneColorImage != VK_NULL_HANDLE;
-		const int modernShadows = !nativeActive && g_vk.gameModernEnabled && g_vk.lights.shadowsEnabled &&
+		const int modernShadows = !nativeWorldSelected && g_vk.gameModernEnabled && g_vk.lights.shadowsEnabled &&
 			g_vk.modernCameraValid && sceneCopyReady;
 		// Legacy lighting receptivity shares the composite pass (and therefore
 		// the scene copy) but is independent of the shadow toggle. The shader
 		// decides which published lights are sun and point, so any non-empty
 		// light set counts.
-		const int legacyLighting = !nativeActive && g_vk.gameModernEnabled &&
+		const int legacyLighting = !nativeWorldSelected && g_vk.gameModernEnabled &&
 			g_vk.lights.legacyLightingScale > 0.0f && g_vk.lights.count > 0 &&
 			g_vk.modernCameraValid && sceneCopyReady;
 		const int modernComposite = modernShadows || legacyLighting;
@@ -6199,7 +6212,7 @@ int PsyX_Vk_RenderFrame(void)
 			g_vk.gameModernStats.legacyLightPass = legacyLighting ? 1 : 0;
 		}
 
-		if (!nativeActive) drawCalls += RecordGameModernMeshes(g_vk.commandBuffer);
+		if (!nativeWorldSelected) drawCalls += RecordGameModernMeshes(g_vk.commandBuffer);
 		// Blend HUD, menus and lens flare over both kinds of geometry. Keeping
 		// them out of the scene copy also prevents their colour/depth from
 		// being interpreted as lit world surfaces.
@@ -6283,6 +6296,7 @@ int PsyX_Vk_RenderFrame(void)
 			// The game contributes its own windows (the developer graphics
 			// panel) into the frame the backend owns.
 			PsyX_InvokeRenderOverlayHandler();
+			DrawNativeFrameDiagnostic();
 		}
 		else
 		{
@@ -6352,7 +6366,7 @@ int PsyX_Vk_RenderFrame(void)
 	// unexpected image index) and the next frame then waited on a signal that
 	// nothing would ever produce.
 	if (!VkOk(vkResetFences(g_vk.device, 1, &g_vk.frameFence), "vkResetFences"))
-		return 0;
+	{ g_nativePick.Fail(PSYX_NATIVE_UPLOAD_FAILED); return 0; }
 	if (!VkOk(vkQueueSubmit(g_vk.queue, 1, &submit, g_vk.frameFence), "vkQueueSubmit"))
 	{
 		// A submission that never happened cannot signal the fence; an empty
@@ -6361,6 +6375,7 @@ int PsyX_Vk_RenderFrame(void)
 		memset(&empty, 0, sizeof(empty));
 		empty.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 		vkQueueSubmit(g_vk.queue, 1, &empty, g_vk.frameFence);
+		g_nativePick.Fail(PSYX_NATIVE_UPLOAD_FAILED);
 		return 0;
 	}
 
@@ -7133,6 +7148,15 @@ PsyXNativeResult PsyX_Native_CreateMaterial(const PsyXNativeMaterialDesc* desc, 
 PsyXNativeResult PsyX_Native_DestroyMaterial(PsyXNativeMaterialHandle handle) { (void)handle; return PSYX_NATIVE_UNSUPPORTED; }
 PsyXNativeResult PsyX_Native_Publish(const PsyXNativeSnapshot* snapshot) { (void)snapshot; return PSYX_NATIVE_UNSUPPORTED; }
 void PsyX_Native_SetRequested(int requested) { (void)requested; }
+void PsyX_Native_SetFrameStatus(PsyXNativeResult reason) { (void)reason; }
+PsyXNativeResult PsyX_Native_RequestPick(int x, int y) { (void)x; (void)y; return PSYX_NATIVE_UNSUPPORTED; }
+PsyXNativeResult PsyX_Native_GetPickResult(PsyXNativePickResult* result)
+{
+	if (!result) return PSYX_NATIVE_INVALID;
+	*result=PsyXNativePickResult(); result->size=sizeof(*result); result->version=PSYX_NATIVE_VERSION;
+	result->reason=PSYX_NATIVE_UNSUPPORTED; return result->reason;
+}
+void PsyX_Native_CancelPick(void) {}
 uint64_t PsyX_Native_ResetScene(void) { return 0; }
 uint64_t PsyX_Native_GetSceneGeneration(void) { return 0; }
 void PsyX_Native_GetStats(PsyXNativeStats* stats)

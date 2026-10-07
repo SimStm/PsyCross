@@ -9,7 +9,7 @@ extern "C" {
 
 /* R01 native world contributor. All calls belong to the render thread. No
  * Vulkan objects or borrowed game pointers cross this C boundary. */
-#define PSYX_NATIVE_VERSION 6u
+#define PSYX_NATIVE_VERSION 8u
 #define PSYX_NATIVE_MAX_MESHES 512u
 #define PSYX_NATIVE_MAX_INSTANCES 4096u
 #define PSYX_NATIVE_MAX_BYTES (32u * 1024u * 1024u)
@@ -28,6 +28,18 @@ typedef enum PsyXNativeResult
 	PSYX_NATIVE_NO_SNAPSHOT = 7,
 	PSYX_NATIVE_NO_BOUNDARY = 8
 } PsyXNativeResult;
+
+/* Auxiliary frames are remaining frontend/loading/UI consumers, never a
+ * replacement world scene. PENDING is expected loading; all other unavailable
+ * world results are failures. No native state permits legacy world recovery. */
+typedef enum PsyXNativeFrameState
+{
+	PSYX_NATIVE_FRAME_OFF = 0,
+	PSYX_NATIVE_FRAME_AUXILIARY = 1,
+	PSYX_NATIVE_FRAME_LOADING = 2,
+	PSYX_NATIVE_FRAME_READY = 3,
+	PSYX_NATIVE_FRAME_FAILED = 4
+} PsyXNativeFrameState;
 
 typedef struct PsyXNativeMeshHandle
 {
@@ -144,9 +156,36 @@ typedef struct PsyXNativeStats
 	uint64_t ownedMaterialBytes;
 	uint32_t nativeBackdropDraws; /* subset of nativeDraws, excluded from world depth/lighting */
 	uint64_t effectiveFrames; /* cumulative submissions since backend initialization */
-	uint64_t fallbackFrames; /* requested native mode but whole legacy frame submitted */
+	uint64_t failedFrames; /* explicit unavailable native world submissions */
 	uint64_t materialUploads; /* successful owned material image uploads, excludes analytic white */
+	PsyXNativeFrameState frameState;
+	uint64_t loadingFrames;
+	uint64_t auxiliaryFrames; /* declared unmigrated consumers, not native success */
 } PsyXNativeStats;
+
+/* An asynchronous sample of the next submitted native world frame. The GPU
+ * resolves depth, culling and artwork alpha; backdrop/UI are not selectable.
+ * hit=0 with reason=OK is a miss. Handles and identity are copied from that
+ * frame, never inferred from a legacy packet or current draw order. */
+typedef struct PsyXNativePickResult
+{
+	uint32_t size, version;
+	PsyXNativeResult reason;
+	uint32_t hit;
+	uint64_t requestSerial, submittedSerial, sceneGeneration, simulationTick;
+	uint64_t identity;
+	PsyXNativeMeshHandle mesh;
+	PsyXNativeMaterialHandle material;
+	uint32_t instanceIndex; /* diagnostic only; identity is the logical key */
+} PsyXNativePickResult;
+
+/* SDL window coordinates, top left origin; drawable scaling is done by the
+ * owner. A resize before submission rejects the request as stale. No GPU wait
+ * is introduced: query PENDING until the ordinary frame fence completes. A
+ * newer request/cancel supersedes an older result, including one in flight. */
+PsyXNativeResult PsyX_Native_RequestPick(int windowX, int windowY);
+PsyXNativeResult PsyX_Native_GetPickResult(PsyXNativePickResult* result);
+void PsyX_Native_CancelPick(void);
 
 /* Pending is a successful owned CPU create, with a valid handle. GPU upload
  * happens after the existing frame fence; query failures explicitly. */
@@ -156,6 +195,11 @@ PsyXNativeResult PsyX_Native_CreateMaterial(const PsyXNativeMaterialDesc* desc, 
 PsyXNativeResult PsyX_Native_DestroyMaterial(PsyXNativeMaterialHandle handle);
 PsyXNativeResult PsyX_Native_Publish(const PsyXNativeSnapshot* snapshot);
 void PsyX_Native_SetRequested(int requested);
+/* The game declares a world frame before preparing its sources. PENDING marks
+ * expected loading; NO_SNAPSHOT is a missing publication error. Publishing a
+ * valid snapshot sets OK. Status is consumed with the ordinary submission,
+ * never inferred from a prior frame. A failure discards pending publication. */
+void PsyX_Native_SetFrameStatus(PsyXNativeResult reason);
 uint64_t PsyX_Native_ResetScene(void); /* invalidates all handles immediately */
 uint64_t PsyX_Native_GetSceneGeneration(void);
 void PsyX_Native_GetStats(PsyXNativeStats* stats);

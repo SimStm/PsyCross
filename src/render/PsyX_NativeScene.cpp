@@ -50,7 +50,7 @@ uint64_t PsyXNativeScene::Mesh::Bytes() const
 	return uint64_t(vertices.size()) * sizeof(PsyXNativeVertex) + uint64_t(indices.size()) * sizeof(uint32_t);
 }
 
-PsyXNativeScene::PsyXNativeScene() : snapshotPending(false), requested(false), generation(1), ownedBytes(0), ownedMaterialBytes(0), rejected(0), generationExhausted(false)
+PsyXNativeScene::PsyXNativeScene() : snapshotPending(false), requested(false), worldExpected(false), producerReason(PSYX_NATIVE_NO_SNAPSHOT), generation(1), ownedBytes(0), ownedMaterialBytes(0), rejected(0), generationExhausted(false)
 {
 	memset(instances, 0, sizeof(instances));
 	memset(&snapshot, 0, sizeof(snapshot));
@@ -152,7 +152,24 @@ PsyXNativeResult PsyXNativeScene::Publish(const PsyXNativeSnapshot* source)
 	snapshot = *source;
 	snapshot.instances = instances;
 	snapshotPending = true;
+	worldExpected = true;
+	producerReason = PSYX_NATIVE_OK;
 	return PSYX_NATIVE_OK;
+}
+
+void PsyXNativeScene::SetFrameStatus(PsyXNativeResult reason)
+{
+	worldExpected = true;
+	producerReason = reason;
+	if (reason != PSYX_NATIVE_OK) { snapshotPending = false; snapshot.instanceCount = 0; }
+}
+
+PsyXNativeFrameState PsyXNativeScene::FrameState(PsyXNativeResult reason, bool worldBoundary) const
+{
+	if (!requested) return PSYX_NATIVE_FRAME_OFF;
+	if (!worldExpected && !worldBoundary && !snapshotPending) return PSYX_NATIVE_FRAME_AUXILIARY;
+	if (reason == PSYX_NATIVE_OK) return PSYX_NATIVE_FRAME_READY;
+	return reason == PSYX_NATIVE_PENDING ? PSYX_NATIVE_FRAME_LOADING : PSYX_NATIVE_FRAME_FAILED;
 }
 
 void PsyXNativeScene::SetRequested(int value)
@@ -197,6 +214,8 @@ void PsyXNativeScene::ConsumeSnapshot()
 {
 	snapshotPending = false;
 	snapshot.instanceCount = 0;
+	worldExpected = false;
+	producerReason = PSYX_NATIVE_NO_SNAPSHOT;
 }
 
 void PsyXNativeScene::GetStats(PsyXNativeStats* out) const
@@ -294,13 +313,13 @@ const char* PsyX_Native_ResultName(PsyXNativeResult result)
 	switch (result)
 	{
 	case PSYX_NATIVE_OK: return "ready";
-	case PSYX_NATIVE_PENDING: return "upload pending";
-	case PSYX_NATIVE_UNSUPPORTED: return "unsupported backend or depth format";
+	case PSYX_NATIVE_PENDING: return "loading native sources or GPU resources";
+	case PSYX_NATIVE_UNSUPPORTED: return "unsupported native backend, mode, source or GPU capability";
 	case PSYX_NATIVE_INVALID: return "invalid descriptor";
 	case PSYX_NATIVE_STALE: return "stale handle or scene";
 	case PSYX_NATIVE_OUT_OF_BUDGET: return "resource budget exceeded";
 	case PSYX_NATIVE_UPLOAD_FAILED: return "GPU upload failed";
-	case PSYX_NATIVE_NO_SNAPSHOT: return "no native view this frame";
+	case PSYX_NATIVE_NO_SNAPSHOT: return "missing native scene publication this world frame";
 	case PSYX_NATIVE_NO_BOUNDARY: return "no tested world/overlay boundary";
 	default: return "unknown result";
 	}

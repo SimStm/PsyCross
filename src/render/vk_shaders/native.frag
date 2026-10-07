@@ -3,7 +3,8 @@ layout(location=0) in vec4 vertexColor;
 layout(location=1) in vec3 sourceNormal;
 layout(location=2) in vec2 sourceUV;
 layout(location=0) out vec4 outColor;
-layout(push_constant) uniform NativeDraw { mat4 mvp; vec4 tint; uint encodeSRGB; float alphaCutoff; } pc;
+layout(location=1) out uint outPick;
+layout(push_constant) uniform NativeDraw { mat4 mvp; vec4 tint; uint encodeSRGB; float alphaCutoff; uint pickId; } pc;
 layout(set=0,binding=0) uniform sampler2D artwork;
 // The swapchain owner selects explicit linear -> sRGB encoding for UNORM;
 // an sRGB attachment performs the conversion itself.
@@ -21,4 +22,5 @@ void main()
     if (texel.a < pc.alphaCutoff) discard;
     vec3 linearRGB = clamp(vertexColor.rgb * texel.rgb, 0.0, 1.0);
     outColor = vec4(pc.encodeSRGB != 0 ? encodeSRGB(linearRGB) : linearRGB, 1.0);
+    outPick = pc.pickId;
 }
