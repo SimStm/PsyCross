@@ -5,8 +5,19 @@
 static PsyXNativeScene g_nativeScene;
 #include "PsyX_NativePick.h"
 #include "PsyX_NativeTransform.h"
+#include "PsyX_NativePlane.h"
 static PsyXNativePick g_nativePick;
 static int g_nativePickReadbackFault = 0; // actual-allocation rollback acceptance hook
+struct NativeDrawPush
+{
+	float mvp[16], tint[4];
+	uint32_t encodeSRGB;
+	float alphaCutoff;
+	uint32_t pickId, padding;
+	float depthPlane[4];
+};
+static_assert(sizeof(NativeDrawPush)==112, "Native push constants must match GLSL alignment");
+static_assert(offsetof(NativeDrawPush,depthPlane)==96, "Native plane must start at the GLSL vec4 offset");
 struct VkNativeMesh
 {
 	VkBuffer vertices;
@@ -52,6 +63,7 @@ static struct
 	uint64_t completed;
 	uint64_t effectiveFrames, failedFrames, loadingFrames, auxiliaryFrames, materialUploads;
 	PsyXNativeStats frame;
+	double clipToWorld[16];
 } g_nativeVk;
 
 #include "PsyX_VkNativeMaterials.inl"
@@ -162,14 +174,14 @@ static int CreateNativePass()
 	VkSubpassDependency dependencies[2] = {};
 	dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
 	dependencies[0].dstSubpass = 0;
-	dependencies[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
-	dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+	dependencies[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+	dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
 	dependencies[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
 	dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 	dependencies[1].srcSubpass = 0;
 	dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
-	dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-	dependencies[1].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+	dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+	dependencies[1].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
 	dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 	dependencies[1].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
 		VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
@@ -187,7 +199,7 @@ static int CreateNativePass()
 static int CreateNativePipeline()
 {
 	if (!PrepareNativeWhiteMaterial()) return 0;
-	VkPushConstantRange push = { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 92 };
+	VkPushConstantRange push = { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(NativeDrawPush) };
 	VkPipelineLayoutCreateInfo layout = {};
 	layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
 	layout.pushConstantRangeCount = 1;
@@ -342,10 +354,20 @@ static PsyXNativeResult PrepareNativeFrame()
 		return g_nativeScene.producerReason;
 	if (!g_nativeScene.snapshotPending) return PSYX_NATIVE_NO_SNAPSHOT;
 	if (g_vk.psx.modernSceneBoundary < 0) return PSYX_NATIVE_NO_BOUNDARY;
+	if (!PsyXNativePlane::Inverse(g_nativeVk.clipToWorld,g_nativeScene.snapshot.view.projection,
+		g_nativeScene.snapshot.view.view)) return PSYX_NATIVE_INVALID;
 	for (uint32_t i = 0; i < g_nativeScene.snapshot.instanceCount; ++i)
 	{
 		const PsyXNativeMeshHandle handle = g_nativeScene.instances[i].mesh;
 		if (!g_nativeScene.IsLive(handle)) return PSYX_NATIVE_STALE;
+		const PsyXNativeScene::Mesh& source=g_nativeScene.meshes[handle.slot];
+		if (source.horizontalPlane && g_nativeScene.instances[i].layer==PSYX_NATIVE_WORLD)
+		{
+			float plane[4];
+			if (PsyXNativePlane::Horizontal(plane,g_nativeVk.clipToWorld,g_nativeScene.instances[i].world,
+				source.planeY,g_vk.width,g_vk.height,source.depthLayer)==PsyXNativePlane::Invalid)
+				return PSYX_NATIVE_INVALID;
+		}
 		const PsyXNativeScene::State state = g_nativeScene.meshes[handle.slot].state;
 		if (state == PsyXNativeScene::Failed) return PSYX_NATIVE_UPLOAD_FAILED;
 		if (state != PsyXNativeScene::Ready) return PSYX_NATIVE_PENDING;
@@ -490,7 +512,11 @@ static void RecordNativeWorld(VkCommandBuffer cmd, uint32_t imageIndex)
 		if (instance.layer != order[pass]) continue;
 		PsyXNativeScene::Mesh& source = g_nativeScene.meshes[instance.mesh.slot];
 		const VkNativeMesh& mesh = g_nativeVk.meshes[instance.mesh.slot];
-		struct { float mvp[16]; float tint[4]; uint32_t encodeSRGB; float alphaCutoff; uint32_t pickId; } push;
+		NativeDrawPush push={};
+		push.depthPlane[3]=-1;
+		if (source.horizontalPlane && instance.layer==PSYX_NATIVE_WORLD)
+			PsyXNativePlane::Horizontal(push.depthPlane,g_nativeVk.clipToWorld,instance.world,
+				source.planeY,g_vk.width,g_vk.height,source.depthLayer);
 		push.pickId = instance.layer == PSYX_NATIVE_WORLD ? i+1 : 0;
 		PsyXNativeTransform::Compose(push.mvp,g_nativeScene.snapshot.view.projection,
 			instance.layer==PSYX_NATIVE_BACKDROP ? backdropView : g_nativeScene.snapshot.view.view,instance.world);

@@ -1,4 +1,5 @@
 #include "PsyX_NativeScene.h"
+#include "PsyX_NativePlane.h"
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -95,6 +96,10 @@ PsyXNativeResult PsyXNativeScene::Create(const PsyXNativeMeshDesc* desc, PsyXNat
 		mesh.lastSubmission = 0;
 		mesh.material = desc->material;
 		mesh.depthLayer = desc->depthLayer;
+		mesh.planeY = mesh.vertices[0].position[1];
+		mesh.horizontalPlane = true;
+		for (size_t i=1; i<mesh.vertices.size(); ++i)
+			if (mesh.vertices[i].position[1]!=mesh.planeY) { mesh.horizontalPlane=false; break; }
 		mesh.state = Pending;
 		ownedBytes += bytes;
 		handle->slot = slot;
@@ -131,6 +136,9 @@ PsyXNativeResult PsyXNativeScene::Publish(const PsyXNativeSnapshot* source)
 		!Finite(source->view.projection, 16) || !Finite(source->view.cameraPosition, 3) ||
 		!std::isfinite(source->view.nearPlane) || !std::isfinite(source->view.farPlane) ||
 		source->view.nearPlane <= 0 || source->view.farPlane <= source->view.nearPlane)
+		return Reject(PSYX_NATIVE_INVALID);
+	double inverse[16];
+	if (!PsyXNativePlane::Inverse(inverse,source->view.projection,source->view.view))
 		return Reject(PSYX_NATIVE_INVALID);
 	for (uint32_t i = 0; i < source->instanceCount; ++i)
 	{
@@ -210,6 +218,8 @@ void PsyXNativeScene::Reclaim(uint32_t slot)
 	mesh.lastSubmission = 0;
 	mesh.material = PsyXNativeMaterialHandle();
 	mesh.depthLayer = 0;
+	mesh.horizontalPlane = false;
+	mesh.planeY = 0;
 	mesh.state = mesh.generation == std::numeric_limits<uint32_t>::max() ? Exhausted : Empty;
 }
 

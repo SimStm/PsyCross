@@ -151,6 +151,100 @@ static int NativeTestLargeOrigin(PsyXNativeSnapshot snapshot, char* report, int 
 	return failures;
 }
 
+static int NativeTestHorizontal(PsyXNativeSnapshot snapshot, char* report, int reportSize)
+{
+	snapshot.sceneGeneration=PsyX_Native_ResetScene(); PsyX_Vk_GameBeginFrame();
+	NativeTestIdentity(snapshot.view.view);
+	snapshot.view.view[5]=snapshot.view.view[10]=.8660254f;
+	snapshot.view.view[6]=.5f; snapshot.view.view[9]=-.5f;
+	snapshot.view.view[13]=-6.9282032f; snapshot.view.view[14]=-4;
+	snapshot.view.projection[0]=1; snapshot.view.projection[5]=-1;
+	const float blue[]={0,0,1,1}, red[]={1,0,0,1}, green[]={0,1,0,1}, white[]={1,1,1,1};
+	const uint8_t art[]={255,0,0,0,255,0,0,255};
+	PsyXNativeMaterialDesc material={}; material.size=sizeof(material); material.version=PSYX_NATIVE_VERSION;
+	material.rgba=art; material.width=2; material.height=1; material.byteCount=8;
+	material.filter=PSYX_NATIVE_NEAREST; material.alphaCutoff=.5f; material.cull=PSYX_NATIVE_CULL_NONE;
+	PsyXNativeMaterialHandle paint={};
+	if(PsyX_Native_CreateMaterial(&material,&paint)!=PSYX_NATIVE_PENDING) return 1;
+	PsyXNativeInstance instances[3]={};
+	PsyXNativeMeshDesc paintMesh={}; std::vector<PsyXNativeVertex> paintVertices;
+	std::vector<uint32_t> paintIndices;
+	for(unsigned int i=0;i<3;++i)
+	{
+		std::vector<PsyXNativeVertex> vertices; std::vector<uint32_t> indices;
+		NativeTestRectangle(vertices,indices,-.9f,-.9f,.9f,.9f,8,i==0 ? blue : i==1 ? red : green,0);
+		for(size_t v=0;v<vertices.size();++v)
+		{
+			vertices[v].position[2]=-vertices[v].position[1]-16;
+			vertices[v].position[1]=i==2 ? .1f : 0;
+			vertices[v].normal[1]=1;vertices[v].normal[2]=0;
+			if(i==1) vertices[v].position[0]-=1024;
+		}
+		if(i==1) { const uint32_t alternate[]={0,3,1,1,3,2}; indices.assign(alternate,alternate+6); }
+		PsyXNativeMeshDesc mesh={}; mesh.size=sizeof(mesh); mesh.version=PSYX_NATIVE_VERSION;
+		mesh.vertices=vertices.data(); mesh.vertexCount=uint32_t(vertices.size());
+		mesh.indices=indices.data(); mesh.indexCount=uint32_t(indices.size());
+		for(unsigned int axis=0;axis<3;++axis) { mesh.boundsMin[axis]=-1040;mesh.boundsMax[axis]=1040; }
+		if(PsyX_Native_CreateMesh(&mesh,&instances[i].mesh)!=PSYX_NATIVE_PENDING) return 1;
+		NativeTestIdentity(instances[i].world);if(i==1) instances[i].world[12]=1024;
+		for(unsigned int channel=0;channel<4;++channel) instances[i].tint[channel]=1;
+		instances[i].identity=701+i;
+		if(i==1) { paintMesh=mesh;paintVertices.swap(vertices);paintIndices.swap(indices); }
+	}
+	snapshot.instances=instances; snapshot.instanceCount=2;
+	std::vector<unsigned char> pixels;int failures=0;
+	// Exact physical ties have a defined winner: the last submitted native face.
+	// Different diagonals/local origins may not create alternating ownership bands.
+	for(unsigned int order=0;order<2;++order)
+	{
+		if(order) std::swap(instances[0],instances[1]);
+		int width=0,height=0;SDL_GetWindowSize(g_vk.window,&width,&height);
+		PsyX_Native_RequestPick(width/2,height/2);PsyXNativePickResult pick={};
+		if(!NativeTestFrame(snapshot,0,pixels,report,reportSize)) { ++failures;continue; }
+		const float* expected=instances[1].identity==702 ? red : blue;
+		unsigned int checked=0,wrong=0;
+		for(int y=g_vk.height*46/100;y<g_vk.height*54/100;++y)
+		for(int x=g_vk.width*42/100;x<g_vk.width*58/100;++x)
+		{
+			++checked; const unsigned char* pixel=&pixels[(size_t(y)*g_vk.width+x)*4];
+			for(unsigned int channel=0;channel<4;++channel)
+				if(std::abs(int(pixel[channel])-int(expected[channel]*255))>3) { ++wrong;break; }
+		}
+		char line[128];snprintf(line,sizeof(line),"native horizontal tie order%u: pixels%u wrong%u\n",order,checked,wrong);
+		ReportAppend(report,reportSize,line);if(wrong || !checked) ++failures;
+		PsyX_Vk_GameBeginFrame();
+		if(PsyX_Native_GetPickResult(&pick)!=PSYX_NATIVE_OK || !pick.hit || pick.identity!=instances[1].identity) ++failures;
+	}
+	// A truly nearer horizontal plane must win even against authored paint bias.
+	const unsigned int paintSlot=instances[0].identity==702 ? 0 : 1;
+	PsyX_Native_DestroyMesh(instances[paintSlot].mesh);
+	for(size_t v=0;v<paintVertices.size();++v) memcpy(paintVertices[v].color,white,sizeof(white));
+	paintMesh.vertices=paintVertices.data();paintMesh.indices=paintIndices.data();paintMesh.material=paint;paintMesh.depthLayer=1;
+	if(PsyX_Native_CreateMesh(&paintMesh,&instances[paintSlot].mesh)!=PSYX_NATIVE_PENDING) return failures+1;
+	for(unsigned int nearer=0;nearer<2;++nearer)
+	for(unsigned int order=0;order<2;++order)
+	{
+		snapshot.instanceCount=nearer ? 3 : 2;
+		if(order) std::swap(instances[0],instances[1]);
+		for(unsigned int sample=0;sample<2;++sample)
+		{
+			int width=0,height=0;SDL_GetWindowSize(g_vk.window,&width,&height);
+			PsyX_Native_RequestPick(width*(sample ? 55 : 45)/100,height/2);PsyXNativePickResult pick={};
+			if(!NativeTestFrame(snapshot,0,pixels,report,reportSize)) { ++failures;continue; }
+			PsyX_Vk_GameBeginFrame();
+			const float* expected=nearer ? green : sample ? red : blue;
+			if(!PsxCheckPixel(pixels.data(),g_vk.width,g_vk.height,g_vk.width*(sample ? 55 : 45)/100,g_vk.height/2,
+				expected,3,"horizontal paint/hole/physical occluder",report,reportSize) ||
+				PsyX_Native_GetPickResult(&pick)!=PSYX_NATIVE_OK || !pick.hit || pick.identity!=(nearer ? 703u : sample ? 702u : 701u)) ++failures;
+		}
+	}
+	PsyX_Native_ResetScene();PsyX_Vk_GameBeginFrame();PsyXNativeStats stats;PsyX_Native_GetStats(&stats);
+	if(stats.ownedBytes || stats.ownedMaterialBytes || stats.retiringMeshes || stats.retiringMaterials) ++failures;
+	ReportAppend(report,reportSize,failures ? "native horizontal plane/ties/paint/alpha/occlusion/IDs/retirement FAIL\n" :
+		"native horizontal plane/ties/paint/alpha/occlusion/IDs/two orders/retirement PASS\n");
+	return failures;
+}
+
 static int NativeTestCoplanar(PsyXNativeSnapshot snapshot, char* report, int reportSize)
 {
 	snapshot.sceneGeneration=PsyX_Native_ResetScene(); PsyX_Vk_GameBeginFrame();
@@ -820,6 +914,7 @@ int PsyX_Vk_NativeSelfTest(char* report, int reportSize)
 	failures += NativeTestBackdrop(snapshot, report, reportSize);
 	failures += NativeTestPicking(snapshot, report, reportSize);
 	failures += NativeTestLargeOrigin(snapshot, report, reportSize);
+	failures += NativeTestHorizontal(snapshot, report, reportSize);
 	failures += NativeTestCoplanar(snapshot, report, reportSize);
 	failures += NativeTestUploadFailure(snapshot, report, reportSize);
 	PsyX_Native_SetRequested(0);

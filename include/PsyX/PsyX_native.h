@@ -115,7 +115,8 @@ typedef struct PsyXNativeInstance
 typedef struct PsyXNativeView
 {
 	float view[16];
-	float projection[16]; /* RH -Z; Vulkan depth 0..1; positive viewport/Y flip */
+	float projection[16]; /* RH -Z; Vulkan depth 0..1; positive viewport/Y flip.
+	                       * projection*view must be finite and invertible. */
 	float cameraPosition[3];
 	float nearPlane;
 	float farPlane;

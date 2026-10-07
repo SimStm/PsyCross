@@ -3,7 +3,7 @@ layout(location=0) in vec3 position;
 layout(location=1) in vec3 normal;
 layout(location=2) in vec2 uv;
 layout(location=3) in vec4 color;
-layout(push_constant) uniform NativeDraw { mat4 mvp; vec4 tint; uint encodeSRGB; float alphaCutoff; uint pickId; } pc;
+layout(push_constant) uniform NativeDraw { mat4 mvp; vec4 tint; uint encodeSRGB; float alphaCutoff; uint pickId; vec4 depthPlane; } pc;
 layout(location=0) out vec4 vertexColor;
 layout(location=1) out vec3 sourceNormal;
 layout(location=2) out vec2 sourceUV;
