@@ -8,11 +8,10 @@ extern "C" {
 #endif
 
 /*
- * Experimental native-Vulkan backend for the modern mesh scene (renderer
- * roadmap R7). It owns an SDL window and a swapchain and renders the same
- * mesh/material/light description the OpenGL modern path uses. The legacy PSX
- * renderer is not ported here; this slice exists to validate the second backend
- * for the modern scene, including presentation, resize, readback and ImGui.
+ * Sole desktop Vulkan device/window/swapchain/presentation owner. It serves
+ * the legacy PSX adapter, existing modern mesh experiments and the opt-in R01
+ * unlit indexed native contributor declared in PsyX_native.h. Native depth
+ * remains independent of PSX projection; no second presenter is introduced.
  *
  * The module is inert on platforms without a delivered Vulkan loader: every
  * entry point degrades to a no-op or a failure result.
@@ -239,6 +238,9 @@ struct SDL_Window* PsyX_Vk_GetSDLWindow(void);
    values the OpenGL shader maths produces. Returns 1 on success and writes a
    short human-readable report. */
 int PsyX_Vk_GameSelfTest(char* report, int reportSize);
+
+/* Native indexed camera/depth/composition and fence retirement GPU readback. */
+int PsyX_Vk_NativeSelfTest(char* report, int reportSize);
 
 #ifdef __cplusplus
 }

@@ -1,0 +1,219 @@
+#include "PsyX_NativeScene.h"
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <new>
+
+namespace
+{
+bool Finite(const float* values, unsigned int count)
+{
+	for (unsigned int i = 0; i < count; ++i)
+		if (!std::isfinite(values[i])) return false;
+	return true;
+}
+
+bool Affine(const float matrix[16])
+{
+	return Finite(matrix, 16) && matrix[3] == 0.0f && matrix[7] == 0.0f &&
+		matrix[11] == 0.0f && matrix[15] == 1.0f;
+}
+
+bool OpaqueColor(const float color[4])
+{
+	return Finite(color, 4) && color[0] >= 0 && color[0] <= 1 &&
+		color[1] >= 0 && color[1] <= 1 && color[2] >= 0 && color[2] <= 1 && color[3] == 1;
+}
+
+bool ValidMesh(const PsyXNativeMeshDesc& desc)
+{
+	if (!desc.vertices || !desc.indices || desc.vertexCount < 3 || desc.indexCount < 3 ||
+		desc.indexCount % 3 || !Finite(desc.boundsMin, 3) || !Finite(desc.boundsMax, 3)) return false;
+	for (unsigned int axis = 0; axis < 3; ++axis)
+		if (desc.boundsMin[axis] > desc.boundsMax[axis]) return false;
+	for (uint32_t i = 0; i < desc.indexCount; ++i)
+		if (desc.indices[i] >= desc.vertexCount) return false;
+	for (uint32_t i = 0; i < desc.vertexCount; ++i)
+	{
+		const PsyXNativeVertex& v = desc.vertices[i];
+		if (!Finite(v.position, 3) || !Finite(v.normal, 3) || !Finite(v.uv, 2) ||
+			!OpaqueColor(v.color)) return false;
+		for (unsigned int axis = 0; axis < 3; ++axis)
+			if (v.position[axis] < desc.boundsMin[axis] || v.position[axis] > desc.boundsMax[axis]) return false;
+	}
+	return true;
+}
+}
+
+uint64_t PsyXNativeScene::Mesh::Bytes() const
+{
+	return uint64_t(vertices.size()) * sizeof(PsyXNativeVertex) + uint64_t(indices.size()) * sizeof(uint32_t);
+}
+
+PsyXNativeScene::PsyXNativeScene() : snapshotPending(false), requested(false), generation(1), ownedBytes(0), rejected(0), generationExhausted(false)
+{
+	memset(instances, 0, sizeof(instances));
+	memset(&snapshot, 0, sizeof(snapshot));
+	snapshot.instances = instances;
+}
+
+PsyXNativeResult PsyXNativeScene::Reject(PsyXNativeResult reason)
+{
+	if (rejected != std::numeric_limits<uint32_t>::max()) ++rejected;
+	return reason;
+}
+
+PsyXNativeResult PsyXNativeScene::Create(const PsyXNativeMeshDesc* desc, PsyXNativeMeshHandle* handle)
+{
+	if (handle) memset(handle, 0, sizeof(*handle));
+	if (!desc || !handle || desc->size != sizeof(*desc) || desc->version != PSYX_NATIVE_VERSION)
+		return Reject(PSYX_NATIVE_INVALID);
+	if (generationExhausted) return Reject(PSYX_NATIVE_OUT_OF_BUDGET);
+	// Check widened byte arithmetic before traversing caller spans or allocating.
+	const uint64_t bytes = uint64_t(desc->vertexCount) * sizeof(PsyXNativeVertex) + uint64_t(desc->indexCount) * sizeof(uint32_t);
+	if (bytes > PSYX_NATIVE_MAX_BYTES || ownedBytes > PSYX_NATIVE_MAX_BYTES - bytes)
+		return Reject(PSYX_NATIVE_OUT_OF_BUDGET);
+	if (!ValidMesh(*desc)) return Reject(PSYX_NATIVE_INVALID);
+	uint32_t slot = PSYX_NATIVE_MAX_MESHES;
+	for (uint32_t i = 0; i < PSYX_NATIVE_MAX_MESHES; ++i)
+		if (meshes[i].state == Empty) { slot = i; break; }
+	if (slot == PSYX_NATIVE_MAX_MESHES) return Reject(PSYX_NATIVE_OUT_OF_BUDGET);
+
+	// Build in temporary owned vectors. A failed allocation cannot publish half
+	// a mesh or charge the budget; exceptions never escape the C API.
+	try
+	{
+		std::vector<PsyXNativeVertex> vertices(desc->vertices, desc->vertices + desc->vertexCount);
+		std::vector<uint32_t> indices(desc->indices, desc->indices + desc->indexCount);
+		Mesh& mesh = meshes[slot];
+		mesh.vertices.swap(vertices);
+		mesh.indices.swap(indices);
+		++mesh.generation;
+		mesh.lastSubmission = 0;
+		mesh.state = Pending;
+		ownedBytes += bytes;
+		handle->slot = slot;
+		handle->generation = mesh.generation;
+	}
+	catch (const std::bad_alloc&) { return Reject(PSYX_NATIVE_OUT_OF_BUDGET); }
+	return PSYX_NATIVE_PENDING;
+}
+
+bool PsyXNativeScene::IsLive(PsyXNativeMeshHandle handle) const
+{
+	if (!handle.generation || handle.slot >= PSYX_NATIVE_MAX_MESHES) return false;
+	const Mesh& mesh = meshes[handle.slot];
+	return mesh.generation == handle.generation &&
+		(mesh.state == Pending || mesh.state == Ready || mesh.state == Failed);
+}
+
+PsyXNativeResult PsyXNativeScene::Destroy(PsyXNativeMeshHandle handle)
+{
+	if (!IsLive(handle)) return Reject(PSYX_NATIVE_STALE);
+	meshes[handle.slot].state = Retiring;
+	// An already published instance may refer to the invalidated handle. The
+	// recorder revalidates every reference rather than retaining a slot pointer.
+	return PSYX_NATIVE_OK;
+}
+
+PsyXNativeResult PsyXNativeScene::Publish(const PsyXNativeSnapshot* source)
+{
+	if (!source || source->size != sizeof(*source) || source->version != PSYX_NATIVE_VERSION)
+		return Reject(PSYX_NATIVE_INVALID);
+	if (generationExhausted || source->sceneGeneration != generation) return Reject(PSYX_NATIVE_STALE);
+	if (source->instanceCount > PSYX_NATIVE_MAX_INSTANCES) return Reject(PSYX_NATIVE_OUT_OF_BUDGET);
+	if (!source->instances || !source->instanceCount || !Affine(source->view.view) ||
+		!Finite(source->view.projection, 16) || !Finite(source->view.cameraPosition, 3) ||
+		!std::isfinite(source->view.nearPlane) || !std::isfinite(source->view.farPlane) ||
+		source->view.nearPlane <= 0 || source->view.farPlane <= source->view.nearPlane)
+		return Reject(PSYX_NATIVE_INVALID);
+	for (uint32_t i = 0; i < source->instanceCount; ++i)
+	{
+		if (!IsLive(source->instances[i].mesh)) return Reject(PSYX_NATIVE_STALE);
+		if (!Affine(source->instances[i].world) || !OpaqueColor(source->instances[i].tint))
+			return Reject(PSYX_NATIVE_INVALID);
+	}
+	// Commit only after every record passed. A rejected publish leaves the
+	// previous valid snapshot intact; recording still verifies mesh liveness.
+	memmove(instances, source->instances, source->instanceCount * sizeof(*instances));
+	snapshot = *source;
+	snapshot.instances = instances;
+	snapshotPending = true;
+	return PSYX_NATIVE_OK;
+}
+
+void PsyXNativeScene::SetRequested(int value)
+{
+	requested = value != 0;
+	if (!requested) ConsumeSnapshot();
+}
+
+uint64_t PsyXNativeScene::Reset()
+{
+	// Never wrap to an earlier scene identity. At exhaustion all future creates
+	// remain unavailable; this is preferable to accepting stale references.
+	if (generation != std::numeric_limits<uint64_t>::max()) ++generation;
+	else generationExhausted = true;
+	ConsumeSnapshot();
+	for (uint32_t i = 0; i < PSYX_NATIVE_MAX_MESHES; ++i)
+		if (meshes[i].state == Pending || meshes[i].state == Ready || meshes[i].state == Failed)
+			meshes[i].state = Retiring;
+	return generation;
+}
+
+bool PsyXNativeScene::CanReclaim(uint32_t slot, uint64_t completed) const
+{
+	return slot < PSYX_NATIVE_MAX_MESHES && meshes[slot].state == Retiring && meshes[slot].lastSubmission <= completed;
+}
+
+void PsyXNativeScene::Reclaim(uint32_t slot)
+{
+	Mesh& mesh = meshes[slot];
+	ownedBytes -= mesh.Bytes();
+	std::vector<PsyXNativeVertex>().swap(mesh.vertices);
+	std::vector<uint32_t>().swap(mesh.indices);
+	mesh.lastSubmission = 0;
+	mesh.state = mesh.generation == std::numeric_limits<uint32_t>::max() ? Exhausted : Empty;
+}
+
+void PsyXNativeScene::ConsumeSnapshot()
+{
+	snapshotPending = false;
+	snapshot.instanceCount = 0;
+}
+
+void PsyXNativeScene::GetStats(PsyXNativeStats* out) const
+{
+	memset(out, 0, sizeof(*out));
+	out->size = sizeof(*out);
+	out->version = PSYX_NATIVE_VERSION;
+	out->requested = requested;
+	out->reason = requested ? PSYX_NATIVE_NO_SNAPSHOT : PSYX_NATIVE_OK;
+	out->rejectedCalls = rejected;
+	out->ownedBytes = ownedBytes;
+	out->sceneGeneration = generation;
+	out->simulationTick = snapshot.simulationTick;
+	for (uint32_t i = 0; i < PSYX_NATIVE_MAX_MESHES; ++i)
+	{
+		if (meshes[i].state == Ready) ++out->residentMeshes;
+		if (meshes[i].state == Pending) ++out->pendingMeshes;
+		if (meshes[i].state == Retiring) ++out->retiringMeshes;
+	}
+}
+
+const char* PsyX_Native_ResultName(PsyXNativeResult result)
+{
+	switch (result)
+	{
+	case PSYX_NATIVE_OK: return "ready";
+	case PSYX_NATIVE_PENDING: return "upload pending";
+	case PSYX_NATIVE_UNSUPPORTED: return "unsupported backend or depth format";
+	case PSYX_NATIVE_INVALID: return "invalid descriptor";
+	case PSYX_NATIVE_STALE: return "stale handle or scene";
+	case PSYX_NATIVE_OUT_OF_BUDGET: return "resource budget exceeded";
+	case PSYX_NATIVE_UPLOAD_FAILED: return "GPU upload failed";
+	case PSYX_NATIVE_NO_SNAPSHOT: return "no native view this frame";
+	case PSYX_NATIVE_NO_BOUNDARY: return "no tested world/overlay boundary";
+	default: return "unknown result";
+	}
+}

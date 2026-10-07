@@ -1,18 +1,19 @@
 /*
- * Native Vulkan backend for the experimental modern scene (renderer roadmap
- * R7). See PsyX_vk.h for the public contract.
+ * Desktop Vulkan owner for the legacy PSX adapter, existing modern experiments
+ * and native world contributors. See PsyX_vk.h and PsyX_native.h.
  *
  * Design notes:
  * - The Vulkan loader is discovered at runtime through SDL, so the build needs
  *   the Vulkan headers only (no import library). On macOS SDL resolves
  *   MoltenVK, which is why this file has no platform-specific surface code.
  * - Single frame in flight with a fence wait per frame keeps the
- *   synchronisation simple and correct for a developer tool.
- * - Instance world transforms travel through push constants; the scene uniform
- *   buffer, shadow map and material textures share one descriptor set per mesh.
+ *   synchronisation explicit across the game and developer fixtures.
+ * - The R01 native contributor shares this device, command buffer and presenter,
+ *   has independent depth, and retires resources after the owner's fence.
  */
 
 #include "PsyX/PsyX_vk.h"
+#include "PsyX_NativeScene.h"
 
 #if !defined(PSX) && !defined(__ANDROID__) && !defined(__EMSCRIPTEN__)
 
@@ -662,6 +663,10 @@ static int g_supported = -1;
 static void FillMeshVertices(const PsyXModernMeshDesc* desc, VkVertex* vertices);
 static void BuildShadowMatrix(float out[16]);
 static void BuildShadowMatrixForExtent(float out[16], float extent);
+static void DestroyNativeTargets();
+static int CreateNativeTargets(uint32_t width, uint32_t height);
+static void NativeCompleted();
+static void NativeShutdown();
 
 // PsyCross logging is only wired up once the game has started, so the Vulkan
 // initialisation stages also go to a small side log for developer runs.
@@ -1070,6 +1075,7 @@ static VkFormat PickSurfaceFormat(VkFormat* outFormat, int* outSrgb)
 
 static void DestroySwapchainResources(void)
 {
+	DestroyNativeTargets();
 	for (int i = 0; i < g_vk.framebufferCount; i++)
 	{
 		if (g_vk.framebuffers[i])
@@ -1392,6 +1398,10 @@ static int CreateSwapchain(void)
 			return 0;
 	}
 	g_vk.modernFramebufferCount = (int)g_vk.swapchainImageCount;
+	// Native depth is independent of the legacy attachment. A failed opt-in
+	// target leaves the legacy swapchain usable and is reported on activation.
+	if (!CreateNativeTargets(width, height))
+		VkStage("native targets unavailable after swapchain creation");
 
 	// Fresh images have undefined contents, so force a clear on first use.
 	memset(g_vk.swapchainImageDrawn, 0, sizeof(g_vk.swapchainImageDrawn));
@@ -1500,6 +1510,8 @@ static VkShaderModule CreateShaderModuleFromSpirv(const unsigned int* words, uns
 		return VK_NULL_HANDLE;
 	return module;
 }
+
+#include "PsyX_VkNative.inl"
 
 static int CreatePipelines(void)
 {
@@ -2876,8 +2888,9 @@ void PsyX_Vk_GameBeginFrame(void)
 
 	// The caller refills the shared vertex buffer next, so make sure the GPU is
 	// done with the previous frame before those writes land.
-	if (g_vk.frameFence)
-		vkWaitForFences(g_vk.device, 1, &g_vk.frameFence, VK_TRUE, UINT64_MAX);
+	if (g_vk.frameFence && !VkOk(vkWaitForFences(g_vk.device, 1, &g_vk.frameFence, VK_TRUE, UINT64_MAX), "game frame fence"))
+		return;
+	NativeCompleted();
 
 	g_vk.psx.vertexSize = 0;
 	g_vk.psx.vertexCount = 0;
@@ -4534,7 +4547,7 @@ static void ResumeMainPass(VkCommandBuffer cmd)
 // queued inside a GR_SetOffscreenState render-to-VRAM run, and the main pass
 // records the complement so those draws are not also drawn on screen.
 static void RecordPsxDraws(VkCommandBuffer cmd, int offscreen, int frame,
-	int targetWidth, int targetHeight, int firstDraw = 0, int drawLimit = -1)
+	int targetWidth, int targetHeight, int firstDraw = 0, int drawLimit = -1, bool suppressColor = false)
 {
 	VkPsxState* psx = &g_vk.psx;
 	// A frame can carry VRAM writes without any draw (level loading); those
@@ -4566,10 +4579,6 @@ static void RecordPsxDraws(VkCommandBuffer cmd, int offscreen, int frame,
 		if ((draw->offscreen ? 1 : 0) != offscreen)
 			continue;
 
-		recordedDraws++;
-		if (!offscreen && draw->stencilMode)
-			stencilDraws++;
-
 		// The game rewrites VRAM between flushes; only the writes that happened
 		// before this draw may be visible to it.
 		if (!offscreen)
@@ -4577,6 +4586,13 @@ static void RecordPsxDraws(VkCommandBuffer cmd, int offscreen, int frame,
 			ApplyVramUploadsUpTo(cmd, draw->vramGeneration, &passClosed);
 			ResumeMainPass(cmd);
 		}
+		if (suppressColor)
+		{
+			++g_nativeVk.frame.suppressedWorldDraws;
+			continue;
+		}
+		++recordedDraws;
+		if (!offscreen && draw->stencilMode) ++stencilDraws;
 
 		const VkDescriptorSet set = draw->textureSet ? draw->textureSet : psx->dummySet;
 		const VkPipeline pipeline = offscreen
@@ -5226,6 +5242,8 @@ int PsyX_Vk_GameSelfTest(char* report, int reportSize)
 }
 
 // ---------------------------------------------------------------------------
+#include "PsyX_VkNativeTests.inl"
+
 // Textures
 
 static int UploadTexture(const unsigned char* pixels, int width, int height)
@@ -5903,6 +5921,11 @@ int PsyX_Vk_RenderFrame(void)
 	}
 	if (imageIndex >= g_vk.swapchainImageCount)
 		return 1;
+	NativeCompleted();
+	const PsyXNativeResult nativeReason = PrepareNativeFrame();
+	const bool nativeActive = g_nativeScene.requested && nativeReason == PSYX_NATIVE_OK;
+	g_nativeVk.frame.reason = nativeReason;
+	g_nativeVk.frame.effective = nativeActive;
 
 	UpdateSceneUbo();
 	if (g_vk.gameMode)
@@ -5970,7 +5993,7 @@ int PsyX_Vk_RenderFrame(void)
 	vkCmdSetScissor(g_vk.commandBuffer, 0, 1, &shadowScissor);
 
 	int drawCalls = 0;
-	if (g_vk.lights.shadowsEnabled)
+	if (g_vk.lights.shadowsEnabled && !nativeActive)
 	{
 		vkCmdBindPipeline(g_vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.shadowPipeline);
 
@@ -6119,12 +6142,12 @@ int PsyX_Vk_RenderFrame(void)
 	g_vk.mainPassBegin = mainBegin;
 	g_vk.mainPassImageIndex = imageIndex;
 	g_vk.mainPassOpen = 1;
-	const int overlayBegin = g_vk.gameMode && g_vk.gameModernEnabled &&
+	const int overlayBegin = g_vk.gameMode && (g_vk.gameModernEnabled || nativeActive) &&
 		g_vk.psx.modernSceneBoundary >= 0 ? g_vk.psx.modernSceneBoundary : g_vk.psx.drawCount;
 	g_vk.psx.lastDraws = 0;
 	g_vk.psx.lastStencilDraws = 0;
-	RecordPsxDraws(g_vk.commandBuffer, 0, g_vk.psx.frameIndex, g_vk.width, g_vk.height, 0, overlayBegin);
-	drawCalls += g_vk.psx.drawCount;
+	RecordPsxDraws(g_vk.commandBuffer, 0, g_vk.psx.frameIndex, g_vk.width, g_vk.height, 0, overlayBegin, nativeActive);
+	g_nativeVk.frame.legacyWorldDraws = g_vk.psx.lastDraws;
 
 	if (g_vk.gameMode)
 	{
@@ -6137,16 +6160,17 @@ int PsyX_Vk_RenderFrame(void)
 			vkCmdEndRenderPass(g_vk.commandBuffer);
 			g_vk.mainPassOpen = 0;
 		}
+		if (nativeActive) RecordNativeWorld(g_vk.commandBuffer, imageIndex);
 
 		const int sceneCopyReady = g_vk.sceneDepthImage != VK_NULL_HANDLE &&
 			g_vk.sceneColorImage != VK_NULL_HANDLE;
-		const int modernShadows = g_vk.gameModernEnabled && g_vk.lights.shadowsEnabled &&
+		const int modernShadows = !nativeActive && g_vk.gameModernEnabled && g_vk.lights.shadowsEnabled &&
 			g_vk.modernCameraValid && sceneCopyReady;
 		// Legacy lighting receptivity shares the composite pass (and therefore
 		// the scene copy) but is independent of the shadow toggle. The shader
 		// decides which published lights are sun and point, so any non-empty
 		// light set counts.
-		const int legacyLighting = g_vk.gameModernEnabled &&
+		const int legacyLighting = !nativeActive && g_vk.gameModernEnabled &&
 			g_vk.lights.legacyLightingScale > 0.0f && g_vk.lights.count > 0 &&
 			g_vk.modernCameraValid && sceneCopyReady;
 		const int modernComposite = modernShadows || legacyLighting;
@@ -6173,7 +6197,7 @@ int PsyX_Vk_RenderFrame(void)
 			g_vk.gameModernStats.legacyLightPass = legacyLighting ? 1 : 0;
 		}
 
-		drawCalls += RecordGameModernMeshes(g_vk.commandBuffer);
+		if (!nativeActive) drawCalls += RecordGameModernMeshes(g_vk.commandBuffer);
 		// Blend HUD, menus and lens flare over both kinds of geometry. Keeping
 		// them out of the scene copy also prevents their colour/depth from
 		// being interpreted as lit world surfaces.
@@ -6181,12 +6205,15 @@ int PsyX_Vk_RenderFrame(void)
 			RecordPsxDraws(g_vk.commandBuffer, 0, g_vk.psx.frameIndex,
 				g_vk.width, g_vk.height, overlayBegin);
 		ResumeMainPass(g_vk.commandBuffer);
+		g_nativeVk.frame.legacyOverlayDraws = g_vk.psx.lastDraws - g_nativeVk.frame.legacyWorldDraws;
+		drawCalls += g_vk.psx.lastDraws + g_nativeVk.frame.nativeDraws;
 	}
 	else
 	{
 		// A replayed VRAM write may have closed the pass; the gallery draws in
 		// the same loaded pass.
 		ResumeMainPass(g_vk.commandBuffer);
+		drawCalls += g_vk.psx.lastDraws;
 
 		vkCmdBindPipeline(g_vk.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, g_vk.pbrPipeline);
 
@@ -6335,6 +6362,7 @@ int PsyX_Vk_RenderFrame(void)
 		return 0;
 	}
 
+	NativeSubmitted();
 	VkPresentInfoKHR present;
 	memset(&present, 0, sizeof(present));
 	present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -6983,6 +7011,7 @@ void PsyX_Vk_Shutdown(void)
 		return;
 
 	vkDeviceWaitIdle(g_vk.device);
+	NativeShutdown();
 
 #ifdef PSYX_VK_IMGUI
 	if (g_vk.imguiActive)
@@ -7080,6 +7109,26 @@ void PsyX_Vk_Shutdown(void)
 }
 
 #else // platform without Vulkan
+
+PsyXNativeResult PsyX_Native_CreateMesh(const PsyXNativeMeshDesc* desc, PsyXNativeMeshHandle* handle)
+{
+	(void)desc;
+	if (handle) { handle->slot = 0; handle->generation = 0; }
+	return PSYX_NATIVE_UNSUPPORTED;
+}
+PsyXNativeResult PsyX_Native_DestroyMesh(PsyXNativeMeshHandle handle) { (void)handle; return PSYX_NATIVE_UNSUPPORTED; }
+PsyXNativeResult PsyX_Native_Publish(const PsyXNativeSnapshot* snapshot) { (void)snapshot; return PSYX_NATIVE_UNSUPPORTED; }
+void PsyX_Native_SetRequested(int requested) { (void)requested; }
+uint64_t PsyX_Native_ResetScene(void) { return 0; }
+uint64_t PsyX_Native_GetSceneGeneration(void) { return 0; }
+void PsyX_Native_GetStats(PsyXNativeStats* stats)
+{
+	if (!stats) return;
+	*stats = PsyXNativeStats();
+	stats->size = sizeof(*stats);
+	stats->version = PSYX_NATIVE_VERSION;
+	stats->reason = PSYX_NATIVE_UNSUPPORTED;
+}
 
 int PsyX_Vk_IsSupported(void) { return 0; }
 int PsyX_Vk_Initialise(const PsyXVkConfig* config) { (void)config; return 0; }
@@ -7187,6 +7236,12 @@ int PsyX_Vk_GameSelfTest(char* report, int reportSize)
 {
 	if (report && reportSize > 0)
 		report[0] = 0;
+	return 0;
+}
+
+int PsyX_Vk_NativeSelfTest(char* report, int reportSize)
+{
+	if (report && reportSize > 0) report[0] = 0;
 	return 0;
 }
 
