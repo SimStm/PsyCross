@@ -9,7 +9,7 @@ extern "C" {
 
 /* R01 native world contributor. All calls belong to the render thread. No
  * Vulkan objects or borrowed game pointers cross this C boundary. */
-#define PSYX_NATIVE_VERSION 3u
+#define PSYX_NATIVE_VERSION 4u
 #define PSYX_NATIVE_MAX_MESHES 512u
 #define PSYX_NATIVE_MAX_INSTANCES 4096u
 #define PSYX_NATIVE_MAX_BYTES (32u * 1024u * 1024u)
@@ -77,12 +77,14 @@ typedef struct PsyXNativeMeshDesc
 	PsyXNativeMaterialHandle material; /* generation=0 selects analytic untextured */
 } PsyXNativeMeshDesc;
 
+typedef enum PsyXNativeLayer { PSYX_NATIVE_WORLD = 0, PSYX_NATIVE_BACKDROP = 1 } PsyXNativeLayer;
 typedef struct PsyXNativeInstance
 {
 	PsyXNativeMeshHandle mesh;
 	float world[16]; /* column-major affine local-to-world */
 	float tint[4]; /* linear RGB, alpha=1 */
 	uint64_t identity;
+	PsyXNativeLayer layer; /* backdrop ignores view translation, draws first with no depth test/write */
 } PsyXNativeInstance;
 
 typedef struct PsyXNativeView
@@ -129,6 +131,7 @@ typedef struct PsyXNativeStats
 	uint32_t pendingMaterials;
 	uint32_t retiringMaterials;
 	uint64_t ownedMaterialBytes;
+	uint32_t nativeBackdropDraws; /* subset of nativeDraws, excluded from world depth/lighting */
 } PsyXNativeStats;
 
 /* Pending is a successful owned CPU create, with a valid handle. GPU upload

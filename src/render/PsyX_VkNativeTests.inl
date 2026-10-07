@@ -81,8 +81,10 @@ static int NativeTestFrame(PsyXNativeSnapshot& snapshot, int legacyDepth,
 		}
 		PsyXNativeStats stats;
 		PsyX_Native_GetStats(&stats);
+		uint32_t backdrops=0;
+		for (uint32_t i=0; i<snapshot.instanceCount; ++i) if (snapshot.instances[i].layer==PSYX_NATIVE_BACKDROP) ++backdrops;
 		const int ok = expectedReason == PSYX_NATIVE_OK ?
-			(stats.effective && stats.nativeDraws == 1 && stats.legacyWorldDraws == 0 &&
+			(stats.effective && stats.nativeDraws == snapshot.instanceCount && stats.nativeBackdropDraws == backdrops && stats.legacyWorldDraws == 0 &&
 			stats.suppressedWorldDraws == 1 && stats.legacyOverlayDraws == 1) :
 			(!stats.effective && stats.reason == expectedReason && !stats.nativeDraws &&
 			!stats.suppressedWorldDraws && stats.legacyWorldDraws + stats.legacyOverlayDraws == 2);
@@ -99,6 +101,70 @@ static int NativeTestFrame(PsyXNativeSnapshot& snapshot, int legacyDepth,
 	}
 	ReportAppend(report, reportSize, "native frame never submitted FAIL\n");
 	return 0;
+}
+
+static int NativeTestBackdrop(PsyXNativeSnapshot snapshot, char* report, int reportSize)
+{
+	const float red[]={1,0,0,1}, green[]={0,1,0,1}, blue[]={0,0,1,1}, ui[]={248.0f/255,0,0,1};
+	snapshot.sceneGeneration=PsyX_Native_ResetScene();
+	PsyX_Vk_GameBeginFrame();
+	NativeTestIdentity(snapshot.view.view);
+	snapshot.view.projection[0]=1; snapshot.view.projection[5]=-1;
+	PsyXNativeInstance instances[2]={}; // Deliberately world first in the producer array.
+	for (unsigned int item=0; item<2; ++item)
+	{
+		NativeTestIdentity(instances[item].world);
+		for (unsigned int channel=0; channel<4; ++channel) instances[item].tint[channel]=1;
+		instances[item].layer=item ? PSYX_NATIVE_BACKDROP : PSYX_NATIVE_WORLD;
+		std::vector<PsyXNativeVertex> vertices;
+		std::vector<uint32_t> indices;
+		const float extent=item ? .95f : .2f;
+		if (item)
+		{
+			NativeTestRectangle(vertices,indices,-extent,-extent,0,extent,4,green,0);
+			NativeTestRectangle(vertices,indices,0,-extent,extent,extent,4,blue,0);
+		}
+		else NativeTestRectangle(vertices,indices,-extent,-extent,extent,extent,8,red,0);
+		PsyXNativeMeshDesc mesh={};
+		mesh.size=sizeof(mesh); mesh.version=PSYX_NATIVE_VERSION;
+		mesh.vertices=vertices.data(); mesh.vertexCount=uint32_t(vertices.size());
+		mesh.indices=indices.data(); mesh.indexCount=uint32_t(indices.size());
+		for (unsigned int axis=0; axis<3; ++axis) { mesh.boundsMin[axis]=-8; mesh.boundsMax[axis]=8; }
+		if (PsyX_Native_CreateMesh(&mesh,&instances[item].mesh)!=PSYX_NATIVE_PENDING) return 1;
+	}
+	snapshot.instances=instances; snapshot.instanceCount=2;
+	std::vector<unsigned char> pixels;
+	int failures=0;
+	for (unsigned int translated=0; translated<2; ++translated)
+	{
+		snapshot.view.view[12]=translated ? 4.0f : 0.0f;
+		if (!NativeTestFrame(snapshot,0,pixels,report,reportSize)) { ++failures; continue; }
+		const int worldX=translated ? g_vk.width*3/4 : g_vk.width/2;
+		if (!PsxCheckPixel(pixels.data(),g_vk.width,g_vk.height,worldX,g_vk.height/2,red,3,
+			"farther world survives nearer backdrop without depth write",report,reportSize)) ++failures;
+		if (!PsxCheckPixel(pixels.data(),g_vk.width,g_vk.height,g_vk.width/4,g_vk.height/2,green,3,
+			"original backdrop ignores camera world translation",report,reportSize)) ++failures;
+		if (translated && !PsxCheckPixel(pixels.data(),g_vk.width,g_vk.height,g_vk.width/2-5,g_vk.height/2,green,3,
+			"world moves while backdrop stays fixed",report,reportSize)) ++failures;
+		if (!PsxCheckPixel(pixels.data(),g_vk.width,g_vk.height,32,32,ui,3,"original UI survives backdrop",report,reportSize)) ++failures;
+	}
+	NativeTestIdentity(snapshot.view.view);
+	snapshot.view.view[0]=snapshot.view.view[5]=0;
+	snapshot.view.view[1]=1; snapshot.view.view[4]=-1; // Rotate the copied source geometry90 degrees.
+	if (!NativeTestFrame(snapshot,0,pixels,report,reportSize)) ++failures;
+	else
+	{
+		if (!PsxCheckPixel(pixels.data(),g_vk.width,g_vk.height,g_vk.width/2,g_vk.height*3/4,green,3,
+			"backdrop source geometry follows camera rotation",report,reportSize)) ++failures;
+		if (!PsxCheckPixel(pixels.data(),g_vk.width,g_vk.height,g_vk.width/2,g_vk.height/4,blue,3,
+			"rotated backdrop preserves original artwork correspondence",report,reportSize)) ++failures;
+	}
+	PsyX_Native_ResetScene(); PsyX_Vk_GameBeginFrame();
+	PsyXNativeStats stats; PsyX_Native_GetStats(&stats);
+	if (stats.ownedBytes || stats.retiringMeshes || stats.residentMeshes) ++failures;
+	ReportAppend(report,reportSize,failures ? "native backdrop order/depth/translation/retirement FAIL\n" :
+		"native backdrop order/depth/translation/retirement ok\n");
+	return failures;
 }
 
 static int NativeTestUploadFailure(PsyXNativeSnapshot snapshot, char* report, int reportSize)
@@ -387,6 +453,7 @@ int PsyX_Vk_NativeSelfTest(char* report, int reportSize)
 	if (stats.residentMeshes || stats.pendingMeshes || stats.retiringMeshes || stats.ownedBytes) ++failures;
 	else ReportAppend(report, reportSize, "eight reloads leave zero owned meshes/bytes ok\n");
 	failures += NativeTestMaterials(snapshot, background, report, reportSize);
+	failures += NativeTestBackdrop(snapshot, report, reportSize);
 	failures += NativeTestUploadFailure(snapshot, report, reportSize);
 	PsyX_Native_SetRequested(0);
 	// No native snapshot or requested mode: the original renderer remains usable.

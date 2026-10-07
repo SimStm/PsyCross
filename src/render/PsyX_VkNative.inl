@@ -33,7 +33,7 @@ static struct
 	VkDescriptorPool materialPool;
 	VkRenderPass pass;
 	VkPipelineLayout layout;
-	VkPipeline pipelines[2];
+	VkPipeline pipelines[4]; // layer*2 + explicit cull policy
 	VkImage depth;
 	VkDeviceMemory depthMemory;
 	VkImageView depthView;
@@ -231,11 +231,13 @@ static int CreateNativePipeline()
 	info.layout = g_nativeVk.layout;
 	info.renderPass = g_nativeVk.pass;
 	int ok = vertex && fragment;
-	for (unsigned int cull = 0; cull < 2 && ok; ++cull)
+	for (unsigned int pipeline = 0; pipeline < 4 && ok; ++pipeline)
 	{
+		const unsigned int cull = pipeline%2;
+		depth.depthTestEnable = depth.depthWriteEnable = pipeline/2 == PSYX_NATIVE_WORLD ? VK_TRUE : VK_FALSE;
 		raster.cullMode = cull == PSYX_NATIVE_CULL_NONE ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT;
 		ok = VkOk(vkCreateGraphicsPipelines(g_vk.device, VK_NULL_HANDLE, 1, &info, NULL,
-			&g_nativeVk.pipelines[cull]), "native unlit/cutout pipeline");
+			&g_nativeVk.pipelines[pipeline]), "native world/backdrop pipeline");
 	}
 	if (vertex) vkDestroyShaderModule(g_vk.device, vertex, NULL);
 	if (fragment) vkDestroyShaderModule(g_vk.device, fragment, NULL);
@@ -244,10 +246,10 @@ static int CreateNativePipeline()
 
 static void DestroyNativePipeline()
 {
-	for (unsigned int cull = 0; cull < 2; ++cull)
+	for (unsigned int pipeline = 0; pipeline < 4; ++pipeline)
 	{
-		if (g_nativeVk.pipelines[cull]) vkDestroyPipeline(g_vk.device, g_nativeVk.pipelines[cull], NULL);
-		g_nativeVk.pipelines[cull] = VK_NULL_HANDLE;
+		if (g_nativeVk.pipelines[pipeline]) vkDestroyPipeline(g_vk.device, g_nativeVk.pipelines[pipeline], NULL);
+		g_nativeVk.pipelines[pipeline] = VK_NULL_HANDLE;
 	}
 	if (g_nativeVk.layout) vkDestroyPipelineLayout(g_vk.device, g_nativeVk.layout, NULL);
 	if (g_nativeVk.pass) vkDestroyRenderPass(g_vk.device, g_nativeVk.pass, NULL);
@@ -356,22 +358,29 @@ static void RecordNativeWorld(VkCommandBuffer cmd, uint32_t imageIndex)
 	vkCmdSetViewport(cmd, 0, 1, &viewport);
 	vkCmdSetScissor(cmd, 0, 1, &scissor);
 	VkPipeline activePipeline = VK_NULL_HANDLE;
-	float viewProjection[16];
-	NativeMultiply(viewProjection, g_nativeScene.snapshot.view.projection, g_nativeScene.snapshot.view.view);
+	float viewProjection[2][16], backdropView[16];
+	memcpy(backdropView, g_nativeScene.snapshot.view.view, sizeof(backdropView));
+	backdropView[12] = backdropView[13] = backdropView[14] = 0;
+	NativeMultiply(viewProjection[PSYX_NATIVE_WORLD], g_nativeScene.snapshot.view.projection, g_nativeScene.snapshot.view.view);
+	NativeMultiply(viewProjection[PSYX_NATIVE_BACKDROP], g_nativeScene.snapshot.view.projection, backdropView);
+	const PsyXNativeLayer order[] = { PSYX_NATIVE_BACKDROP, PSYX_NATIVE_WORLD };
+	for (unsigned int pass = 0; pass < 2; ++pass)
 	for (uint32_t i = 0; i < g_nativeScene.snapshot.instanceCount; ++i)
 	{
 		const PsyXNativeInstance& instance = g_nativeScene.instances[i];
+		if (instance.layer != order[pass]) continue;
 		PsyXNativeScene::Mesh& source = g_nativeScene.meshes[instance.mesh.slot];
 		const VkNativeMesh& mesh = g_nativeVk.meshes[instance.mesh.slot];
 		struct { float mvp[16]; float tint[4]; uint32_t encodeSRGB; float alphaCutoff; } push;
-		NativeMultiply(push.mvp, viewProjection, instance.world);
+		NativeMultiply(push.mvp, viewProjection[instance.layer], instance.world);
 		memcpy(push.tint, instance.tint, sizeof(push.tint));
 		push.encodeSRGB = g_vk.srgbOutput ? 0 : 1;
 		const bool textured = source.material.generation != 0;
 		const unsigned int cull = textured ? g_nativeScene.materials[source.material.slot].cull : PSYX_NATIVE_CULL_BACK;
-		if (activePipeline != g_nativeVk.pipelines[cull])
+		const unsigned int pipeline = unsigned(instance.layer)*2+cull;
+		if (activePipeline != g_nativeVk.pipelines[pipeline])
 		{
-			activePipeline = g_nativeVk.pipelines[cull];
+			activePipeline = g_nativeVk.pipelines[pipeline];
 			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, activePipeline);
 		}
 		push.alphaCutoff = textured ? g_nativeScene.materials[source.material.slot].alphaCutoff : 0;
@@ -383,6 +392,7 @@ static void RecordNativeWorld(VkCommandBuffer cmd, uint32_t imageIndex)
 		vkCmdBindIndexBuffer(cmd, mesh.indices, 0, VK_INDEX_TYPE_UINT32);
 		vkCmdDrawIndexed(cmd, uint32_t(source.indices.size()), 1, 0, 0, 0);
 		++g_nativeVk.frame.nativeDraws;
+		if (instance.layer == PSYX_NATIVE_BACKDROP) ++g_nativeVk.frame.nativeBackdropDraws;
 	}
 	vkCmdEndRenderPass(cmd);
 }
@@ -444,6 +454,7 @@ void PsyX_Native_GetStats(PsyXNativeStats* stats)
 	stats->effective = g_nativeVk.frame.effective;
 	stats->reason = g_nativeVk.frame.reason;
 	stats->nativeDraws = g_nativeVk.frame.nativeDraws;
+	stats->nativeBackdropDraws = g_nativeVk.frame.nativeBackdropDraws;
 	stats->legacyWorldDraws = g_nativeVk.frame.legacyWorldDraws;
 	stats->legacyOverlayDraws = g_nativeVk.frame.legacyOverlayDraws;
 	stats->suppressedWorldDraws = g_nativeVk.frame.suppressedWorldDraws;

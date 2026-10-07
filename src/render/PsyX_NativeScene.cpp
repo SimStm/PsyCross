@@ -135,7 +135,8 @@ PsyXNativeResult PsyXNativeScene::Publish(const PsyXNativeSnapshot* source)
 		if (!IsLive(source->instances[i].mesh)) return Reject(PSYX_NATIVE_STALE);
 		const PsyXNativeMaterialHandle material = meshes[source->instances[i].mesh.slot].material;
 		if (material.generation && !IsMaterialLive(material)) return Reject(PSYX_NATIVE_STALE);
-		if (!Affine(source->instances[i].world) || !OpaqueColor(source->instances[i].tint))
+		if (!Affine(source->instances[i].world) || !OpaqueColor(source->instances[i].tint) ||
+			(source->instances[i].layer != PSYX_NATIVE_WORLD && source->instances[i].layer != PSYX_NATIVE_BACKDROP))
 			return Reject(PSYX_NATIVE_INVALID);
 	}
 	// Commit only after every record passed. A rejected publish leaves the
