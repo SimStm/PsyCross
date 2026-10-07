@@ -50,7 +50,7 @@ uint64_t PsyXNativeScene::Mesh::Bytes() const
 	return uint64_t(vertices.size()) * sizeof(PsyXNativeVertex) + uint64_t(indices.size()) * sizeof(uint32_t);
 }
 
-PsyXNativeScene::PsyXNativeScene() : snapshotPending(false), requested(false), generation(1), ownedBytes(0), rejected(0), generationExhausted(false)
+PsyXNativeScene::PsyXNativeScene() : snapshotPending(false), requested(false), generation(1), ownedBytes(0), ownedMaterialBytes(0), rejected(0), generationExhausted(false)
 {
 	memset(instances, 0, sizeof(instances));
 	memset(&snapshot, 0, sizeof(snapshot));
@@ -74,6 +74,8 @@ PsyXNativeResult PsyXNativeScene::Create(const PsyXNativeMeshDesc* desc, PsyXNat
 	if (bytes > PSYX_NATIVE_MAX_BYTES || ownedBytes > PSYX_NATIVE_MAX_BYTES - bytes)
 		return Reject(PSYX_NATIVE_OUT_OF_BUDGET);
 	if (!ValidMesh(*desc)) return Reject(PSYX_NATIVE_INVALID);
+	if (desc->material.generation && !IsMaterialLive(desc->material)) return Reject(PSYX_NATIVE_STALE);
+	if (!desc->material.generation && desc->material.slot) return Reject(PSYX_NATIVE_INVALID);
 	uint32_t slot = PSYX_NATIVE_MAX_MESHES;
 	for (uint32_t i = 0; i < PSYX_NATIVE_MAX_MESHES; ++i)
 		if (meshes[i].state == Empty) { slot = i; break; }
@@ -90,6 +92,7 @@ PsyXNativeResult PsyXNativeScene::Create(const PsyXNativeMeshDesc* desc, PsyXNat
 		mesh.indices.swap(indices);
 		++mesh.generation;
 		mesh.lastSubmission = 0;
+		mesh.material = desc->material;
 		mesh.state = Pending;
 		ownedBytes += bytes;
 		handle->slot = slot;
@@ -130,6 +133,8 @@ PsyXNativeResult PsyXNativeScene::Publish(const PsyXNativeSnapshot* source)
 	for (uint32_t i = 0; i < source->instanceCount; ++i)
 	{
 		if (!IsLive(source->instances[i].mesh)) return Reject(PSYX_NATIVE_STALE);
+		const PsyXNativeMaterialHandle material = meshes[source->instances[i].mesh.slot].material;
+		if (material.generation && !IsMaterialLive(material)) return Reject(PSYX_NATIVE_STALE);
 		if (!Affine(source->instances[i].world) || !OpaqueColor(source->instances[i].tint))
 			return Reject(PSYX_NATIVE_INVALID);
 	}
@@ -158,6 +163,9 @@ uint64_t PsyXNativeScene::Reset()
 	for (uint32_t i = 0; i < PSYX_NATIVE_MAX_MESHES; ++i)
 		if (meshes[i].state == Pending || meshes[i].state == Ready || meshes[i].state == Failed)
 			meshes[i].state = Retiring;
+	for (uint32_t i = 0; i < PSYX_NATIVE_MAX_MATERIALS; ++i)
+		if (materials[i].state == Pending || materials[i].state == Ready || materials[i].state == Failed)
+			materials[i].state = Retiring;
 	return generation;
 }
 
@@ -173,6 +181,7 @@ void PsyXNativeScene::Reclaim(uint32_t slot)
 	std::vector<PsyXNativeVertex>().swap(mesh.vertices);
 	std::vector<uint32_t>().swap(mesh.indices);
 	mesh.lastSubmission = 0;
+	mesh.material = PsyXNativeMaterialHandle();
 	mesh.state = mesh.generation == std::numeric_limits<uint32_t>::max() ? Exhausted : Empty;
 }
 
@@ -193,12 +202,77 @@ void PsyXNativeScene::GetStats(PsyXNativeStats* out) const
 	out->ownedBytes = ownedBytes;
 	out->sceneGeneration = generation;
 	out->simulationTick = snapshot.simulationTick;
+	out->ownedMaterialBytes = ownedMaterialBytes;
+	for (uint32_t i = 0; i < PSYX_NATIVE_MAX_MATERIALS; ++i)
+	{
+		if (materials[i].state == Ready) ++out->residentMaterials;
+		if (materials[i].state == Pending) ++out->pendingMaterials;
+		if (materials[i].state == Retiring) ++out->retiringMaterials;
+	}
 	for (uint32_t i = 0; i < PSYX_NATIVE_MAX_MESHES; ++i)
 	{
 		if (meshes[i].state == Ready) ++out->residentMeshes;
 		if (meshes[i].state == Pending) ++out->pendingMeshes;
 		if (meshes[i].state == Retiring) ++out->retiringMeshes;
 	}
+}
+
+PsyXNativeResult PsyXNativeScene::CreateMaterial(const PsyXNativeMaterialDesc* desc, PsyXNativeMaterialHandle* handle)
+{
+	if (handle) memset(handle, 0, sizeof(*handle));
+	if (!desc || !handle || desc->size != sizeof(*desc) || desc->version != PSYX_NATIVE_VERSION ||
+		!desc->rgba || !desc->width || !desc->height || desc->width > 4096 || desc->height > 4096 ||
+		(desc->filter != PSYX_NATIVE_NEAREST && desc->filter != PSYX_NATIVE_LINEAR) ||
+		!std::isfinite(desc->alphaCutoff) || desc->alphaCutoff < 0 || desc->alphaCutoff > 1)
+		return Reject(PSYX_NATIVE_INVALID);
+	if (generationExhausted) return Reject(PSYX_NATIVE_OUT_OF_BUDGET);
+	const uint64_t bytes = uint64_t(desc->width) * desc->height * 4;
+	if (desc->byteCount != bytes) return Reject(PSYX_NATIVE_INVALID);
+	if (bytes > PSYX_NATIVE_MAX_MATERIAL_BYTES || ownedMaterialBytes > PSYX_NATIVE_MAX_MATERIAL_BYTES - bytes)
+		return Reject(PSYX_NATIVE_OUT_OF_BUDGET);
+	uint32_t slot = PSYX_NATIVE_MAX_MATERIALS;
+	for (uint32_t i = 0; i < PSYX_NATIVE_MAX_MATERIALS; ++i)
+		if (materials[i].state == Empty) { slot = i; break; }
+	if (slot == PSYX_NATIVE_MAX_MATERIALS) return Reject(PSYX_NATIVE_OUT_OF_BUDGET);
+	try
+	{
+		std::vector<uint8_t> pixels(desc->rgba, desc->rgba + (size_t)bytes);
+		Material& material = materials[slot];
+		material.rgba.swap(pixels);
+		material.width = desc->width; material.height = desc->height;
+		material.filter = desc->filter; material.alphaCutoff = desc->alphaCutoff;
+		++material.generation;
+		material.lastSubmission = 0; material.state = Pending;
+		ownedMaterialBytes += bytes;
+		handle->slot = slot; handle->generation = material.generation;
+	}
+	catch (const std::bad_alloc&) { return Reject(PSYX_NATIVE_OUT_OF_BUDGET); }
+	return PSYX_NATIVE_PENDING;
+}
+bool PsyXNativeScene::IsMaterialLive(PsyXNativeMaterialHandle handle) const
+{
+	if (!handle.generation || handle.slot >= PSYX_NATIVE_MAX_MATERIALS) return false;
+	const Material& material = materials[handle.slot];
+	return material.generation == handle.generation &&
+		(material.state == Pending || material.state == Ready || material.state == Failed);
+}
+PsyXNativeResult PsyXNativeScene::DestroyMaterial(PsyXNativeMaterialHandle handle)
+{
+	if (!IsMaterialLive(handle)) return Reject(PSYX_NATIVE_STALE);
+	materials[handle.slot].state = Retiring;
+	return PSYX_NATIVE_OK;
+}
+bool PsyXNativeScene::CanReclaimMaterial(uint32_t slot, uint64_t completed) const
+{
+	return slot < PSYX_NATIVE_MAX_MATERIALS && materials[slot].state == Retiring && materials[slot].lastSubmission <= completed;
+}
+void PsyXNativeScene::ReclaimMaterial(uint32_t slot)
+{
+	Material& material = materials[slot];
+	ownedMaterialBytes -= material.rgba.size();
+	std::vector<uint8_t>().swap(material.rgba);
+	material.lastSubmission = 0; material.width = material.height = 0;
+	material.state = material.generation == std::numeric_limits<uint32_t>::max() ? Exhausted : Empty;
 }
 
 const char* PsyX_Native_ResultName(PsyXNativeResult result)

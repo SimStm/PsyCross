@@ -17,13 +17,30 @@ public:
 		uint64_t lastSubmission;
 		std::vector<PsyXNativeVertex> vertices;
 		std::vector<uint32_t> indices;
-		Mesh() : state(Empty), generation(0), lastSubmission(0) {}
+		PsyXNativeMaterialHandle material;
+		Mesh() : state(Empty), generation(0), lastSubmission(0), material() {}
 		uint64_t Bytes() const;
+	};
+	struct Material
+	{
+		State state;
+		uint32_t generation;
+		uint64_t lastSubmission;
+		uint32_t width, height;
+		PsyXNativeFilter filter;
+		float alphaCutoff;
+		std::vector<uint8_t> rgba;
+		Material() : state(Empty), generation(0), lastSubmission(0), width(0), height(0), filter(PSYX_NATIVE_NEAREST), alphaCutoff(0.5f) {}
 	};
 
 	PsyXNativeScene();
 	PsyXNativeResult Create(const PsyXNativeMeshDesc* desc, PsyXNativeMeshHandle* handle);
 	PsyXNativeResult Destroy(PsyXNativeMeshHandle handle);
+	PsyXNativeResult CreateMaterial(const PsyXNativeMaterialDesc* desc, PsyXNativeMaterialHandle* handle);
+	PsyXNativeResult DestroyMaterial(PsyXNativeMaterialHandle handle);
+	bool IsMaterialLive(PsyXNativeMaterialHandle handle) const;
+	bool CanReclaimMaterial(uint32_t slot, uint64_t completed) const;
+	void ReclaimMaterial(uint32_t slot);
 	PsyXNativeResult Publish(const PsyXNativeSnapshot* snapshot);
 	uint64_t Reset();
 	void SetRequested(int requested);
@@ -35,12 +52,14 @@ public:
 	PsyXNativeResult Reject(PsyXNativeResult reason);
 
 	Mesh meshes[PSYX_NATIVE_MAX_MESHES];
+	Material materials[PSYX_NATIVE_MAX_MATERIALS];
 	PsyXNativeInstance instances[PSYX_NATIVE_MAX_INSTANCES];
 	PsyXNativeSnapshot snapshot;
 	bool snapshotPending;
 	bool requested;
 	uint64_t generation;
 	uint64_t ownedBytes;
+	uint64_t ownedMaterialBytes;
 	uint32_t rejected;
 	bool generationExhausted;
 };

@@ -34,7 +34,8 @@ static void NativeTestRectangle(std::vector<PsyXNativeVertex>& vertices, std::ve
 }
 
 static int NativeTestFrame(PsyXNativeSnapshot& snapshot, int legacyDepth,
-	std::vector<unsigned char>& pixels, char* report, int reportSize)
+	std::vector<unsigned char>& pixels, char* report, int reportSize, int legacyBilinear = 0,
+	PsyXNativeResult expectedReason = PSYX_NATIVE_OK)
 {
 	// Acquire can legitimately skip a frame while recreating an out-of-date
 	// swapchain. Accept only a fresh successful submission, never stale readback.
@@ -61,7 +62,7 @@ static int NativeTestFrame(PsyXNativeSnapshot& snapshot, int legacyDepth,
 		PsyX_Vk_GameSetBlendMode(PSYX_VK_BLEND_NONE);
 		PsyX_Vk_GameSetTexture(PSYX_VK_TEX_16BIT, 0);
 		PsyX_Vk_GameEnableDepth(legacyDepth);
-		PsyX_Vk_GameSetBilinear(0);
+		PsyX_Vk_GameSetBilinear(legacyBilinear);
 		PsyX_Vk_GameSetViewPort(0, 0, drawableWidth, drawableHeight);
 		PsyX_Vk_GameSetScissor(0, 0, 0, drawableWidth, drawableHeight);
 		PsyX_Vk_GameDrawTriangles(0, 2); // synthetic old sky/world: must be suppressed
@@ -80,13 +81,157 @@ static int NativeTestFrame(PsyXNativeSnapshot& snapshot, int legacyDepth,
 		}
 		PsyXNativeStats stats;
 		PsyX_Native_GetStats(&stats);
-		const int ok = stats.effective && stats.nativeDraws == 1 && stats.legacyWorldDraws == 0 &&
-			stats.suppressedWorldDraws == 1 && stats.legacyOverlayDraws == 1;
+		const int ok = expectedReason == PSYX_NATIVE_OK ?
+			(stats.effective && stats.nativeDraws == 1 && stats.legacyWorldDraws == 0 &&
+			stats.suppressedWorldDraws == 1 && stats.legacyOverlayDraws == 1) :
+			(!stats.effective && stats.reason == expectedReason && !stats.nativeDraws &&
+			!stats.suppressedWorldDraws && stats.legacyWorldDraws + stats.legacyOverlayDraws == 2);
 		ReportAppend(report, reportSize, ok ? "native/world/UI draw accounting ok\n" : "native draw accounting FAIL\n");
+		if (!ok)
+		{
+			char line[256];
+			snprintf(line, sizeof(line), "actual native stats: effective=%d reason=%d expected=%d native=%u world=%u suppressed=%u UI=%u\n",
+				stats.effective, stats.reason, expectedReason, stats.nativeDraws, stats.legacyWorldDraws,
+				stats.suppressedWorldDraws, stats.legacyOverlayDraws);
+			ReportAppend(report, reportSize, line);
+		}
 		return ok;
 	}
 	ReportAppend(report, reportSize, "native frame never submitted FAIL\n");
 	return 0;
+}
+
+static int NativeTestUploadFailure(PsyXNativeSnapshot snapshot, char* report, int reportSize)
+{
+	const float white[] = { 1, 1, 1, 1 };
+	std::vector<PsyXNativeVertex> vertices;
+	std::vector<uint32_t> indices;
+	NativeTestRectangle(vertices, indices, -.8f, -.8f, .8f, .8f, 4, white, 0);
+	snapshot.sceneGeneration = PsyX_Native_ResetScene();
+	PsyX_Vk_GameBeginFrame();
+	uint8_t artwork[] = { 255, 255, 255, 255 };
+	PsyXNativeMaterialDesc material = {};
+	material.size = sizeof(material); material.version = PSYX_NATIVE_VERSION;
+	material.rgba = artwork; material.width = material.height = 1; material.byteCount = 4;
+	PsyXNativeMeshDesc mesh = {};
+	mesh.size = sizeof(mesh); mesh.version = PSYX_NATIVE_VERSION;
+	mesh.vertices = vertices.data(); mesh.vertexCount = uint32_t(vertices.size());
+	mesh.indices = indices.data(); mesh.indexCount = uint32_t(indices.size());
+	for (int i = 0; i < 3; ++i) { mesh.boundsMin[i] = -4; mesh.boundsMax[i] = 4; }
+	PsyXNativeInstance instance = {};
+	NativeTestIdentity(instance.world);
+	for (int i = 0; i < 4; ++i) instance.tint[i] = 1;
+	if (PsyX_Native_CreateMaterial(&material, &mesh.material) != PSYX_NATIVE_PENDING ||
+		PsyX_Native_CreateMesh(&mesh, &instance.mesh) != PSYX_NATIVE_PENDING) return 1;
+	snapshot.instances = &instance; snapshot.instanceCount = 1;
+	NativeTestIdentity(snapshot.view.view);
+	snapshot.view.projection[0] = 1; snapshot.view.projection[5] = -1;
+	g_nativeTestHoldUpload = 1;
+	std::vector<unsigned char> pixels;
+	int failures = !NativeTestFrame(snapshot, 0, pixels, report, reportSize, 0, PSYX_NATIVE_UPLOAD_FAILED);
+	const float legacy[] = { 248.0f / 255, 0, 0, 1 };
+	if (pixels.empty() || !PsxCheckPixel(pixels.data(), g_vk.width, g_vk.height, g_vk.width / 2,
+		g_vk.height / 2, legacy, 3, "upload failure preserves original world pixels", report, reportSize)) ++failures;
+	VkNativeMaterial& gpu = g_nativeVk.materials[mesh.material.slot];
+	const VkImage retainedImage = gpu.image;
+	const VkBuffer retainedStaging = gpu.staging;
+	const VkCommandBuffer retainedCommand = gpu.uploadCommand;
+	const VkFence retainedFence = gpu.uploadFence;
+	if (!retainedImage || !retainedStaging || !retainedCommand || !retainedFence || !gpu.uploadSubmitted) ++failures;
+	if (PsyX_Native_DestroyMaterial(mesh.material) != PSYX_NATIVE_OK) ++failures;
+	PsyX_Vk_GameBeginFrame();
+	PsyXNativeStats stats;
+	PsyX_Native_GetStats(&stats);
+	if (stats.retiringMaterials != 1 || stats.ownedMaterialBytes != 4 || gpu.image != retainedImage ||
+		gpu.staging != retainedStaging || gpu.uploadCommand != retainedCommand || gpu.uploadFence != retainedFence) ++failures;
+	// The fault seam never pretends the real upload completed. Wait for its
+	// actual fence before restoring normal completion and releasing resources.
+	if (!retainedFence || vkWaitForFences(g_vk.device, 1, &retainedFence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) ++failures;
+	g_nativeTestHoldUpload = 0;
+	PsyX_Native_ResetScene();
+	PsyX_Vk_GameBeginFrame();
+	PsyX_Native_GetStats(&stats);
+	if (stats.retiringMaterials || stats.ownedMaterialBytes || stats.ownedBytes || gpu.image || gpu.staging ||
+		gpu.uploadCommand || gpu.uploadFence || gpu.uploadSubmitted) ++failures;
+	ReportAppend(report, reportSize, failures ? "submitted upload failure/fallback/retention FAIL\n" :
+		"submitted upload failure: legacy fallback, retained handles, fence recovery and zero owned bytes ok\n");
+	return failures;
+}
+
+static int NativeTestMaterials(PsyXNativeSnapshot snapshot, const float background[4], char* report, int reportSize)
+{
+	const float white[] = { 1, 1, 1, 1 };
+	const float black[] = { 0, 0, 0, 1 };
+	// 50% linear light encodes to sRGB 188, not artwork byte 128.
+	const float middle[] = { 188.0f / 255, 188.0f / 255, 188.0f / 255, 1 };
+	std::vector<PsyXNativeVertex> vertices;
+	std::vector<uint32_t> indices;
+	NativeTestRectangle(vertices, indices, -.8f, -.8f, .8f, .8f, 4, white, 0);
+	PsyXNativeMeshDesc mesh = {};
+	mesh.size = sizeof(mesh); mesh.version = PSYX_NATIVE_VERSION;
+	mesh.vertices = vertices.data(); mesh.vertexCount = uint32_t(vertices.size());
+	mesh.indices = indices.data(); mesh.indexCount = uint32_t(indices.size());
+	for (int i = 0; i < 3; ++i) { mesh.boundsMin[i] = -4; mesh.boundsMax[i] = 4; }
+	PsyXNativeMaterialDesc material = {};
+	material.size = sizeof(material); material.version = PSYX_NATIVE_VERSION;
+	material.width = 2; material.height = 1; material.byteCount = 8;
+	PsyXNativeInstance instance = {};
+	NativeTestIdentity(instance.world);
+	for (int i = 0; i < 4; ++i) instance.tint[i] = 1;
+	instance.identity = 2;
+	snapshot.instances = &instance; snapshot.instanceCount = 1;
+	NativeTestIdentity(snapshot.view.view);
+	snapshot.view.cameraPosition[0] = snapshot.view.cameraPosition[1] = snapshot.view.cameraPosition[2] = 0;
+	snapshot.view.projection[0] = 1; snapshot.view.projection[5] = -1;
+	std::vector<unsigned char> pixels, previous;
+	int failures = 0;
+	// Every cycle allocates, uploads, submits and retires a texture/descriptor.
+	for (int reload = 0; reload < 8; ++reload)
+	{
+		snapshot.sceneGeneration = PsyX_Native_ResetScene();
+		PsyX_Vk_GameBeginFrame();
+		uint8_t artwork[] = { 0, 0, 0, 255, 255, 255, 255, 255 };
+		material.rgba = artwork;
+		material.filter = (reload & 1) ? PSYX_NATIVE_LINEAR : PSYX_NATIVE_NEAREST;
+		material.alphaCutoff = .5f;
+		if (reload >= 4) artwork[3] = 0;
+		if (PsyX_Native_CreateMaterial(&material, &mesh.material) != PSYX_NATIVE_PENDING ||
+			PsyX_Native_CreateMesh(&mesh, &instance.mesh) != PSYX_NATIVE_PENDING)
+		{
+			ReportAppend(report, reportSize, "native material resource creation FAIL\n"); ++failures; break;
+		}
+		// Destroy the producer bytes before GPU upload: the owner must have copied.
+		memset(artwork, 127, sizeof(artwork));
+		for (int legacyBilinear = 0; legacyBilinear < 2; ++legacyBilinear)
+		{
+			if (!NativeTestFrame(snapshot, 0, pixels, report, reportSize, legacyBilinear)) { ++failures; continue; }
+			if (!PsxCheckPixel(pixels.data(), g_vk.width, g_vk.height, g_vk.width / 4, g_vk.height / 2,
+				reload >= 4 ? background : black, 3, reload >= 4 ? "native cutout reveals background" : "native owns original black texel",
+				report, reportSize)) ++failures;
+			if (!PsxCheckPixel(pixels.data(), g_vk.width, g_vk.height, g_vk.width * 3 / 4, g_vk.height / 2,
+				white, 3, "native white artwork texel", report, reportSize)) ++failures;
+			if ((reload & 1) && reload < 4 && !PsxCheckPixel(pixels.data(), g_vk.width, g_vk.height,
+				g_vk.width / 2, g_vk.height / 2, middle, 3, "native linear filtering in linear light", report, reportSize)) ++failures;
+			if (!legacyBilinear) previous = pixels;
+			else if (previous != pixels) { ReportAppend(report, reportSize, "legacy filter changes native artwork FAIL\n"); ++failures; }
+		}
+		PsyXNativeStats stats;
+		PsyX_Native_GetStats(&stats);
+		if (stats.residentMaterials != 1 || stats.pendingMaterials || stats.retiringMaterials || stats.ownedMaterialBytes != 8) ++failures;
+		if (PsyX_Native_DestroyMaterial(mesh.material) != PSYX_NATIVE_OK || PsyX_Native_Publish(&snapshot) != PSYX_NATIVE_STALE) ++failures;
+		PsyX_Native_GetStats(&stats);
+		if (stats.retiringMaterials != 1) ++failures;
+		PsyX_Vk_GameBeginFrame();
+		PsyX_Native_GetStats(&stats);
+		if (stats.residentMaterials || stats.retiringMaterials || stats.ownedMaterialBytes) ++failures;
+	}
+	PsyX_Native_ResetScene();
+	PsyX_Vk_GameBeginFrame();
+	PsyXNativeStats stats;
+	PsyX_Native_GetStats(&stats);
+	if (stats.residentMaterials || stats.pendingMaterials || stats.retiringMaterials || stats.ownedMaterialBytes || stats.ownedBytes) ++failures;
+	ReportAppend(report, reportSize, failures ? "native material/filter/cutout/retirement FAIL\n" : "eight material/filter/cutout/retirement cycles ok\n");
+	return failures;
 }
 
 int PsyX_Vk_NativeSelfTest(char* report, int reportSize)
@@ -231,6 +376,8 @@ int PsyX_Vk_NativeSelfTest(char* report, int reportSize)
 	PsyX_Native_GetStats(&stats);
 	if (stats.residentMeshes || stats.pendingMeshes || stats.retiringMeshes || stats.ownedBytes) ++failures;
 	else ReportAppend(report, reportSize, "eight reloads leave zero owned meshes/bytes ok\n");
+	failures += NativeTestMaterials(snapshot, background, report, reportSize);
+	failures += NativeTestUploadFailure(snapshot, report, reportSize);
 	PsyX_Native_SetRequested(0);
 	// No native snapshot or requested mode: the original renderer remains usable.
 	for (int requested = 0; requested < 2; ++requested)

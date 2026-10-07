@@ -9,10 +9,12 @@ extern "C" {
 
 /* R01 native world contributor. All calls belong to the render thread. No
  * Vulkan objects or borrowed game pointers cross this C boundary. */
-#define PSYX_NATIVE_VERSION 1u
+#define PSYX_NATIVE_VERSION 2u
 #define PSYX_NATIVE_MAX_MESHES 32u
 #define PSYX_NATIVE_MAX_INSTANCES 64u
 #define PSYX_NATIVE_MAX_BYTES (8u * 1024u * 1024u)
+#define PSYX_NATIVE_MAX_MATERIALS 32u
+#define PSYX_NATIVE_MAX_MATERIAL_BYTES (32u * 1024u * 1024u)
 
 typedef enum PsyXNativeResult
 {
@@ -33,6 +35,25 @@ typedef struct PsyXNativeMeshHandle
 	uint32_t generation; /* zero is invalid; slot alone is never an identity */
 } PsyXNativeMeshHandle;
 
+typedef struct PsyXNativeMaterialHandle
+{
+	uint32_t slot;
+	uint32_t generation;
+} PsyXNativeMaterialHandle;
+
+typedef enum PsyXNativeFilter { PSYX_NATIVE_NEAREST = 0, PSYX_NATIVE_LINEAR = 1 } PsyXNativeFilter;
+typedef struct PsyXNativeMaterialDesc
+{
+	uint32_t size;
+	uint32_t version;
+	const uint8_t* rgba; /* copied sRGB artwork; tightly packed width*height*4 */
+	uint32_t width;
+	uint32_t height;
+	uint64_t byteCount; /* actual supplied span; must match dimensions exactly */
+	PsyXNativeFilter filter;
+	float alphaCutoff; /* opaque/cutout slice; alpha does not imply blending */
+} PsyXNativeMaterialDesc;
+
 typedef struct PsyXNativeVertex
 {
 	float position[3];
@@ -51,6 +72,7 @@ typedef struct PsyXNativeMeshDesc
 	uint32_t indexCount; /* triangle list; copied before returning */
 	float boundsMin[3];
 	float boundsMax[3];
+	PsyXNativeMaterialHandle material; /* generation=0 selects analytic untextured */
 } PsyXNativeMeshDesc;
 
 typedef struct PsyXNativeInstance
@@ -101,12 +123,18 @@ typedef struct PsyXNativeStats
 	uint64_t submittedSerial;
 	uint64_t completedSerial;
 	uint64_t simulationTick;
+	uint32_t residentMaterials;
+	uint32_t pendingMaterials;
+	uint32_t retiringMaterials;
+	uint64_t ownedMaterialBytes;
 } PsyXNativeStats;
 
 /* Pending is a successful owned CPU create, with a valid handle. GPU upload
  * happens after the existing frame fence; query failures explicitly. */
 PsyXNativeResult PsyX_Native_CreateMesh(const PsyXNativeMeshDesc* desc, PsyXNativeMeshHandle* handle);
 PsyXNativeResult PsyX_Native_DestroyMesh(PsyXNativeMeshHandle handle);
+PsyXNativeResult PsyX_Native_CreateMaterial(const PsyXNativeMaterialDesc* desc, PsyXNativeMaterialHandle* handle);
+PsyXNativeResult PsyX_Native_DestroyMaterial(PsyXNativeMaterialHandle handle);
 PsyXNativeResult PsyX_Native_Publish(const PsyXNativeSnapshot* snapshot);
 void PsyX_Native_SetRequested(int requested);
 uint64_t PsyX_Native_ResetScene(void); /* invalidates all handles immediately */

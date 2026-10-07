@@ -84,6 +84,7 @@
 	X(vkCreateFence) \
 	X(vkDestroyFence) \
 	X(vkWaitForFences) \
+	X(vkGetFenceStatus) \
 	X(vkResetFences) \
 	X(vkCreateSemaphore) \
 	X(vkDestroySemaphore) \
@@ -118,6 +119,7 @@
 	X(vkCreateDescriptorPool) \
 	X(vkDestroyDescriptorPool) \
 	X(vkAllocateDescriptorSets) \
+	X(vkFreeDescriptorSets) \
 	X(vkResetDescriptorPool) \
 	X(vkUpdateDescriptorSets) \
 	X(vkCreateCommandPool) \
@@ -7010,7 +7012,12 @@ void PsyX_Vk_Shutdown(void)
 	if (!g_vk.initialised)
 		return;
 
-	vkDeviceWaitIdle(g_vk.device);
+	const VkResult idle = vkDeviceWaitIdle(g_vk.device);
+	if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST)
+	{
+		VkOk(idle, "shutdown device idle; resources retained for retry");
+		return;
+	}
 	NativeShutdown();
 
 #ifdef PSYX_VK_IMGUI
@@ -7117,6 +7124,13 @@ PsyXNativeResult PsyX_Native_CreateMesh(const PsyXNativeMeshDesc* desc, PsyXNati
 	return PSYX_NATIVE_UNSUPPORTED;
 }
 PsyXNativeResult PsyX_Native_DestroyMesh(PsyXNativeMeshHandle handle) { (void)handle; return PSYX_NATIVE_UNSUPPORTED; }
+PsyXNativeResult PsyX_Native_CreateMaterial(const PsyXNativeMaterialDesc* desc, PsyXNativeMaterialHandle* handle)
+{
+	(void)desc;
+	if (handle) { handle->slot = 0; handle->generation = 0; }
+	return PSYX_NATIVE_UNSUPPORTED;
+}
+PsyXNativeResult PsyX_Native_DestroyMaterial(PsyXNativeMaterialHandle handle) { (void)handle; return PSYX_NATIVE_UNSUPPORTED; }
 PsyXNativeResult PsyX_Native_Publish(const PsyXNativeSnapshot* snapshot) { (void)snapshot; return PSYX_NATIVE_UNSUPPORTED; }
 void PsyX_Native_SetRequested(int requested) { (void)requested; }
 uint64_t PsyX_Native_ResetScene(void) { return 0; }

@@ -10,10 +10,27 @@ struct VkNativeMesh
 	VkBuffer indices;
 	VkDeviceMemory indexMemory;
 };
+struct VkNativeMaterial
+{
+	VkImage image;
+	VkDeviceMemory memory;
+	VkImageView view;
+	VkSampler sampler;
+	VkDescriptorSet set;
+	VkBuffer staging;
+	VkDeviceMemory stagingMemory;
+	VkCommandBuffer uploadCommand;
+	VkFence uploadFence;
+	int uploadSubmitted;
+};
 
 static struct
 {
 	VkNativeMesh meshes[PSYX_NATIVE_MAX_MESHES];
+	VkNativeMaterial materials[PSYX_NATIVE_MAX_MATERIALS];
+	VkNativeMaterial white;
+	VkDescriptorSetLayout materialLayout;
+	VkDescriptorPool materialPool;
 	VkRenderPass pass;
 	VkPipelineLayout layout;
 	VkPipeline pipeline;
@@ -25,6 +42,8 @@ static struct
 	uint64_t completed;
 	PsyXNativeStats frame;
 } g_nativeVk;
+
+#include "PsyX_VkNativeMaterials.inl"
 
 static void DestroyNativeMesh(uint32_t slot)
 {
@@ -137,11 +156,14 @@ static int CreateNativePass()
 
 static int CreateNativePipeline()
 {
-	VkPushConstantRange push = { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 84 };
+	if (!PrepareNativeWhiteMaterial()) return 0;
+	VkPushConstantRange push = { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 88 };
 	VkPipelineLayoutCreateInfo layout = {};
 	layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
 	layout.pushConstantRangeCount = 1;
 	layout.pPushConstantRanges = &push;
+	layout.setLayoutCount = 1;
+	layout.pSetLayouts = &g_nativeVk.materialLayout;
 	if (!VkOk(vkCreatePipelineLayout(g_vk.device, &layout, NULL, &g_nativeVk.layout), "native pipeline layout")) return 0;
 	VkShaderModule vertex = CreateShaderModuleFromSpirv(native_vert_spv, native_vert_spv_size);
 	VkShaderModule fragment = CreateShaderModuleFromSpirv(native_frag_spv, native_frag_spv_size);
@@ -230,6 +252,7 @@ static void NativeCompleted()
 	// Called only after the owner's fence or device-idle succeeds. Persistent
 	// CPU payloads never require reads from GPU-mapped memory.
 	g_nativeVk.completed = g_nativeVk.submitted;
+	NativeMaterialsCompleted();
 	for (uint32_t slot = 0; slot < PSYX_NATIVE_MAX_MESHES; ++slot)
 	{
 		if (g_nativeScene.CanReclaim(slot, g_nativeVk.completed))
@@ -274,6 +297,14 @@ static PsyXNativeResult PrepareNativeFrame()
 		const PsyXNativeScene::State state = g_nativeScene.meshes[handle.slot].state;
 		if (state == PsyXNativeScene::Failed) return PSYX_NATIVE_UPLOAD_FAILED;
 		if (state != PsyXNativeScene::Ready) return PSYX_NATIVE_PENDING;
+		const PsyXNativeMaterialHandle material = g_nativeScene.meshes[handle.slot].material;
+		if (material.generation)
+		{
+			if (!g_nativeScene.IsMaterialLive(material)) return PSYX_NATIVE_STALE;
+			const PsyXNativeScene::State materialState = g_nativeScene.materials[material.slot].state;
+			if (materialState == PsyXNativeScene::Failed) return PSYX_NATIVE_UPLOAD_FAILED;
+			if (materialState != PsyXNativeScene::Ready) return PSYX_NATIVE_PENDING;
+		}
 	}
 	if (!g_nativeVk.pass && (!CreateNativePass() || !CreateNativePipeline()))
 	{
@@ -324,10 +355,14 @@ static void RecordNativeWorld(VkCommandBuffer cmd, uint32_t imageIndex)
 		const PsyXNativeInstance& instance = g_nativeScene.instances[i];
 		PsyXNativeScene::Mesh& source = g_nativeScene.meshes[instance.mesh.slot];
 		const VkNativeMesh& mesh = g_nativeVk.meshes[instance.mesh.slot];
-		struct { float mvp[16]; float tint[4]; uint32_t encodeSRGB; } push;
+		struct { float mvp[16]; float tint[4]; uint32_t encodeSRGB; float alphaCutoff; } push;
 		NativeMultiply(push.mvp, viewProjection, instance.world);
 		memcpy(push.tint, instance.tint, sizeof(push.tint));
 		push.encodeSRGB = g_vk.srgbOutput ? 0 : 1;
+		const bool textured = source.material.generation != 0;
+		push.alphaCutoff = textured ? g_nativeScene.materials[source.material.slot].alphaCutoff : 0;
+		const VkDescriptorSet descriptor = textured ? g_nativeVk.materials[source.material.slot].set : g_nativeVk.white.set;
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_nativeVk.layout, 0, 1, &descriptor, 0, NULL);
 		vkCmdPushConstants(cmd, g_nativeVk.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 		const VkDeviceSize offset = 0;
 		vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertices, &offset);
@@ -343,7 +378,11 @@ static void NativeSubmitted()
 	++g_nativeVk.submitted;
 	if (g_nativeVk.frame.effective)
 		for (uint32_t i = 0; i < g_nativeScene.snapshot.instanceCount; ++i)
-			g_nativeScene.meshes[g_nativeScene.instances[i].mesh.slot].lastSubmission = g_nativeVk.submitted;
+		{
+			PsyXNativeScene::Mesh& mesh = g_nativeScene.meshes[g_nativeScene.instances[i].mesh.slot];
+			mesh.lastSubmission = g_nativeVk.submitted;
+			if (mesh.material.generation) g_nativeScene.materials[mesh.material.slot].lastSubmission = g_nativeVk.submitted;
+		}
 	g_nativeVk.frame.submittedSerial = g_nativeVk.submitted;
 	g_nativeVk.frame.completedSerial = g_nativeVk.completed;
 	g_nativeScene.ConsumeSnapshot();
@@ -351,11 +390,17 @@ static void NativeSubmitted()
 
 static void NativeShutdown()
 {
+	// The owner has confirmed device idle (or loss). This proof also covers
+	// uploads submitted after the last ordinary frame fence was signalled.
+	for (uint32_t slot = 0; slot < PSYX_NATIVE_MAX_MATERIALS; ++slot)
+		g_nativeVk.materials[slot].uploadSubmitted = 0;
+	g_nativeVk.white.uploadSubmitted = 0;
 	g_nativeScene.Reset();
 	g_nativeScene.SetRequested(0);
 	NativeCompleted();
 	DestroyNativeTargets();
 	DestroyNativePipeline();
+	DestroyNativeMaterialDescriptors();
 	memset(&g_nativeVk, 0, sizeof(g_nativeVk));
 }
 
