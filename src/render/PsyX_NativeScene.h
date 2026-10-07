@@ -19,7 +19,8 @@ public:
 		std::vector<PsyXNativeVertex> vertices;
 		std::vector<uint32_t> indices;
 		PsyXNativeMaterialHandle material;
-		Mesh() : state(Empty), generation(0), lastSubmission(0), material() {}
+		uint32_t depthLayer;
+		Mesh() : state(Empty), generation(0), lastSubmission(0), material(), depthLayer(0) {}
 		uint64_t Bytes() const;
 	};
 	struct Material

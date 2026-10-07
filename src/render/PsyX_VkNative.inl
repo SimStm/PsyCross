@@ -227,6 +227,7 @@ static int CreateNativePipeline()
 	raster.cullMode = VK_CULL_MODE_BACK_BIT;
 	raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
 	raster.lineWidth = 1;
+	raster.depthBiasEnable = VK_TRUE;
 	VkPipelineMultisampleStateCreateInfo samples = {};
 	samples.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
 	samples.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
@@ -241,10 +242,10 @@ static int CreateNativePipeline()
 	blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
 	blend.attachmentCount = 2;
 	blend.pAttachments = attachments;
-	VkDynamicState dynamicStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+	VkDynamicState dynamicStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS };
 	VkPipelineDynamicStateCreateInfo dynamic = {};
 	dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-	dynamic.dynamicStateCount = 2;
+	dynamic.dynamicStateCount = 3;
 	dynamic.pDynamicStates = dynamicStates;
 	VkGraphicsPipelineCreateInfo info = {};
 	info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -519,6 +520,10 @@ static void RecordNativeWorld(VkCommandBuffer cmd, uint32_t imageIndex)
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_nativeVk.layout, 0, 1, &descriptor, 0, NULL);
 		vkCmdPushConstants(cmd, g_nativeVk.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 		const VkDeviceSize offset = 0;
+		// Only declared coplanar artwork gets a small D32 representable bias.
+		// Ordinary geometry and backdrop reset it; alpha/depth/ID share this draw.
+		// Zero clamp/slope needs no optional device feature or geometric offset.
+		vkCmdSetDepthBias(cmd, instance.layer == PSYX_NATIVE_WORLD ? -4.0f*source.depthLayer : 0.0f, 0.0f, 0.0f);
 		vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertices, &offset);
 		vkCmdBindIndexBuffer(cmd, mesh.indices, 0, VK_INDEX_TYPE_UINT32);
 		vkCmdDrawIndexed(cmd, uint32_t(source.indices.size()), 1, 0, 0, 0);

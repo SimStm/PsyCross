@@ -27,6 +27,7 @@ bool OpaqueColor(const float color[4])
 
 bool ValidMesh(const PsyXNativeMeshDesc& desc)
 {
+	if (desc.depthLayer > PSYX_NATIVE_MAX_DEPTH_LAYER) return false;
 	if (!desc.vertices || !desc.indices || desc.vertexCount < 3 || desc.indexCount < 3 ||
 		desc.indexCount % 3 || !Finite(desc.boundsMin, 3) || !Finite(desc.boundsMax, 3)) return false;
 	for (unsigned int axis = 0; axis < 3; ++axis)
@@ -93,6 +94,7 @@ PsyXNativeResult PsyXNativeScene::Create(const PsyXNativeMeshDesc* desc, PsyXNat
 		++mesh.generation;
 		mesh.lastSubmission = 0;
 		mesh.material = desc->material;
+		mesh.depthLayer = desc->depthLayer;
 		mesh.state = Pending;
 		ownedBytes += bytes;
 		handle->slot = slot;
@@ -207,6 +209,7 @@ void PsyXNativeScene::Reclaim(uint32_t slot)
 	std::vector<uint32_t>().swap(mesh.indices);
 	mesh.lastSubmission = 0;
 	mesh.material = PsyXNativeMaterialHandle();
+	mesh.depthLayer = 0;
 	mesh.state = mesh.generation == std::numeric_limits<uint32_t>::max() ? Exhausted : Empty;
 }
 

@@ -9,7 +9,8 @@ extern "C" {
 
 /* R01 native world contributor. All calls belong to the render thread. No
  * Vulkan objects or borrowed game pointers cross this C boundary. */
-#define PSYX_NATIVE_VERSION 8u
+#define PSYX_NATIVE_VERSION 9u
+#define PSYX_NATIVE_MAX_DEPTH_LAYER 8u
 #define PSYX_NATIVE_MAX_MESHES 512u
 #define PSYX_NATIVE_MAX_INSTANCES 4096u
 #define PSYX_NATIVE_MAX_BYTES (32u * 1024u * 1024u)
@@ -88,6 +89,7 @@ typedef struct PsyXNativeMeshDesc
 	float boundsMin[3];
 	float boundsMax[3];
 	PsyXNativeMaterialHandle material; /* generation=0 selects analytic untextured */
+	uint32_t depthLayer; /* 0 ordinary; 1..8 authored coplanar overlays, same color/pick depth */
 } PsyXNativeMeshDesc;
 
 typedef enum PsyXNativeLayer { PSYX_NATIVE_WORLD = 0, PSYX_NATIVE_BACKDROP = 1 } PsyXNativeLayer;

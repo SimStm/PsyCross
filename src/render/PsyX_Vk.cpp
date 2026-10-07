@@ -141,6 +141,7 @@
 	X(vkCmdDrawIndexed) \
 	X(vkCmdSetViewport) \
 	X(vkCmdSetScissor) \
+	X(vkCmdSetDepthBias) \
 	X(vkCmdSetBlendConstants) \
 	X(vkCmdPipelineBarrier) \
 	X(vkCmdCopyBufferToImage) \

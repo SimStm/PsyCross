@@ -107,6 +107,73 @@ static int NativeTestFrame(PsyXNativeSnapshot& snapshot, int legacyDepth,
 	return 0;
 }
 
+static int NativeTestCoplanar(PsyXNativeSnapshot snapshot, char* report, int reportSize)
+{
+	snapshot.sceneGeneration=PsyX_Native_ResetScene(); PsyX_Vk_GameBeginFrame();
+	NativeTestIdentity(snapshot.view.view);
+	snapshot.view.projection[0]=1; snapshot.view.projection[5]=-1;
+	const float white[]={1,1,1,1}, blue[]={0,0,1,1}, green[]={0,1,0,1}, red[]={1,0,0,1};
+	const uint8_t art[]={255,0,0,0, 255,0,0,255};
+	PsyXNativeMaterialDesc material={}; material.size=sizeof(material); material.version=PSYX_NATIVE_VERSION;
+	material.rgba=art; material.width=2; material.height=1; material.byteCount=8;
+	material.filter=PSYX_NATIVE_NEAREST; material.alphaCutoff=.5f; material.cull=PSYX_NATIVE_CULL_NONE;
+	PsyXNativeMaterialHandle paint={};
+	if (PsyX_Native_CreateMaterial(&material,&paint)!=PSYX_NATIVE_PENDING) return 1;
+	PsyXNativeInstance instances[3]={}; PsyXNativeMeshDesc paintMesh={};
+	std::vector<PsyXNativeVertex> paintVertices; std::vector<uint32_t> paintIndices;
+	for (unsigned int i=0;i<3;++i)
+	{
+		std::vector<PsyXNativeVertex> vertices; std::vector<uint32_t> indices;
+		// The paint fixture is a few D32 rounding units behind its base. A
+		// declared coplanar layer must cover it, but never a genuinely nearer face.
+		const float distance=i==0 ? 8.000002f : i==1 ? 8.0f : 7.9f;
+		NativeTestRectangle(vertices,indices,i==2 ? .2f : -.9f,i==2 ? -.7f : -.9f,
+			i==2 ? .7f : .9f,i==2 ? -.2f : .9f,distance,i==0 ? white : i==1 ? blue : green,0);
+		PsyXNativeMeshDesc mesh={}; mesh.size=sizeof(mesh); mesh.version=PSYX_NATIVE_VERSION;
+		mesh.vertices=vertices.data(); mesh.vertexCount=uint32_t(vertices.size());
+		mesh.indices=indices.data(); mesh.indexCount=uint32_t(indices.size());
+		for (unsigned int axis=0;axis<3;++axis) { mesh.boundsMin[axis]=-9; mesh.boundsMax[axis]=9; }
+		if (!i) mesh.material=paint;
+		if (PsyX_Native_CreateMesh(&mesh,&instances[i].mesh)!=PSYX_NATIVE_PENDING) return 1;
+		NativeTestIdentity(instances[i].world); for(unsigned int j=0;j<4;++j) instances[i].tint[j]=1;
+		instances[i].identity=501+i;
+		if (!i) { paintMesh=mesh; paintVertices.swap(vertices); paintIndices.swap(indices); }
+	}
+	snapshot.instances=instances; snapshot.instanceCount=3;
+	std::vector<unsigned char> pixels; int failures=0;
+	if (!NativeTestFrame(snapshot,0,pixels,report,reportSize) ||
+		!PsxCheckPixel(pixels.data(),g_vk.width,g_vk.height,g_vk.width*13/20,g_vk.height/2,
+			blue,3,"ordinary depth rejects behind-base paint control",report,reportSize)) ++failures;
+	PsyX_Native_DestroyMesh(instances[0].mesh);
+	paintMesh.vertices=paintVertices.data(); paintMesh.indices=paintIndices.data(); paintMesh.depthLayer=1;
+	if (PsyX_Native_CreateMesh(&paintMesh,&instances[0].mesh)!=PSYX_NATIVE_PENDING) return failures+1;
+	// Base and paint draw order reverses; the ordinary face resets bias explicitly.
+	for (unsigned int order=0;order<2;++order)
+	{
+		if (order) std::swap(instances[0],instances[1]);
+		for (unsigned int sample=0;sample<3;++sample)
+		{
+			int width=0,height=0; SDL_GetWindowSize(g_vk.window,&width,&height);
+			const int x=width*(sample==0 ? 13 : sample==1 ? 7 : 14)/20;
+			const int y=height*(sample==2 ? 6 : 10)/20;
+			PsyXNativePickResult pick={}; PsyX_Native_RequestPick(x,y);
+			if (!NativeTestFrame(snapshot,0,pixels,report,reportSize)) { ++failures; continue; }
+			PsyX_Vk_GameBeginFrame();
+			const float* expected=sample==0 ? red : sample==1 ? blue : green;
+			const uint64_t identity=sample==0 ? 501 : sample==1 ? 502 : 503;
+			if (!PsxCheckPixel(pixels.data(),g_vk.width,g_vk.height,g_vk.width*(sample==0 ? 13 : sample==1 ? 7 : 14)/20,
+				g_vk.height*(sample==2 ? 6 : 10)/20,expected,3,"native coplanar paint/hole/occluder",report,reportSize) ||
+				PsyX_Native_GetPickResult(&pick)!=PSYX_NATIVE_OK || !pick.hit || pick.identity!=identity) ++failures;
+		}
+	}
+	PsyX_Native_ResetScene(); PsyX_Vk_GameBeginFrame();
+	PsyXNativeStats stats; PsyX_Native_GetStats(&stats);
+	if (stats.ownedBytes || stats.ownedMaterialBytes || stats.retiringMeshes || stats.retiringMaterials) ++failures;
+	ReportAppend(report,reportSize,failures ? "native coplanar layer/alpha/occlusion/picking/retirement FAIL\n" :
+		"native coplanar layer/alpha/occlusion/picking/two draw orders/retirement ok\n");
+	return failures;
+}
+
 static int NativeTestBackdrop(PsyXNativeSnapshot snapshot, char* report, int reportSize)
 {
 	const float red[]={1,0,0,1}, green[]={0,1,0,1}, blue[]={0,0,1,1}, ui[]={248.0f/255,0,0,1};
@@ -708,6 +775,7 @@ int PsyX_Vk_NativeSelfTest(char* report, int reportSize)
 	failures += NativeTestMips(snapshot, background, report, reportSize);
 	failures += NativeTestBackdrop(snapshot, report, reportSize);
 	failures += NativeTestPicking(snapshot, report, reportSize);
+	failures += NativeTestCoplanar(snapshot, report, reportSize);
 	failures += NativeTestUploadFailure(snapshot, report, reportSize);
 	PsyX_Native_SetRequested(0);
 	// Off/auxiliary consumers remain explicit. Every unavailable world state
