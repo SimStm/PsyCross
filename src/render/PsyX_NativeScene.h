@@ -2,6 +2,7 @@
 #define PSYX_NATIVE_SCENE_INTERNAL_H
 
 #include "PsyX/PsyX_native.h"
+#include "PsyX_NativeMip.h"
 #include <vector>
 
 /* CPU ownership and validation are independent of Vulkan. The backend alone
@@ -31,6 +32,7 @@ public:
 		float alphaCutoff;
 		PsyXNativeCull cull;
 		std::vector<uint8_t> rgba;
+		std::vector<PsyXNativeMip::Level> levels;
 		Material() : state(Empty), generation(0), lastSubmission(0), width(0), height(0), filter(PSYX_NATIVE_NEAREST), alphaCutoff(0.5f), cull(PSYX_NATIVE_CULL_BACK) {}
 	};
 

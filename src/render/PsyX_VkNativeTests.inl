@@ -167,6 +167,77 @@ static int NativeTestBackdrop(PsyXNativeSnapshot snapshot, char* report, int rep
 	return failures;
 }
 
+static int NativeTestMips(PsyXNativeSnapshot snapshot, const float background[4], char* report, int reportSize)
+{
+	const float white[]={1,1,1,1}, black[]={0,0,0,1};
+	const float middle[]={188.0f/255,188.0f/255,188.0f/255,1};
+	std::vector<PsyXNativeVertex> vertices;
+	std::vector<uint32_t> indices;
+	// An eight-pixel rectangle minifies a 128x64 checker. Offset by half a
+	// texel so level-zero sampling lands on a black texel, not a checker edge.
+	NativeTestRectangle(vertices,indices,-8.0f/g_vk.width,-8.0f/g_vk.height,
+		8.0f/g_vk.width,8.0f/g_vk.height,4,white,0);
+	for (size_t i=0;i<vertices.size();++i) { vertices[i].uv[0]+=.5f/128; vertices[i].uv[1]+=.5f/64; }
+	PsyXNativeMeshDesc mesh={};
+	mesh.size=sizeof(mesh); mesh.version=PSYX_NATIVE_VERSION;
+	mesh.vertices=vertices.data(); mesh.vertexCount=uint32_t(vertices.size());
+	mesh.indices=indices.data(); mesh.indexCount=uint32_t(indices.size());
+	for (unsigned int i=0;i<3;++i) { mesh.boundsMin[i]=-4; mesh.boundsMax[i]=4; }
+	PsyXNativeInstance instance={};
+	NativeTestIdentity(instance.world);
+	for (unsigned int i=0;i<4;++i) instance.tint[i]=1;
+	snapshot.instances=&instance; snapshot.instanceCount=1;
+	NativeTestIdentity(snapshot.view.view);
+	snapshot.view.projection[0]=1; snapshot.view.projection[5]=-1;
+	PsyXNativeMaterialDesc material={};
+	material.size=sizeof(material); material.version=PSYX_NATIVE_VERSION;
+	material.width=128; material.height=64; material.byteCount=128*64*4; material.alphaCutoff=.5f;
+	std::vector<uint8_t> artwork(size_t(material.byteCount));
+	std::vector<unsigned char> pixels;
+	int failures=0;
+	for (unsigned int mode=0;mode<4;++mode)
+	{
+		snapshot.sceneGeneration=PsyX_Native_ResetScene(); PsyX_Vk_GameBeginFrame();
+		for (unsigned int y=0;y<64;++y)
+		for (unsigned int x=0;x<128;++x)
+		{
+			uint8_t* texel=artwork.data()+(y*128+x)*4;
+			if (mode==3)
+			{
+				texel[0]=255; texel[1]=texel[2]=x<64 ? 0 : 255; texel[3]=x<64 ? 0 : 255;
+			}
+			else { texel[0]=texel[1]=texel[2]=((x+y)&1) ? 255 : 0; texel[3]=255; }
+		}
+		material.rgba=artwork.data();
+		material.filter=mode<2 ? PsyXNativeFilter(mode) : PSYX_NATIVE_TRILINEAR;
+		if (PsyX_Native_CreateMaterial(&material,&mesh.material)!=PSYX_NATIVE_PENDING ||
+			PsyX_Native_CreateMesh(&mesh,&instance.mesh)!=PSYX_NATIVE_PENDING) { ++failures; break; }
+		memset(artwork.data(),127,artwork.size()); // Upload must use the complete owned chain.
+		if (!NativeTestFrame(snapshot,0,pixels,report,reportSize)) { ++failures; continue; }
+		if (mode<3)
+		{
+			if (!PsxCheckPixel(pixels.data(),g_vk.width,g_vk.height,g_vk.width/2,g_vk.height/2,
+				mode==2 ? middle : black,4,mode==2 ? "minified trilinear checker is linear-light gray" :
+				"base-only sampler preserves aliased black texel",report,reportSize)) ++failures;
+		}
+		else
+		{
+			if (!PsxCheckPixel(pixels.data(),g_vk.width,g_vk.height,g_vk.width/2-3,g_vk.height/2,
+				background,3,"minified cutout retains transparent half",report,reportSize)) ++failures;
+			if (!PsxCheckPixel(pixels.data(),g_vk.width,g_vk.height,g_vk.width/2+2,g_vk.height/2,
+				white,3,"minified opaque half has no transparent red halo",report,reportSize)) ++failures;
+		}
+		PsyXNativeStats stats; PsyX_Native_GetStats(&stats);
+		if (stats.ownedMaterialBytes!=(mode<2 ? 32768 : 43692) || stats.residentMaterials!=1) ++failures;
+	}
+	PsyX_Native_ResetScene(); PsyX_Vk_GameBeginFrame();
+	PsyXNativeStats stats; PsyX_Native_GetStats(&stats);
+	if (stats.ownedMaterialBytes || stats.ownedBytes || stats.residentMaterials || stats.retiringMaterials) ++failures;
+	ReportAppend(report,reportSize,failures ? "native mip minification/cutout/ownership FAIL\n" :
+		"native mip minification/cutout/full-chain ownership and retirement ok\n");
+	return failures;
+}
+
 static int NativeTestUploadFailure(PsyXNativeSnapshot snapshot, char* report, int reportSize)
 {
 	const float white[] = { 1, 1, 1, 1 };
@@ -175,10 +246,11 @@ static int NativeTestUploadFailure(PsyXNativeSnapshot snapshot, char* report, in
 	NativeTestRectangle(vertices, indices, -.8f, -.8f, .8f, .8f, 4, white, 0);
 	snapshot.sceneGeneration = PsyX_Native_ResetScene();
 	PsyX_Vk_GameBeginFrame();
-	uint8_t artwork[] = { 255, 255, 255, 255 };
+	uint8_t artwork[] = { 255, 255, 255, 255, 255, 255, 255, 255 };
 	PsyXNativeMaterialDesc material = {};
 	material.size = sizeof(material); material.version = PSYX_NATIVE_VERSION;
-	material.rgba = artwork; material.width = material.height = 1; material.byteCount = 4;
+	material.rgba = artwork; material.width = 2; material.height = 1; material.byteCount = 8;
+	material.filter=PSYX_NATIVE_TRILINEAR;
 	PsyXNativeMeshDesc mesh = {};
 	mesh.size = sizeof(mesh); mesh.version = PSYX_NATIVE_VERSION;
 	mesh.vertices = vertices.data(); mesh.vertexCount = uint32_t(vertices.size());
@@ -208,7 +280,7 @@ static int NativeTestUploadFailure(PsyXNativeSnapshot snapshot, char* report, in
 	PsyX_Vk_GameBeginFrame();
 	PsyXNativeStats stats;
 	PsyX_Native_GetStats(&stats);
-	if (stats.retiringMaterials != 1 || stats.ownedMaterialBytes != 4 || gpu.image != retainedImage ||
+	if (stats.retiringMaterials != 1 || stats.ownedMaterialBytes != 12 || gpu.image != retainedImage ||
 		gpu.staging != retainedStaging || gpu.uploadCommand != retainedCommand || gpu.uploadFence != retainedFence) ++failures;
 	// The fault seam never pretends the real upload completed. Wait for its
 	// actual fence before restoring normal completion and releasing resources.
@@ -453,6 +525,7 @@ int PsyX_Vk_NativeSelfTest(char* report, int reportSize)
 	if (stats.residentMeshes || stats.pendingMeshes || stats.retiringMeshes || stats.ownedBytes) ++failures;
 	else ReportAppend(report, reportSize, "eight reloads leave zero owned meshes/bytes ok\n");
 	failures += NativeTestMaterials(snapshot, background, report, reportSize);
+	failures += NativeTestMips(snapshot, background, report, reportSize);
 	failures += NativeTestBackdrop(snapshot, report, reportSize);
 	failures += NativeTestUploadFailure(snapshot, report, reportSize);
 	PsyX_Native_SetRequested(0);

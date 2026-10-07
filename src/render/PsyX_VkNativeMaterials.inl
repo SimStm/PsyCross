@@ -68,26 +68,27 @@ static int CreateNativeMaterialDescriptors()
 	return 1;
 }
 
-static int UploadNativeMaterial(VkNativeMaterial& gpu, const PsyXNativeMaterialDesc& source)
+static int UploadNativeMaterial(VkNativeMaterial& gpu, const PsyXNativeScene::Material& source)
 {
 	VkPhysicalDeviceProperties properties;
 	vkGetPhysicalDeviceProperties(g_vk.physicalDevice, &properties);
 	VkFormatProperties format;
 	vkGetPhysicalDeviceFormatProperties(g_vk.physicalDevice, VK_FORMAT_R8G8B8A8_SRGB, &format);
 	VkFormatFeatureFlags required = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-	if (source.filter == PSYX_NATIVE_LINEAR) required |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+	if (source.filter != PSYX_NATIVE_NEAREST) required |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
 	if (source.width > properties.limits.maxImageDimension2D || source.height > properties.limits.maxImageDimension2D ||
 		(format.optimalTilingFeatures & required) != required || !CreateNativeMaterialDescriptors()) return 0;
 
 	// A retry must not overwrite retained handles from an earlier failed wait.
 	if (!DestroyNativeMaterial(gpu)) return 0;
 	void* mapped = NULL;
-	int ok = CreateImage2D(source.width, source.height, VK_FORMAT_R8G8B8A8_SRGB,
+	const uint32_t levelCount=uint32_t(source.levels.size());
+	int ok = CreateImage2DLevels(source.width, source.height, int(levelCount), VK_FORMAT_R8G8B8A8_SRGB,
 		VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, &gpu.image, &gpu.memory);
-	if (ok) ok = CreateBuffer(source.byteCount, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+	if (ok) ok = CreateBuffer(source.rgba.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
 		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
 		&gpu.staging, &gpu.stagingMemory, &mapped);
-	if (ok) memcpy(mapped, source.rgba, (size_t)source.byteCount);
+	if (ok) memcpy(mapped, source.rgba.data(), source.rgba.size());
 	if (mapped) vkUnmapMemory(g_vk.device, gpu.stagingMemory);
 	if (ok)
 	{
@@ -107,14 +108,22 @@ static int UploadNativeMaterial(VkNativeMaterial& gpu, const PsyXNativeMaterialD
 	}
 	if (ok)
 	{
-		ImageBarrier(gpu.uploadCommand, gpu.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		ImageBarrierLevels(gpu.uploadCommand, gpu.image, VK_IMAGE_ASPECT_COLOR_BIT, 0, int(levelCount), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
-		VkBufferImageCopy copy = {};
-		copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		copy.imageSubresource.layerCount = 1;
-		copy.imageExtent.width = source.width; copy.imageExtent.height = source.height; copy.imageExtent.depth = 1;
-		vkCmdCopyBufferToImage(gpu.uploadCommand, gpu.staging, gpu.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-		ImageBarrier(gpu.uploadCommand, gpu.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		// 4096x4096 permits at most thirteen levels; no allocation inside recording.
+		VkBufferImageCopy copies[13] = {};
+		for (uint32_t level=0; level<levelCount; ++level)
+		{
+			VkBufferImageCopy& copy=copies[level];
+			copy.bufferOffset=source.levels[level].offset;
+			copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			copy.imageSubresource.mipLevel=level;
+			copy.imageSubresource.layerCount = 1;
+			copy.imageExtent.width = source.levels[level].width;
+			copy.imageExtent.height = source.levels[level].height; copy.imageExtent.depth = 1;
+		}
+		vkCmdCopyBufferToImage(gpu.uploadCommand, gpu.staging, gpu.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, levelCount, copies);
+		ImageBarrierLevels(gpu.uploadCommand, gpu.image, VK_IMAGE_ASPECT_COLOR_BIT, 0, int(levelCount), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 		ok = VkOk(vkEndCommandBuffer(gpu.uploadCommand), "native texture upload end");
 	}
@@ -139,13 +148,14 @@ static int UploadNativeMaterial(VkNativeMaterial& gpu, const PsyXNativeMaterialD
 		}
 	}
 	if (!ReleaseNativeUpload(gpu)) ok = 0;
-	if (ok) ok = CreateImageView2D(gpu.image, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_ASPECT_COLOR_BIT, &gpu.view);
+	if (ok) ok = CreateImageView2DLevels(gpu.image, VK_FORMAT_R8G8B8A8_SRGB, int(levelCount), &gpu.view);
 	if (ok)
 	{
 		VkSamplerCreateInfo sampler = {};
 		sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-		sampler.magFilter = sampler.minFilter = source.filter == PSYX_NATIVE_LINEAR ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-		sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+		sampler.magFilter = sampler.minFilter = source.filter != PSYX_NATIVE_NEAREST ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+		sampler.mipmapMode = source.filter == PSYX_NATIVE_TRILINEAR ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+		sampler.maxLod=float(levelCount-1);
 		sampler.addressModeU = sampler.addressModeV = sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
 		ok = VkOk(vkCreateSampler(g_vk.device, &sampler, NULL, &gpu.sampler), "native material sampler");
 	}
@@ -175,10 +185,11 @@ static int PrepareNativeWhiteMaterial()
 {
 	if (g_nativeVk.white.set) return 1;
 	const uint8_t white[] = {255,255,255,255};
-	PsyXNativeMaterialDesc desc = {};
-	desc.rgba = white; desc.width = desc.height = 1; desc.byteCount = 4;
-	desc.filter = PSYX_NATIVE_NEAREST;
-	return UploadNativeMaterial(g_nativeVk.white, desc);
+	PsyXNativeScene::Material source;
+	source.width = source.height = 1;
+	source.rgba.assign(white,white+4);
+	PsyXNativeMip::Layout(1,1,false,source.levels);
+	return UploadNativeMaterial(g_nativeVk.white, source);
 }
 
 static void NativeMaterialsCompleted()
@@ -192,10 +203,7 @@ static void NativeMaterialsCompleted()
 		PsyXNativeScene::Material& source = g_nativeScene.materials[slot];
 		if (source.state == PsyXNativeScene::Failed) DestroyNativeMaterial(g_nativeVk.materials[slot]);
 		if (source.state != PsyXNativeScene::Pending) continue;
-		PsyXNativeMaterialDesc desc = {};
-		desc.rgba = source.rgba.data(); desc.width = source.width; desc.height = source.height;
-		desc.byteCount = source.rgba.size(); desc.filter = source.filter; desc.alphaCutoff = source.alphaCutoff;
-		source.state = UploadNativeMaterial(g_nativeVk.materials[slot], desc) ? PsyXNativeScene::Ready : PsyXNativeScene::Failed;
+		source.state = UploadNativeMaterial(g_nativeVk.materials[slot], source) ? PsyXNativeScene::Ready : PsyXNativeScene::Failed;
 	}
 }
 

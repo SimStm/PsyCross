@@ -223,24 +223,27 @@ PsyXNativeResult PsyXNativeScene::CreateMaterial(const PsyXNativeMaterialDesc* d
 	if (handle) memset(handle, 0, sizeof(*handle));
 	if (!desc || !handle || desc->size != sizeof(*desc) || desc->version != PSYX_NATIVE_VERSION ||
 		!desc->rgba || !desc->width || !desc->height || desc->width > 4096 || desc->height > 4096 ||
-		(desc->filter != PSYX_NATIVE_NEAREST && desc->filter != PSYX_NATIVE_LINEAR) ||
+		(desc->filter != PSYX_NATIVE_NEAREST && desc->filter != PSYX_NATIVE_LINEAR && desc->filter != PSYX_NATIVE_TRILINEAR) ||
 		(desc->cull != PSYX_NATIVE_CULL_BACK && desc->cull != PSYX_NATIVE_CULL_NONE) ||
 		!std::isfinite(desc->alphaCutoff) || desc->alphaCutoff < 0 || desc->alphaCutoff > 1)
 		return Reject(PSYX_NATIVE_INVALID);
 	if (generationExhausted) return Reject(PSYX_NATIVE_OUT_OF_BUDGET);
-	const uint64_t bytes = uint64_t(desc->width) * desc->height * 4;
-	if (desc->byteCount != bytes) return Reject(PSYX_NATIVE_INVALID);
-	if (bytes > PSYX_NATIVE_MAX_MATERIAL_BYTES || ownedMaterialBytes > PSYX_NATIVE_MAX_MATERIAL_BYTES - bytes)
-		return Reject(PSYX_NATIVE_OUT_OF_BUDGET);
+	if (desc->byteCount != uint64_t(desc->width) * desc->height * 4) return Reject(PSYX_NATIVE_INVALID);
 	uint32_t slot = PSYX_NATIVE_MAX_MATERIALS;
 	for (uint32_t i = 0; i < PSYX_NATIVE_MAX_MATERIALS; ++i)
 		if (materials[i].state == Empty) { slot = i; break; }
 	if (slot == PSYX_NATIVE_MAX_MATERIALS) return Reject(PSYX_NATIVE_OUT_OF_BUDGET);
 	try
 	{
-		std::vector<uint8_t> pixels(desc->rgba, desc->rgba + (size_t)bytes);
+		std::vector<PsyXNativeMip::Level> levels;
+		const uint64_t bytes=PsyXNativeMip::Layout(desc->width,desc->height,desc->filter==PSYX_NATIVE_TRILINEAR,levels);
+		if (bytes > PSYX_NATIVE_MAX_MATERIAL_BYTES || ownedMaterialBytes > PSYX_NATIVE_MAX_MATERIAL_BYTES - bytes)
+			return Reject(PSYX_NATIVE_OUT_OF_BUDGET);
+		std::vector<uint8_t> pixels;
+		PsyXNativeMip::Build(desc->rgba,levels,bytes,desc->alphaCutoff,pixels);
 		Material& material = materials[slot];
 		material.rgba.swap(pixels);
+		material.levels.swap(levels);
 		material.width = desc->width; material.height = desc->height;
 		material.filter = desc->filter; material.alphaCutoff = desc->alphaCutoff;
 		material.cull = desc->cull;
@@ -274,6 +277,7 @@ void PsyXNativeScene::ReclaimMaterial(uint32_t slot)
 	Material& material = materials[slot];
 	ownedMaterialBytes -= material.rgba.size();
 	std::vector<uint8_t>().swap(material.rgba);
+	std::vector<PsyXNativeMip::Level>().swap(material.levels);
 	material.lastSubmission = 0; material.width = material.height = 0;
 	material.state = material.generation == std::numeric_limits<uint32_t>::max() ? Exhausted : Empty;
 }

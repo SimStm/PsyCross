@@ -9,7 +9,7 @@ extern "C" {
 
 /* R01 native world contributor. All calls belong to the render thread. No
  * Vulkan objects or borrowed game pointers cross this C boundary. */
-#define PSYX_NATIVE_VERSION 4u
+#define PSYX_NATIVE_VERSION 5u
 #define PSYX_NATIVE_MAX_MESHES 512u
 #define PSYX_NATIVE_MAX_INSTANCES 4096u
 #define PSYX_NATIVE_MAX_BYTES (32u * 1024u * 1024u)
@@ -41,7 +41,8 @@ typedef struct PsyXNativeMaterialHandle
 	uint32_t generation;
 } PsyXNativeMaterialHandle;
 
-typedef enum PsyXNativeFilter { PSYX_NATIVE_NEAREST = 0, PSYX_NATIVE_LINEAR = 1 } PsyXNativeFilter;
+/* NEAREST/LINEAR sample level zero; TRILINEAR owns a complete mip chain. */
+typedef enum PsyXNativeFilter { PSYX_NATIVE_NEAREST = 0, PSYX_NATIVE_LINEAR = 1, PSYX_NATIVE_TRILINEAR = 2 } PsyXNativeFilter;
 typedef enum PsyXNativeCull { PSYX_NATIVE_CULL_BACK = 0, PSYX_NATIVE_CULL_NONE = 1 } PsyXNativeCull;
 typedef struct PsyXNativeMaterialDesc
 {
