@@ -84,10 +84,16 @@ static int NativeTestFrame(PsyXNativeSnapshot& snapshot, int legacyDepth,
 		}
 		PsyXNativeStats stats;
 		PsyX_Native_GetStats(&stats);
-		uint32_t backdrops=0;
-		for (uint32_t i=0; i<snapshot.instanceCount; ++i) if (snapshot.instances[i].layer==PSYX_NATIVE_BACKDROP) ++backdrops;
+		uint32_t backdrops=0,draws=0;
+		for (uint32_t i=0; i<snapshot.instanceCount; ++i)
+		{
+			const PsyXNativeInstance& instance=snapshot.instances[i];
+			if(instance.layer==PSYX_NATIVE_BACKDROP) { ++backdrops; ++draws; }
+			else if(expectedReason==PSYX_NATIVE_OK)
+				draws+=uint32_t(g_nativeScene.meshes[instance.mesh.slot].drawRanges.size());
+		}
 		const int ok = expectedReason == PSYX_NATIVE_OK ?
-			(stats.effective && stats.nativeDraws == snapshot.instanceCount && stats.nativeBackdropDraws == backdrops && stats.legacyWorldDraws == 0 &&
+			(stats.effective && stats.nativeDraws == draws && stats.nativeBackdropDraws == backdrops && stats.legacyWorldDraws == 0 &&
 			stats.suppressedWorldDraws == 1 && stats.legacyOverlayDraws == 1) :
 			(!stats.effective && stats.reason == expectedReason && !stats.nativeDraws &&
 			stats.frameState == PSYX_NATIVE_FRAME_FAILED && stats.suppressedWorldDraws == 1 &&
@@ -180,7 +186,20 @@ static int NativeTestHorizontal(PsyXNativeSnapshot snapshot, char* report, int r
 			vertices[v].normal[1]=1;vertices[v].normal[2]=0;
 			if(i==1) vertices[v].position[0]-=1024;
 		}
-		if(i==1) { const uint32_t alternate[]={0,3,1,1,3,2}; indices.assign(alternate,alternate+6); }
+		if(i==1)
+		{
+			const uint32_t alternate[]={0,3,1,1,3,2}; indices.assign(alternate,alternate+6);
+			// Reproduce an original kerb: a coplanar top and a vertical side share
+			// one mesh/material/ID. The side must not disable the top's depth plane.
+			const unsigned int corners[]={0,1,1,0};
+			for(unsigned int corner=0;corner<4;++corner)
+			{
+				PsyXNativeVertex side=vertices[corners[corner]];
+				if(corner>=2) side.position[1]-=1;
+				vertices.push_back(side);
+			}
+			const uint32_t side[]={4,5,6,4,6,7}; indices.insert(indices.end(),side,side+6);
+		}
 		PsyXNativeMeshDesc mesh={}; mesh.size=sizeof(mesh); mesh.version=PSYX_NATIVE_VERSION;
 		mesh.vertices=vertices.data(); mesh.vertexCount=uint32_t(vertices.size());
 		mesh.indices=indices.data(); mesh.indexCount=uint32_t(indices.size());
@@ -201,6 +220,8 @@ static int NativeTestHorizontal(PsyXNativeSnapshot snapshot, char* report, int r
 		int width=0,height=0;SDL_GetWindowSize(g_vk.window,&width,&height);
 		PsyX_Native_RequestPick(width/2,height/2);PsyXNativePickResult pick={};
 		if(!NativeTestFrame(snapshot,0,pixels,report,reportSize)) { ++failures;continue; }
+		PsyXNativeStats splitStats;PsyX_Native_GetStats(&splitStats);
+		if(splitStats.nativeDraws!=3) ++failures; // Two logical meshes, exactly one split top/side.
 		const float* expected=instances[1].identity==702 ? red : blue;
 		unsigned int checked=0,wrong=0;
 		for(int y=g_vk.height*46/100;y<g_vk.height*54/100;++y)
@@ -239,9 +260,9 @@ static int NativeTestHorizontal(PsyXNativeSnapshot snapshot, char* report, int r
 		}
 	}
 	PsyX_Native_ResetScene();PsyX_Vk_GameBeginFrame();PsyXNativeStats stats;PsyX_Native_GetStats(&stats);
-	if(stats.ownedBytes || stats.ownedMaterialBytes || stats.retiringMeshes || stats.retiringMaterials) ++failures;
+	if(stats.ownedBytes || stats.ownedMaterialBytes || stats.retiringMeshes || stats.retiringMaterials || g_nativeScene.ownedDrawRangeBytes) ++failures;
 	ReportAppend(report,reportSize,failures ? "native horizontal plane/ties/paint/alpha/occlusion/IDs/retirement FAIL\n" :
-		"native horizontal plane/ties/paint/alpha/occlusion/IDs/two orders/retirement PASS\n");
+		"native horizontal plane/mixed-side/ties/paint/alpha/occlusion/IDs/two orders/retirement PASS\n");
 	return failures;
 }
 

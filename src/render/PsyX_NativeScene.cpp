@@ -45,6 +45,25 @@ bool ValidMesh(const PsyXNativeMeshDesc& desc)
 	}
 	return true;
 }
+
+PsyXNativeScene::DrawRange NextDrawRange(const PsyXNativeMeshDesc& desc, uint32_t first)
+{
+	// ValidMesh has checked every index and finite position before this traversal.
+	PsyXNativeScene::DrawRange range = {};
+	range.firstIndex = first;
+	for (uint32_t index = first; index < desc.indexCount; index += 3)
+	{
+		const float y = desc.vertices[desc.indices[index]].position[1];
+		const bool horizontal = y == desc.vertices[desc.indices[index+1]].position[1] &&
+			y == desc.vertices[desc.indices[index+2]].position[1];
+		if (index != first && (horizontal != range.horizontalPlane ||
+			(horizontal && y != range.planeY))) break;
+		range.horizontalPlane = horizontal;
+		range.planeY = horizontal ? y : 0;
+		range.indexCount += 3;
+	}
+	return range;
+}
 }
 
 uint64_t PsyXNativeScene::Mesh::Bytes() const
@@ -52,7 +71,12 @@ uint64_t PsyXNativeScene::Mesh::Bytes() const
 	return uint64_t(vertices.size()) * sizeof(PsyXNativeVertex) + uint64_t(indices.size()) * sizeof(uint32_t);
 }
 
-PsyXNativeScene::PsyXNativeScene() : snapshotPending(false), requested(false), worldExpected(false), producerReason(PSYX_NATIVE_NO_SNAPSHOT), generation(1), ownedBytes(0), ownedMaterialBytes(0), rejected(0), generationExhausted(false)
+uint64_t PsyXNativeScene::Mesh::DrawRangeBytes() const
+{
+	return uint64_t(drawRanges.capacity()) * sizeof(DrawRange);
+}
+
+PsyXNativeScene::PsyXNativeScene() : snapshotPending(false), requested(false), worldExpected(false), producerReason(PSYX_NATIVE_NO_SNAPSHOT), generation(1), ownedBytes(0), ownedDrawRangeBytes(0), ownedMaterialBytes(0), rejected(0), generationExhausted(false)
 {
 	memset(instances, 0, sizeof(instances));
 	memset(&snapshot, 0, sizeof(snapshot));
@@ -76,6 +100,15 @@ PsyXNativeResult PsyXNativeScene::Create(const PsyXNativeMeshDesc* desc, PsyXNat
 	if (bytes > PSYX_NATIVE_MAX_BYTES || ownedBytes > PSYX_NATIVE_MAX_BYTES - bytes)
 		return Reject(PSYX_NATIVE_OUT_OF_BUDGET);
 	if (!ValidMesh(*desc)) return Reject(PSYX_NATIVE_INVALID);
+	uint32_t rangeCount = 0;
+	for (uint32_t first = 0; first < desc->indexCount; ++rangeCount)
+	{
+		if (rangeCount == MaxDrawRanges) return Reject(PSYX_NATIVE_OUT_OF_BUDGET);
+		first += NextDrawRange(*desc, first).indexCount;
+	}
+	const uint64_t rangeBytes = uint64_t(rangeCount) * sizeof(DrawRange);
+	if (rangeBytes > PSYX_NATIVE_MAX_BYTES || ownedDrawRangeBytes > PSYX_NATIVE_MAX_BYTES - rangeBytes)
+		return Reject(PSYX_NATIVE_OUT_OF_BUDGET);
 	if (desc->material.generation && !IsMaterialLive(desc->material)) return Reject(PSYX_NATIVE_STALE);
 	if (!desc->material.generation && desc->material.slot) return Reject(PSYX_NATIVE_INVALID);
 	uint32_t slot = PSYX_NATIVE_MAX_MESHES;
@@ -89,19 +122,28 @@ PsyXNativeResult PsyXNativeScene::Create(const PsyXNativeMeshDesc* desc, PsyXNat
 	{
 		std::vector<PsyXNativeVertex> vertices(desc->vertices, desc->vertices + desc->vertexCount);
 		std::vector<uint32_t> indices(desc->indices, desc->indices + desc->indexCount);
+		std::vector<DrawRange> ranges;
+		ranges.reserve(rangeCount);
+		const uint64_t reservedBytes = uint64_t(ranges.capacity()) * sizeof(DrawRange);
+		if (reservedBytes > PSYX_NATIVE_MAX_BYTES || ownedDrawRangeBytes > PSYX_NATIVE_MAX_BYTES - reservedBytes)
+			return Reject(PSYX_NATIVE_OUT_OF_BUDGET);
+		for (uint32_t first = 0; first < desc->indexCount;)
+		{
+			const DrawRange range = NextDrawRange(*desc, first);
+			ranges.push_back(range);
+			first += range.indexCount;
+		}
 		Mesh& mesh = meshes[slot];
 		mesh.vertices.swap(vertices);
 		mesh.indices.swap(indices);
+		mesh.drawRanges.swap(ranges);
 		++mesh.generation;
 		mesh.lastSubmission = 0;
 		mesh.material = desc->material;
 		mesh.depthLayer = desc->depthLayer;
-		mesh.planeY = mesh.vertices[0].position[1];
-		mesh.horizontalPlane = true;
-		for (size_t i=1; i<mesh.vertices.size(); ++i)
-			if (mesh.vertices[i].position[1]!=mesh.planeY) { mesh.horizontalPlane=false; break; }
 		mesh.state = Pending;
 		ownedBytes += bytes;
+		ownedDrawRangeBytes += reservedBytes;
 		handle->slot = slot;
 		handle->generation = mesh.generation;
 	}
@@ -140,6 +182,7 @@ PsyXNativeResult PsyXNativeScene::Publish(const PsyXNativeSnapshot* source)
 	double inverse[16];
 	if (!PsyXNativePlane::Inverse(inverse,source->view.projection,source->view.view))
 		return Reject(PSYX_NATIVE_INVALID);
+	uint64_t drawRangeCount = 0;
 	for (uint32_t i = 0; i < source->instanceCount; ++i)
 	{
 		if (!IsLive(source->instances[i].mesh)) return Reject(PSYX_NATIVE_STALE);
@@ -149,6 +192,9 @@ PsyXNativeResult PsyXNativeScene::Publish(const PsyXNativeSnapshot* source)
 			(source->instances[i].layer != PSYX_NATIVE_WORLD && source->instances[i].layer != PSYX_NATIVE_BACKDROP) ||
 			unsigned(source->instances[i].sampling)>PSYX_NATIVE_SAMPLE_TRILINEAR)
 			return Reject(PSYX_NATIVE_INVALID);
+		drawRangeCount += source->instances[i].layer == PSYX_NATIVE_BACKDROP ? 1 :
+			meshes[source->instances[i].mesh.slot].drawRanges.size();
+		if (drawRangeCount > MaxDrawRanges) return Reject(PSYX_NATIVE_OUT_OF_BUDGET);
 		if (material.generation && source->instances[i].sampling==PSYX_NATIVE_SAMPLE_TRILINEAR)
 		{
 			const std::vector<PsyXNativeMip::Level>& levels=materials[material.slot].levels;
@@ -213,13 +259,13 @@ void PsyXNativeScene::Reclaim(uint32_t slot)
 {
 	Mesh& mesh = meshes[slot];
 	ownedBytes -= mesh.Bytes();
+	ownedDrawRangeBytes -= mesh.DrawRangeBytes();
 	std::vector<PsyXNativeVertex>().swap(mesh.vertices);
 	std::vector<uint32_t>().swap(mesh.indices);
+	std::vector<DrawRange>().swap(mesh.drawRanges);
 	mesh.lastSubmission = 0;
 	mesh.material = PsyXNativeMaterialHandle();
 	mesh.depthLayer = 0;
-	mesh.horizontalPlane = false;
-	mesh.planeY = 0;
 	mesh.state = mesh.generation == std::numeric_limits<uint32_t>::max() ? Exhausted : Empty;
 }
 

@@ -362,12 +362,16 @@ static PsyXNativeResult PrepareNativeFrame()
 		const PsyXNativeMeshHandle handle = g_nativeScene.instances[i].mesh;
 		if (!g_nativeScene.IsLive(handle)) return PSYX_NATIVE_STALE;
 		const PsyXNativeScene::Mesh& source=g_nativeScene.meshes[handle.slot];
-		if (source.horizontalPlane && g_nativeScene.instances[i].layer==PSYX_NATIVE_WORLD)
+		if (g_nativeScene.instances[i].layer==PSYX_NATIVE_WORLD)
 		{
-			float plane[4];
-			if (PsyXNativePlane::Horizontal(plane,g_nativeVk.clipToWorld,g_nativeScene.instances[i].world,
-				source.planeY,g_vk.width,g_vk.height,source.depthLayer)==PsyXNativePlane::Invalid)
-				return PSYX_NATIVE_INVALID;
+			for (size_t range=0; range<source.drawRanges.size(); ++range)
+			{
+				if (!source.drawRanges[range].horizontalPlane) continue;
+				float plane[4];
+				if (PsyXNativePlane::Horizontal(plane,g_nativeVk.clipToWorld,g_nativeScene.instances[i].world,
+					source.drawRanges[range].planeY,g_vk.width,g_vk.height,source.depthLayer)==PsyXNativePlane::Invalid)
+					return PSYX_NATIVE_INVALID;
+			}
 		}
 		const PsyXNativeScene::State state = g_nativeScene.meshes[handle.slot].state;
 		if (state == PsyXNativeScene::Failed) return PSYX_NATIVE_UPLOAD_FAILED;
@@ -514,10 +518,6 @@ static void RecordNativeWorld(VkCommandBuffer cmd, uint32_t imageIndex)
 		PsyXNativeScene::Mesh& source = g_nativeScene.meshes[instance.mesh.slot];
 		const VkNativeMesh& mesh = g_nativeVk.meshes[instance.mesh.slot];
 		NativeDrawPush push={};
-		push.depthPlane[3]=-1;
-		if (source.horizontalPlane && instance.layer==PSYX_NATIVE_WORLD)
-			PsyXNativePlane::Horizontal(push.depthPlane,g_nativeVk.clipToWorld,instance.world,
-				source.planeY,g_vk.width,g_vk.height,source.depthLayer);
 		push.pickId = instance.layer == PSYX_NATIVE_WORLD ? i+1 : 0;
 		PsyXNativeTransform::Compose(push.mvp,g_nativeScene.snapshot.view.projection,
 			instance.layer==PSYX_NATIVE_BACKDROP ? backdropView : g_nativeScene.snapshot.view.view,instance.world);
@@ -536,7 +536,6 @@ static void RecordNativeWorld(VkCommandBuffer cmd, uint32_t imageIndex)
 		push.sampling=filter;
 		const VkDescriptorSet descriptor = textured ? g_nativeVk.materials[source.material.slot].sets[filter] : g_nativeVk.white.sets[filter];
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_nativeVk.layout, 0, 1, &descriptor, 0, NULL);
-		vkCmdPushConstants(cmd, g_nativeVk.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 		const VkDeviceSize offset = 0;
 		// Only declared coplanar artwork gets a small D32 representable bias.
 		// Ordinary geometry and backdrop reset it; alpha/depth/ID share this draw.
@@ -544,9 +543,21 @@ static void RecordNativeWorld(VkCommandBuffer cmd, uint32_t imageIndex)
 		vkCmdSetDepthBias(cmd, instance.layer == PSYX_NATIVE_WORLD ? -4.0f*source.depthLayer : 0.0f, 0.0f, 0.0f);
 		vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertices, &offset);
 		vkCmdBindIndexBuffer(cmd, mesh.indices, 0, VK_INDEX_TYPE_UINT32);
-		vkCmdDrawIndexed(cmd, uint32_t(source.indices.size()), 1, 0, 0, 0);
-		++g_nativeVk.frame.nativeDraws;
-		if (instance.layer == PSYX_NATIVE_BACKDROP) ++g_nativeVk.frame.nativeBackdropDraws;
+		const bool world = instance.layer == PSYX_NATIVE_WORLD;
+		const size_t rangeCount = world ? source.drawRanges.size() : 1;
+		for (size_t rangeIndex=0; rangeIndex<rangeCount; ++rangeIndex)
+		{
+			const PsyXNativeScene::DrawRange& range = source.drawRanges[rangeIndex];
+			memset(push.depthPlane,0,sizeof(push.depthPlane)); push.depthPlane[3]=-1;
+			if (world && range.horizontalPlane)
+				PsyXNativePlane::Horizontal(push.depthPlane,g_nativeVk.clipToWorld,instance.world,
+					range.planeY,g_vk.width,g_vk.height,source.depthLayer);
+			vkCmdPushConstants(cmd, g_nativeVk.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+			vkCmdDrawIndexed(cmd, world ? range.indexCount : uint32_t(source.indices.size()), 1,
+				world ? range.firstIndex : 0, 0, 0);
+			++g_nativeVk.frame.nativeDraws;
+			if (!world) ++g_nativeVk.frame.nativeBackdropDraws;
+		}
 	}
 	vkCmdEndRenderPass(cmd);
 	RecordNativePick(cmd);

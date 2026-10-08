@@ -11,6 +11,13 @@ class PsyXNativeScene
 {
 public:
 	enum State { Empty, Pending, Ready, Failed, Retiring, Exhausted };
+	enum { MaxDrawRanges = PSYX_NATIVE_MAX_INSTANCES }; // Per mesh and per published frame.
+	struct DrawRange
+	{
+		uint32_t firstIndex, indexCount;
+		bool horizontalPlane;
+		float planeY;
+	};
 	struct Mesh
 	{
 		State state;
@@ -20,10 +27,10 @@ public:
 		std::vector<uint32_t> indices;
 		PsyXNativeMaterialHandle material;
 		uint32_t depthLayer;
-		bool horizontalPlane;
-		float planeY;
-		Mesh() : state(Empty), generation(0), lastSubmission(0), material(), depthLayer(0), horizontalPlane(false), planeY(0) {}
+		std::vector<DrawRange> drawRanges; // Consecutive indexed triangles; logical mesh/ID unchanged.
+		Mesh() : state(Empty), generation(0), lastSubmission(0), material(), depthLayer(0) {}
 		uint64_t Bytes() const;
+		uint64_t DrawRangeBytes() const;
 	};
 	struct Material
 	{
@@ -69,6 +76,7 @@ public:
 	PsyXNativeResult producerReason;
 	uint64_t generation;
 	uint64_t ownedBytes;
+	uint64_t ownedDrawRangeBytes; // Separate bounded CPU metadata, not uploaded geometry.
 	uint64_t ownedMaterialBytes;
 	uint32_t rejected;
 	bool generationExhausted;
