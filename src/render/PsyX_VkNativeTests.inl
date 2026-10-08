@@ -630,6 +630,111 @@ static int NativeTestMaterials(PsyXNativeSnapshot snapshot, const float backgrou
 	return failures;
 }
 
+// Characterize dark sRGB fractional filtering independently of city geometry
+// and RenderDoc replay. Strict ideal-colour deviations remain diagnostics;
+// uniformity, nearest texels, filter consistency and resource lifetime are gates.
+static int NativeTestFractionalSampling(PsyXNativeSnapshot snapshot, char* report, int reportSize)
+{
+	struct Sample { float x, y; uint8_t rgba[16]; };
+	const Sample samples[] = {
+		{ .9559468f,.4726291f,{33,33,16,255,16,16,8,255,123,140,99,255,33,33,16,255} },
+		{ .0920732f,.0887237f,{41,49,25,255,58,66,41,255,115,132,90,255,165,189,148,255} },
+		{ .8511162f,.0247246f,{58,66,41,255,41,49,25,255,165,189,148,255,82,90,58,255} },
+		{ .8737386f,.2212204f,{58,66,41,255,16,16,8,255,148,173,123,255,16,16,8,255} },
+		{ .7409889f,.0629630f,{16,16,8,255,16,16,8,255,148,173,123,255,33,33,16,255} }
+	};
+	NativeTestIdentity(snapshot.view.view);
+	snapshot.view.cameraPosition[0]=snapshot.view.cameraPosition[1]=snapshot.view.cameraPosition[2]=0;
+	snapshot.view.projection[0]=1; snapshot.view.projection[5]=-1;
+	const float white[]={1,1,1,1};
+	int failures=0, strictOutside=0;
+	char line[256];
+	for (unsigned int sample=0;sample<sizeof(samples)/sizeof(samples[0]);++sample)
+	{
+		const Sample& source=samples[sample];
+		double ideal[3]={};
+		for (unsigned int channel=0;channel<3;++channel)
+		{
+			double linear[4];
+			for (unsigned int texel=0;texel<4;++texel)
+			{
+				const double value=source.rgba[texel*4+channel]/255.0;
+				linear[texel]=value<=.04045 ? value/12.92 : pow((value+.055)/1.055,2.4);
+			}
+			const double value=(linear[0]*(1-source.x)+linear[1]*source.x)*(1-source.y)+
+				(linear[2]*(1-source.x)+linear[3]*source.x)*source.y;
+			ideal[channel]=255*(value<=.0031308 ? 12.92*value : 1.055*pow(value,1.0/2.4)-.055);
+		}
+		unsigned char bilinear[4]={};
+		for (unsigned int filter=0;filter<3;++filter)
+		{
+			snapshot.sceneGeneration=PsyX_Native_ResetScene(); PsyX_Vk_GameBeginFrame();
+			PsyXNativeMaterialDesc material={}; material.size=sizeof(material); material.version=PSYX_NATIVE_VERSION;
+			material.rgba=source.rgba; material.width=material.height=2; material.byteCount=16;
+			material.filter=PsyXNativeFilter(filter); material.alphaCutoff=.5f; material.cull=PSYX_NATIVE_CULL_NONE;
+			std::vector<PsyXNativeVertex> vertices; std::vector<uint32_t> indices;
+			NativeTestRectangle(vertices,indices,-.8f,-.8f,.8f,.8f,4,white,0);
+			for (size_t vertex=0;vertex<vertices.size();++vertex)
+			{
+				vertices[vertex].uv[0]=(.5f+source.x)/2;
+				vertices[vertex].uv[1]=(.5f+source.y)/2;
+			}
+			PsyXNativeMeshDesc mesh={}; mesh.size=sizeof(mesh); mesh.version=PSYX_NATIVE_VERSION;
+			mesh.vertices=vertices.data(); mesh.vertexCount=uint32_t(vertices.size());
+			mesh.indices=indices.data(); mesh.indexCount=uint32_t(indices.size());
+			for (int axis=0;axis<3;++axis) { mesh.boundsMin[axis]=-4; mesh.boundsMax[axis]=4; }
+			PsyXNativeInstance instance={}; NativeTestIdentity(instance.world);
+			for (int channel=0;channel<4;++channel) instance.tint[channel]=1;
+			instance.identity=1000+sample;
+			if (PsyX_Native_CreateMaterial(&material,&mesh.material)!=PSYX_NATIVE_PENDING ||
+				PsyX_Native_CreateMesh(&mesh,&instance.mesh)!=PSYX_NATIVE_PENDING)
+			{ ++failures; break; }
+			snapshot.instances=&instance; snapshot.instanceCount=1;
+			std::vector<unsigned char> pixels;
+			if (!NativeTestFrame(snapshot,0,pixels,report,reportSize)) { ++failures; break; }
+			const unsigned char* actual=&pixels[(size_t(g_vk.height/2)*g_vk.width+g_vk.width/2)*4];
+			int nonuniform=0;
+			for (int y=-16;y<16;++y) for (int x=-16;x<16;++x)
+				if (memcmp(actual,&pixels[(size_t(g_vk.height/2+y)*g_vk.width+g_vk.width/2+x)*4],4)) ++nonuniform;
+			if (nonuniform) { ++failures; ReportAppend(report,reportSize,"fractional sample nonuniform interior FAIL\n"); }
+			if (!filter)
+			{
+				const unsigned int texel=(source.y>=.5f ? 2u : 0u)+(source.x>=.5f ? 1u : 0u);
+				for (unsigned int channel=0;channel<3;++channel)
+					if (abs(int(actual[channel])-int(source.rgba[texel*4+channel]))>1) ++failures;
+			}
+			else if (filter==1) memcpy(bilinear,actual,4);
+			else if (memcmp(bilinear,actual,4)) ++failures;
+			if (actual[3]!=255) ++failures;
+			bool outside=false;
+			for (unsigned int channel=0;channel<3;++channel)
+				if (fabs(actual[channel]-ideal[channel])>2) outside=true;
+			if (filter && outside) ++strictOutside;
+			snprintf(line,sizeof(line),"fractional sample%u filter%u RGB=%u,%u,%u ideal=%.4f,%.4f,%.4f strict2=%s (accuracy diagnostic)\n",
+				sample,filter,actual[0],actual[1],actual[2],ideal[0],ideal[1],ideal[2],outside ? "outside" : "inside");
+			ReportAppend(report,reportSize,line);
+			PsyXNativeStats stats; PsyX_Native_GetStats(&stats);
+			const uint64_t meshBytes=vertices.size()*sizeof(PsyXNativeVertex)+indices.size()*sizeof(uint32_t);
+			// Base-only filters own 16 bytes; trilinear additionally owns a 1x1 mip.
+			const uint64_t materialBytes=filter==PSYX_NATIVE_TRILINEAR ? 20 : 16;
+			const bool resources=stats.ownedBytes==meshBytes && stats.ownedMaterialBytes==materialBytes &&
+				stats.residentMeshes==1 && stats.residentMaterials==1 && !stats.pendingMeshes &&
+				!stats.retiringMeshes && !stats.pendingMaterials && !stats.retiringMaterials;
+			snprintf(line,sizeof(line),"fractional owned mesh=%llu material=%llu expected=%llu/%llu %s\n",
+				(unsigned long long)stats.ownedBytes,(unsigned long long)stats.ownedMaterialBytes,
+				(unsigned long long)meshBytes,(unsigned long long)materialBytes,resources ? "ok" : "FAIL");
+			ReportAppend(report,reportSize,line); if (!resources) ++failures;
+		}
+	}
+	PsyX_Native_ResetScene(); PsyX_Vk_GameBeginFrame();
+	PsyXNativeStats stats; PsyX_Native_GetStats(&stats);
+	if (stats.ownedBytes || stats.ownedMaterialBytes || stats.retiringMeshes || stats.retiringMaterials) ++failures;
+	snprintf(line,sizeof(line),"fractional sampling readback/uniformity/nearest/filter-consistency/retirement %s; strict2 outside=%d, accuracy unaccepted\n",
+		failures ? "FAIL" : "PASS",strictOutside);
+	ReportAppend(report,reportSize,line);
+	return failures;
+}
+
 static int NativeTestPicking(PsyXNativeSnapshot snapshot, char* report, int reportSize)
 {
 	snapshot.sceneGeneration=PsyX_Native_ResetScene();
@@ -910,6 +1015,7 @@ int PsyX_Vk_NativeSelfTest(char* report, int reportSize)
 	if (stats.residentMeshes || stats.pendingMeshes || stats.retiringMeshes || stats.ownedBytes) ++failures;
 	else ReportAppend(report, reportSize, "eight reloads leave zero owned meshes/bytes ok\n");
 	failures += NativeTestMaterials(snapshot, background, report, reportSize);
+	failures += NativeTestFractionalSampling(snapshot, report, reportSize);
 	failures += NativeTestMips(snapshot, background, report, reportSize);
 	failures += NativeTestBackdrop(snapshot, report, reportSize);
 	failures += NativeTestPicking(snapshot, report, reportSize);
