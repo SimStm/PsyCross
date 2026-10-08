@@ -13,10 +13,11 @@ struct NativeDrawPush
 	float mvp[16], tint[4];
 	uint32_t encodeSRGB;
 	float alphaCutoff;
-	uint32_t pickId, padding;
+	uint32_t pickId, sampling;
 	float depthPlane[4];
 };
 static_assert(sizeof(NativeDrawPush)==112, "Native push constants must match GLSL alignment");
+static_assert(offsetof(NativeDrawPush,sampling)==92, "Native sampling must use the former GLSL padding word");
 static_assert(offsetof(NativeDrawPush,depthPlane)==96, "Native plane must start at the GLSL vec4 offset");
 struct VkNativeMesh
 {
@@ -532,6 +533,7 @@ static void RecordNativeWorld(VkCommandBuffer cmd, uint32_t imageIndex)
 		}
 		push.alphaCutoff = textured ? g_nativeScene.materials[source.material.slot].alphaCutoff : 0;
 		const unsigned int filter=textured ? NativeSamplingFilter(instance,g_nativeScene.materials[source.material.slot].filter) : PSYX_NATIVE_NEAREST;
+		push.sampling=filter;
 		const VkDescriptorSet descriptor = textured ? g_nativeVk.materials[source.material.slot].sets[filter] : g_nativeVk.white.sets[filter];
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_nativeVk.layout, 0, 1, &descriptor, 0, NULL);
 		vkCmdPushConstants(cmd, g_nativeVk.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);

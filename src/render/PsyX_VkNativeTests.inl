@@ -376,6 +376,63 @@ static int NativeTestBackdrop(PsyXNativeSnapshot snapshot, char* report, int rep
 	return failures;
 }
 
+static int NativeTestMipBlendBounds(PsyXNativeSnapshot snapshot, char* report, int reportSize)
+{
+	// Four solid 2x2 quadrants reduce to red/green/blue/white at mip1 and
+	// sRGB188 at mip2. LOD1.5 at UV(.25,.25) must mix red with decoded188.
+	uint8_t artwork[64];
+	const uint8_t colours[4][4]={{255,0,0,255},{0,255,0,255},{0,0,255,255},{255,255,255,255}};
+	for (unsigned int y=0;y<4;++y) for (unsigned int x=0;x<4;++x)
+		memcpy(artwork+(y*4+x)*4,colours[(y/2)*2+x/2],4);
+	const float white[]={1,1,1,1}, red[]={1,0,0,1};
+	const float blended[]={225.0f/255,137.0f/255,137.0f/255,1};
+	const float average[]={188.0f/255,188.0f/255,188.0f/255,1};
+	NativeTestIdentity(snapshot.view.view);
+	snapshot.view.cameraPosition[0]=snapshot.view.cameraPosition[1]=snapshot.view.cameraPosition[2]=0;
+	snapshot.view.projection[0]=1; snapshot.view.projection[5]=-1;
+	const char* labels[]={"minified nearest stays base red","minified bilinear stays base red",
+		"fractional mip1/mip2 linear-light blend","negative large UV clamps before fetch",
+		"positive large UV clamps before fetch","oversized derivative clamps to last mip"};
+	int failures=0;
+	for (unsigned int test=0;test<6;++test)
+	{
+		snapshot.sceneGeneration=PsyX_Native_ResetScene(); PsyX_Vk_GameBeginFrame();
+		PsyXNativeMaterialDesc material={}; material.size=sizeof(material); material.version=PSYX_NATIVE_VERSION;
+		material.rgba=artwork; material.width=material.height=4; material.byteCount=64;
+		material.filter=test<2 ? PsyXNativeFilter(test) : test==3 ? PSYX_NATIVE_LINEAR : PSYX_NATIVE_TRILINEAR;
+		material.alphaCutoff=.5f; material.cull=PSYX_NATIVE_CULL_NONE;
+		std::vector<PsyXNativeVertex> vertices; std::vector<uint32_t> indices;
+		NativeTestRectangle(vertices,indices,-.8f,-.8f,.8f,.8f,4,white,0);
+		for (size_t vertex=0;vertex<vertices.size();++vertex)
+		{
+			const float screenX=(vertices[vertex].position[0]/4+1)*g_vk.width/2;
+			vertices[vertex].uv[0]=test==3 ? -1e20f : test==4 ? 1e20f :
+				.25f+(screenX-(g_vk.width/2+.5f))*(test==5 ? 1e6f : sqrtf(8.0f)/4);
+			vertices[vertex].uv[1]=test==4 ? 1e20f : .25f;
+		}
+		PsyXNativeMeshDesc mesh={}; mesh.size=sizeof(mesh); mesh.version=PSYX_NATIVE_VERSION;
+		mesh.vertices=vertices.data(); mesh.vertexCount=uint32_t(vertices.size());
+		mesh.indices=indices.data(); mesh.indexCount=uint32_t(indices.size());
+		for (int axis=0;axis<3;++axis) { mesh.boundsMin[axis]=-4; mesh.boundsMax[axis]=4; }
+		PsyXNativeInstance instance={}; NativeTestIdentity(instance.world);
+		for (int channel=0;channel<4;++channel) instance.tint[channel]=1;
+		if (PsyX_Native_CreateMaterial(&material,&mesh.material)!=PSYX_NATIVE_PENDING ||
+			PsyX_Native_CreateMesh(&mesh,&instance.mesh)!=PSYX_NATIVE_PENDING) { ++failures; break; }
+		snapshot.instances=&instance; snapshot.instanceCount=1;
+		std::vector<unsigned char> pixels;
+		const float* expected=test==2 ? blended : test==4 ? white : test==5 ? average : red;
+		if (!NativeTestFrame(snapshot,0,pixels,report,reportSize) ||
+			!PsxCheckPixel(pixels.data(),g_vk.width,g_vk.height,g_vk.width/2,g_vk.height/2,
+				expected,2,labels[test],report,reportSize)) ++failures;
+	}
+	PsyX_Native_ResetScene(); PsyX_Vk_GameBeginFrame();
+	PsyXNativeStats stats; PsyX_Native_GetStats(&stats);
+	if (stats.ownedBytes || stats.ownedMaterialBytes || stats.retiringMeshes || stats.retiringMaterials) ++failures;
+	ReportAppend(report,reportSize,failures ? "native fractional mip/clamp/last-level/retirement FAIL\n" :
+		"native fractional mip/clamp/last-level/retirement PASS\n");
+	return failures;
+}
+
 static int NativeTestMips(PsyXNativeSnapshot snapshot, const float background[4], char* report, int reportSize)
 {
 	const float white[]={1,1,1,1}, black[]={0,0,0,1};
@@ -630,9 +687,9 @@ static int NativeTestMaterials(PsyXNativeSnapshot snapshot, const float backgrou
 	return failures;
 }
 
-// Characterize dark sRGB fractional filtering independently of city geometry
-// and RenderDoc replay. Strict ideal-colour deviations remain diagnostics;
-// uniformity, nearest texels, filter consistency and resource lifetime are gates.
+// Verify dark sRGB fractional filtering independently of city geometry/replay.
+// Filtered samples must meet the unchanged two-byte ideal-colour tolerance,
+// in addition to uniformity, nearest texels, consistency and resource lifetime.
 static int NativeTestFractionalSampling(PsyXNativeSnapshot snapshot, char* report, int reportSize)
 {
 	struct Sample { float x, y; uint8_t rgba[16]; };
@@ -709,9 +766,9 @@ static int NativeTestFractionalSampling(PsyXNativeSnapshot snapshot, char* repor
 			bool outside=false;
 			for (unsigned int channel=0;channel<3;++channel)
 				if (fabs(actual[channel]-ideal[channel])>2) outside=true;
-			if (filter && outside) ++strictOutside;
-			snprintf(line,sizeof(line),"fractional sample%u filter%u RGB=%u,%u,%u ideal=%.4f,%.4f,%.4f strict2=%s (accuracy diagnostic)\n",
-				sample,filter,actual[0],actual[1],actual[2],ideal[0],ideal[1],ideal[2],outside ? "outside" : "inside");
+			if (filter && outside) { ++strictOutside; ++failures; }
+			snprintf(line,sizeof(line),"fractional sample%u filter%u RGB=%u,%u,%u ideal=%.4f,%.4f,%.4f strict2=%s\n",
+				sample,filter,actual[0],actual[1],actual[2],ideal[0],ideal[1],ideal[2],!filter ? "nearest control" : outside ? "FAIL" : "ok");
 			ReportAppend(report,reportSize,line);
 			PsyXNativeStats stats; PsyX_Native_GetStats(&stats);
 			const uint64_t meshBytes=vertices.size()*sizeof(PsyXNativeVertex)+indices.size()*sizeof(uint32_t);
@@ -729,7 +786,7 @@ static int NativeTestFractionalSampling(PsyXNativeSnapshot snapshot, char* repor
 	PsyX_Native_ResetScene(); PsyX_Vk_GameBeginFrame();
 	PsyXNativeStats stats; PsyX_Native_GetStats(&stats);
 	if (stats.ownedBytes || stats.ownedMaterialBytes || stats.retiringMeshes || stats.retiringMaterials) ++failures;
-	snprintf(line,sizeof(line),"fractional sampling readback/uniformity/nearest/filter-consistency/retirement %s; strict2 outside=%d, accuracy unaccepted\n",
+	snprintf(line,sizeof(line),"fractional sampling accuracy/readback/uniformity/nearest/filter-consistency/retirement %s; strict2 outside=%d\n",
 		failures ? "FAIL" : "PASS",strictOutside);
 	ReportAppend(report,reportSize,line);
 	return failures;
@@ -1016,6 +1073,7 @@ int PsyX_Vk_NativeSelfTest(char* report, int reportSize)
 	else ReportAppend(report, reportSize, "eight reloads leave zero owned meshes/bytes ok\n");
 	failures += NativeTestMaterials(snapshot, background, report, reportSize);
 	failures += NativeTestFractionalSampling(snapshot, report, reportSize);
+	failures += NativeTestMipBlendBounds(snapshot, report, reportSize);
 	failures += NativeTestMips(snapshot, background, report, reportSize);
 	failures += NativeTestBackdrop(snapshot, report, reportSize);
 	failures += NativeTestPicking(snapshot, report, reportSize);
