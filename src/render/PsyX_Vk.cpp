@@ -574,6 +574,7 @@ static struct
 	VkMesh meshes[PSYX_VK_MAX_MESHES];
 	int meshCount;
 	int resizePending;
+	int requestedVsync;
 	int frameIndex;
 	int lastDrawCalls;
 
@@ -1235,38 +1236,39 @@ static int CreateSwapchain(void)
 	info.preTransform = capabilities.currentTransform;
 	info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
 	info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
-	// Developer/benchmark override. The shipped default stays FIFO (vsync),
-	// which caps the reported rate at the display refresh and would make a
-	// backend throughput comparison meaningless. PSYX_VK_PRESENT_MODE=mailbox
-	// (or immediate) picks an uncapped mode when the surface supports it.
+	VkPresentModeKHR wanted = g_vk.requestedVsync ? VK_PRESENT_MODE_FIFO_KHR : VK_PRESENT_MODE_IMMEDIATE_KHR;
+	// An explicit developer/benchmark override keeps its existing precedence.
 	if (const char* requestedMode = getenv("PSYX_VK_PRESENT_MODE"))
 	{
-		VkPresentModeKHR wanted = VK_PRESENT_MODE_FIFO_KHR;
+		wanted = VK_PRESENT_MODE_FIFO_KHR;
 		if (!strcmp(requestedMode, "mailbox"))
 			wanted = VK_PRESENT_MODE_MAILBOX_KHR;
 		else if (!strcmp(requestedMode, "immediate"))
 			wanted = VK_PRESENT_MODE_IMMEDIATE_KHR;
 
-		if (wanted != VK_PRESENT_MODE_FIFO_KHR)
+	}
+	if (wanted != VK_PRESENT_MODE_FIFO_KHR)
+	{
+		uint32_t modeCount = 16;
+		VkPresentModeKHR modes[16];
+		const VkResult result = vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.physicalDevice, g_vk.surface, &modeCount, modes);
+		if (result != VK_SUCCESS && result != VK_INCOMPLETE)
 		{
-			uint32_t modeCount = 0;
-			vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.physicalDevice, g_vk.surface, &modeCount, NULL);
-			VkPresentModeKHR modes[16];
-			if (modeCount > 16)
-				modeCount = 16;
-			if (modeCount > 0 &&
-				vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.physicalDevice, g_vk.surface, &modeCount, modes) == VK_SUCCESS)
-			{
-				for (uint32_t m = 0; m < modeCount; m++)
-				{
-					if (modes[m] == wanted)
-					{
-						info.presentMode = wanted;
-						break;
-					}
-				}
-			}
+			VkOk(result, "surface present modes");
+			return 0;
 		}
+		for (uint32_t m = 0; m < modeCount; m++)
+		{
+			if (modes[m] == wanted)
+			{
+				info.presentMode = wanted;
+				break;
+			}
+			if (modes[m] == VK_PRESENT_MODE_MAILBOX_KHR)
+				info.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+		}
+		if (info.presentMode == VK_PRESENT_MODE_FIFO_KHR)
+			eprintwarn("PsyX Vulkan: unsynchronized presentation unavailable; using FIFO\n");
 	}
 	info.clipped = VK_TRUE;
 	info.oldSwapchain = g_vk.swapchain;
@@ -1275,6 +1277,7 @@ static int CreateSwapchain(void)
 
 	if (!VkOk(vkCreateSwapchainKHR(g_vk.device, &info, NULL, &g_vk.swapchain), "vkCreateSwapchainKHR"))
 		return 0;
+	VkStage("swapchain present mode=%d vsync requested=%d", (int)info.presentMode, g_vk.requestedVsync);
 
 	uint32_t actualImageCount = 0;
 	if (!VkOk(vkGetSwapchainImagesKHR(g_vk.device, g_vk.swapchain, &actualImageCount, NULL), "swapchain image count"))
@@ -2916,6 +2919,16 @@ void PsyX_Vk_GameEnableDepth(int enable)
 void PsyX_Vk_GameSetBilinear(int enable)
 {
 	g_vk.psx.stBilinear = enable ? 1 : 0;
+}
+
+void PsyX_Vk_GameSetSwapInterval(int interval)
+{
+	const int vsync = interval > 0;
+	if (g_vk.requestedVsync == vsync)
+		return;
+	g_vk.requestedVsync = vsync;
+	if (g_vk.initialised && g_vk.gameMode)
+		g_vk.resizePending = 1;
 }
 
 void PsyX_Vk_GameSetScissor(int enable, int x, int y, int width, int height)
@@ -5408,9 +5421,9 @@ int PsyX_Vk_RenderFrame(void)
 
 	if (g_vk.resizePending)
 	{
-		g_vk.resizePending = 0;
 		if (!RecreateSwapchain())
 			return 1;	// try again next frame
+		g_vk.resizePending = 0;
 	}
 
 	// A minimised window has no drawable to present to and a 0x0 surface, so
@@ -6232,6 +6245,7 @@ int PsyX_Vk_Initialise(const PsyXVkConfig* config)
 	const int height = config && config->height > 0 ? config->height : 720;
 	const char* title = config && config->title ? config->title : "REDRIVER2 - Vulkan fixture";
 	g_vk.gameMode = (config && config->gameMode) ? 1 : 0;
+	g_vk.requestedVsync = g_vk.gameMode ? (g_cfg_swapInterval != 0) : 1;
 
 	if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0)
 	{
@@ -6591,6 +6605,7 @@ void PsyX_Vk_GameSetOverrideAlphaMode(int mode) { (void)mode; }
 void PsyX_Vk_GameSetStencilMode(int drawPrimMode) { (void)drawPrimMode; }
 void PsyX_Vk_GameEnableDepth(int enable) { (void)enable; }
 void PsyX_Vk_GameSetBilinear(int enable) { (void)enable; }
+void PsyX_Vk_GameSetSwapInterval(int interval) { (void)interval; }
 void PsyX_Vk_GameSetScissor(int enable, int x, int y, int width, int height)
 {
 	(void)enable; (void)x; (void)y; (void)width; (void)height;

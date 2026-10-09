@@ -144,6 +144,9 @@ void PsyX_Vk_GameSetOverrideAlphaMode(int mode);
 void PsyX_Vk_GameSetStencilMode(int drawPrimMode);
 void PsyX_Vk_GameEnableDepth(int enable);
 void PsyX_Vk_GameSetBilinear(int enable);
+// Requests FIFO for a positive interval, otherwise an available unsynchronized
+// mode. Resources are recreated at the next safe presentation boundary.
+void PsyX_Vk_GameSetSwapInterval(int interval);
 
 /* Window-space rectangles, top-left origin (as the caller computes them). */
 void PsyX_Vk_GameSetScissor(int enable, int x, int y, int width, int height);

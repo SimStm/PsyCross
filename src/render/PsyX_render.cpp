@@ -486,7 +486,7 @@ void GR_UpdateSwapIntervalState(int swapInterval)
 {
 	if (GR_UseVulkan())
 	{
-		// Present mode is FIFO; a runtime vsync toggle is not wired up yet.
+		PsyX_Vk_GameSetSwapInterval(swapInterval);
 		return;
 	}
 
