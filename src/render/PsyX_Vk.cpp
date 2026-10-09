@@ -493,6 +493,7 @@ static struct
 {
 	int initialised;
 	int gameMode;			// owns the game window (not the developer fixture)
+	int headless;			// window only: no swapchain, no present
 	SDL_Window* window;
 	int width;
 	int height;
@@ -5370,6 +5371,11 @@ int PsyX_Vk_RenderFrame(void)
 	if (!g_vk.initialised)
 		return 0;
 
+	// Headless: the window's presentation belongs to another renderer; the
+	// frame's queued draws are dropped instead of acquired and presented.
+	if (g_vk.headless)
+		return 1;
+
 	if (g_vk.gameMode)
 	{
 		// The game owns the SDL event pump (keyboard, pad, resize, quit); the
@@ -6245,6 +6251,7 @@ int PsyX_Vk_Initialise(const PsyXVkConfig* config)
 	const int height = config && config->height > 0 ? config->height : 720;
 	const char* title = config && config->title ? config->title : "REDRIVER2 - Vulkan fixture";
 	g_vk.gameMode = (config && config->gameMode) ? 1 : 0;
+	g_vk.headless = (config && config->headless) ? 1 : 0;
 	g_vk.requestedVsync = g_vk.gameMode ? (g_cfg_swapInterval != 0) : 1;
 
 	if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0)
@@ -6344,10 +6351,19 @@ int PsyX_Vk_Initialise(const PsyXVkConfig* config)
 	else
 		VkStage("initialise: game modern resources failed");
 
-	// The swapchain depends on the main render pass.
-	if (!CreateSwapchain())
-		return 0;
-	VkStage("initialise: swapchain");
+	// The swapchain depends on the main render pass. In headless mode another
+	// renderer owns the window's presentation, so no swapchain is created and
+	// Vulkan returns VK_ERROR_NATIVE_WINDOW_IN_USE_KHR if one were attempted.
+	if (!g_vk.headless)
+	{
+		if (!CreateSwapchain())
+			return 0;
+		VkStage("initialise: swapchain");
+	}
+	else
+	{
+		VkStage("initialise: headless (no swapchain)");
+	}
 
 	if (!CreateSceneResources())
 		return 0;

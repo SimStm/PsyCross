@@ -46,6 +46,9 @@ typedef void(*GameDebugMouseHandlerFunc)(int x, int y, int dx, int dy);
 typedef void(*GameOnTextInputHandler)(const char* buf);
 typedef int(*PsyXSDLEventHandlerFunc)(const SDL_Event* event);
 typedef void(*PsyXRenderOverlayHandlerFunc)(void);
+/* Runs once per finished frame, after the backend's present. A second renderer
+   that owns the window's presentation (headless backend) draws here. */
+typedef void(*PsyXPostFrameHandlerFunc)(void);
 
 typedef struct
 {
@@ -177,6 +180,7 @@ extern int PsyX_ApplyWindowMode(int fullscreen, int width, int height, int* outW
    to consume keyboard, mouse, or text input before game debug callbacks. */
 extern void PsyX_SetSDLEventHandler(PsyXSDLEventHandlerFunc handler);
 extern void PsyX_SetRenderOverlayHandler(PsyXRenderOverlayHandlerFunc handler);
+extern void PsyX_SetPostFrameHandler(PsyXPostFrameHandlerFunc handler);
 extern void PsyX_SetInputCapture(int captureFlags);
 
 /* Returns aggregate primitive data for the current rendered frame. */
@@ -418,9 +422,16 @@ extern void PsyX_SetSwapInterval(int interval);
 extern void PsyX_SetRenderBackend(int backend);
 extern int  PsyX_GetRenderBackend(void);
 
+/* Headless presentation: the backend still creates and owns the game window,
+   but creates no swapchain and presents nothing, so another renderer can own
+   the window's presentation. Set this before PsyX_Initialise. */
+extern void PsyX_SetHeadless(int enable);
+extern int  PsyX_GetHeadless(void);
+
 /* Invokes the registered post-frame overlay handler (if any) so a backend can
    contribute its widgets to a frame it does not itself drive. */
 extern void PsyX_InvokeRenderOverlayHandler(void);
+extern void PsyX_InvokePostFrameHandler(void);
 
 #if defined(_LANGUAGE_C_PLUS_PLUS)||defined(__cplusplus)||defined(c_plusplus)
 }

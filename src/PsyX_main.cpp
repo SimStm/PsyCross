@@ -59,12 +59,25 @@ int PsyX_GetRenderBackend(void)
 	return g_renderBackend;
 }
 
+static int g_headless = 0;
+
+void PsyX_SetHeadless(int enable)
+{
+	g_headless = enable != 0;
+}
+
+int PsyX_GetHeadless(void)
+{
+	return g_headless;
+}
+
 int							g_cfg_swapInterval = 0;
 PsyXKeyboardMapping			g_cfg_keyboardMapping;
 PsyXControllerMapping		g_cfg_controllerMapping;
 GameOnTextInputHandler		g_cfg_gameOnTextInput = NULL;
 PsyXSDLEventHandlerFunc		g_cfg_sdlEventHandler = NULL;
 PsyXRenderOverlayHandlerFunc	g_cfg_renderOverlayHandler = NULL;
+PsyXPostFrameHandlerFunc	g_cfg_postFrameHandler = NULL;
 int							g_cfg_inputCapture = 0;
 int							g_cfg_overrideProportionalAlpha = 0;
 
@@ -283,7 +296,9 @@ static void PsyX_Sys_InitialiseInput()
 	g_cfg_controllerMapping.gc_axis_right_x = SDL_CONTROLLER_AXIS_RIGHTX | CONTROLLER_MAP_FLAG_AXIS;
 	g_cfg_controllerMapping.gc_axis_right_y = SDL_CONTROLLER_AXIS_RIGHTY | CONTROLLER_MAP_FLAG_AXIS;
 
-	PsyX_Pad_InitSystem();
+	// Input is owned by the project (utils/InputService.*); PsyCross no longer
+	// opens SDL controllers or polls pads, so this keeps the default mapping
+	// values above without a second controller owner.
 }
 
 #ifdef __GNUC__
@@ -660,6 +675,7 @@ void PsyX_Initialise(char* appName, int width, int height, int fullscreen)
 		vkConfig.title = windowNameStr;
 		vkConfig.enableImGui = 1;
 		vkConfig.gameMode = 1;
+		vkConfig.headless = g_headless;
 
 		if (!PsyX_Vk_Initialise(&vkConfig))
 		{
@@ -771,6 +787,17 @@ void PsyX_InvokeRenderOverlayHandler(void)
 		g_cfg_renderOverlayHandler();
 }
 
+void PsyX_InvokePostFrameHandler(void)
+{
+	if (g_cfg_postFrameHandler)
+		g_cfg_postFrameHandler();
+}
+
+void PsyX_SetPostFrameHandler(PsyXPostFrameHandlerFunc handler)
+{
+	g_cfg_postFrameHandler = handler;
+}
+
 void PsyX_SetRenderOverlayHandler(PsyXRenderOverlayHandlerFunc handler)
 {
 	g_cfg_renderOverlayHandler = handler;
@@ -808,12 +835,6 @@ void PsyX_Sys_DoPollEvent()
 
 		switch (event.type)
 		{
-			case SDL_CONTROLLERDEVICEADDED:
-				PsyX_Pad_Event_ControllerAdded(event.cdevice.which);
-				break;
-			case SDL_CONTROLLERDEVICEREMOVED:
-				PsyX_Pad_Event_ControllerRemoved(event.cdevice.which);
-				break;
 			case SDL_QUIT:
 				PsyX_Exit();
 				break;
@@ -981,6 +1002,11 @@ void PsyX_EndScene()
 
 		GR_SwapWindow();
 	}
+
+	// A second renderer that owns the window's presentation (headless backend)
+	// draws its frame here, after the backend has finished with the window.
+	if (g_cfg_postFrameHandler)
+		g_cfg_postFrameHandler();
 
 	const Uint64 submitEnd = SDL_GetPerformanceCounter();
 
@@ -1199,11 +1225,9 @@ void PsyX_Sys_DoDebugKeys(int nKey, char down)
 
 void PsyX_UpdateInput()
 {
-	// also poll events here
+	// Poll events only. Input polling is owned by the project InputService
+	// (utils/InputService.*), which the game calls after this.
 	PsyX_Sys_DoPollEvent();
-
-	if(!g_altKeyState)
-		PsyX_Pad_InternalPadUpdates();
 }
 
 uint PsyX_CalcFPS()

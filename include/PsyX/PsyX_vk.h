@@ -28,6 +28,8 @@ typedef struct
 	const char* title;
 	int enableImGui;	/* 1 to create the ImGui overlay */
 	int gameMode;		/* 1 when the window backs the game, not the fixture */
+	int headless;		/* 1 to create the window without a swapchain or present
+						   (another renderer owns the window's presentation) */
 } PsyXVkConfig;
 
 typedef struct
