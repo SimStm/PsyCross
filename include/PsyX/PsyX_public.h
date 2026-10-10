@@ -422,10 +422,12 @@ extern void PsyX_SetSwapInterval(int interval);
 extern void PsyX_SetRenderBackend(int backend);
 extern int  PsyX_GetRenderBackend(void);
 
-/* Headless presentation: the backend still creates and owns the game window,
-   but creates no swapchain and presents nothing, so another renderer can own
-   the window's presentation. Set this before PsyX_Initialise. */
-extern void PsyX_SetHeadless(int enable);
+/* Select before PsyX_Initialise. Mode 1 keeps the compatibility GPU without
+   presenting. Mode 2 owns only an SDL window and CPU VRAM: an external
+   renderer must provide presentation, including framebuffer-derived effects. */
+#define PSYX_HEADLESS_GPU 1
+#define PSYX_HEADLESS_WINDOW_ONLY 2
+extern void PsyX_SetHeadless(int mode);
 extern int  PsyX_GetHeadless(void);
 
 /* Invokes the registered post-frame overlay handler (if any) so a backend can

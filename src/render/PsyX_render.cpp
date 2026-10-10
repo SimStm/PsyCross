@@ -13,6 +13,11 @@
 // The GR_* entry points below are the OpenGL renderer's contract. When the
 // Vulkan backend was selected (PsyX_SetRenderBackend) the same calls are
 // forwarded to its emulated-PSX path instead, and the GL-only work is skipped.
+static inline int GR_WindowOnly(void)
+{
+	return PsyX_GetHeadless() == PSYX_HEADLESS_WINDOW_ONLY;
+}
+
 static inline int GR_UseVulkan(void)
 {
 	return PsyX_GetRenderBackend() == PSYX_BACKEND_VULKAN;
@@ -453,6 +458,9 @@ int GR_InitialiseRender(char* windowName, int width, int height, int fullscreen)
 
 void GR_Shutdown()
 {
+	if (GR_WindowOnly())
+		return;
+
 	if (GR_UseVulkan())
 	{
 		// PsyX_Shutdown destroys the Vulkan backend (it owns the window).
@@ -484,6 +492,9 @@ void GR_Shutdown()
 
 void GR_UpdateSwapIntervalState(int swapInterval)
 {
+	if (GR_WindowOnly())
+		return;
+
 	if (GR_UseVulkan())
 	{
 		PsyX_Vk_GameSetSwapInterval(swapInterval);
@@ -499,6 +510,9 @@ static bool g_modernSceneComposed = false;
 
 void GR_ComposeModernScene()
 {
+	if (GR_WindowOnly())
+		return;
+
 	if (g_modernSceneComposed)
 		return;
 	g_modernSceneComposed = true;
@@ -510,6 +524,9 @@ void GR_ComposeModernScene()
 
 void GR_BeginScene()
 {
+	if (GR_WindowOnly())
+		return;
+
 	g_modernSceneComposed = false;
 	g_lastBoundTexture = 0;
 
@@ -548,6 +565,9 @@ void GR_BeginScene()
 
 void GR_EndScene()
 {
+	if (GR_WindowOnly())
+		return;
+
 	framebuffer_need_update = 1;
 	
 	if (g_dbg_wireframeMode)
@@ -583,6 +603,9 @@ static u_char rgLUT[LUT_WIDTH * LUT_HEIGHT * sizeof(u_int)];
 
 void GR_ResetDevice()
 {
+	if (GR_WindowOnly())
+		return;
+
 	if (GR_UseVulkan())
 	{
 		PsyX_Vk_GameResetDevice();
@@ -1023,6 +1046,12 @@ void GR_GenerateCommonTextures()
 
 TextureID GR_CreateRGBATexture(int width, int height, u_char* data /*= nullptr*/)
 {
+	if (GR_WindowOnly())
+	{
+		eprinterr("Compatibility GPU texture requested in window-only mode\n");
+		return (TextureID)0;
+	}
+
 	if (GR_UseVulkan())
 		return (TextureID)PsyX_Vk_GameCreateTexture(data, width, height, 0);
 
@@ -1045,6 +1074,12 @@ TextureID GR_CreateRGBATexture(int width, int height, u_char* data /*= nullptr*/
 
 TextureID GR_CreateRGBATextureMipmapped(int width, int height, u_char* data /*= nullptr*/)
 {
+	if (GR_WindowOnly())
+	{
+		eprinterr("Compatibility GPU texture requested in window-only mode\n");
+		return (TextureID)0;
+	}
+
 	if (GR_UseVulkan())
 		return (TextureID)PsyX_Vk_GameCreateTexture(data, width, height, 1);
 
@@ -1149,6 +1184,8 @@ void GR_InitRG8LUT()
 int GR_InitialisePSX()
 {
 	SDL_memset(vram, 0, VRAM_WIDTH * VRAM_HEIGHT * sizeof(unsigned short));
+	if (GR_WindowOnly())
+		return 1;
 	GR_InitRG8LUT();
 	GR_GenerateCommonTextures();
 	GR_InitialisePSXShaders();
@@ -1284,6 +1321,9 @@ int GR_InitialisePSX()
 
 void GR_Ortho2D(float left, float right, float bottom, float top, float znear, float zfar)
 {
+	if (GR_WindowOnly())
+		return;
+
 	float a = 2.0f / (right - left);
 	float b = 2.0f / (top - bottom);
 	float c = 2.0f / (znear - zfar);
@@ -1316,6 +1356,9 @@ void GR_Ortho2D(float left, float right, float bottom, float top, float znear, f
 
 void GR_Perspective3D(const float fov, const float width, const float height, const float zNear, const float zFar)
 {
+	if (GR_WindowOnly())
+		return;
+
 	float sinF, cosF;
 	sinF = sinf(0.5f * fov);
 	cosF = cosf(0.5f * fov);
@@ -1348,6 +1391,9 @@ void GR_Perspective3D(const float fov, const float width, const float height, co
 
 void GR_SetupClipMode(const RECT16* rect, int enable)
 {
+	if (GR_WindowOnly())
+		return;
+
 	// [A] isinterlaced dirty hack for widescreen
 	const bool scissorOn = enable && (activeDispEnv.isinter ||
 		(	rect->x - activeDispEnv.disp.x > 0 ||
@@ -1440,6 +1486,9 @@ void PsyX_GetPSXWidescreenMappedViewport(struct _RECT16* rect)
 
 void GR_SetShader(const ShaderID shader)
 {
+	if (GR_WindowOnly())
+		return;
+
 	if (GR_UseVulkan())
 	{
 		// The Vulkan pipeline is picked from the blend mode and texture format
@@ -1462,6 +1511,9 @@ void GR_SetShader(const ShaderID shader)
 
 void GR_SetTexture(TextureID texture, TexFormat texFormat)
 {
+	if (GR_WindowOnly())
+		return;
+
 	if (GR_UseVulkan())
 	{
 		// TextureID and TexFormat values match PsyX_Vk_GameCreateTexture
@@ -1553,6 +1605,9 @@ void GR_SetTexture(TextureID texture, TexFormat texFormat)
 
 void GR_SetOverrideTextureSize(int width, int height)
 {
+	if (GR_WindowOnly())
+		return;
+
 	if (GR_UseVulkan())
 	{
 		PsyX_Vk_GameSetOverrideTextureSize(width, height);
@@ -1569,6 +1624,9 @@ void GR_SetOverrideTextureSize(int width, int height)
 
 void GR_SetOverrideAlphaMode(int mode)
 {
+	if (GR_WindowOnly())
+		return;
+
 	if (GR_UseVulkan())
 	{
 		PsyX_Vk_GameSetOverrideAlphaMode(mode);
@@ -1583,6 +1641,9 @@ void GR_SetOverrideAlphaMode(int mode)
 
 void GR_DestroyTexture(TextureID texture)
 {
+	if (GR_WindowOnly())
+		return;
+
 	if (texture == -1)
 		return;
 
@@ -1625,6 +1686,9 @@ void GR_ClearVRAM(int x, int y, int w, int h, unsigned char r, unsigned char g, 
 
 void GR_Clear(int x, int y, int w, int h, unsigned char r, unsigned char g, unsigned char b)
 {
+	if (GR_WindowOnly())
+		return;
+
 	framebuffer_need_update = 1;
 
 	if (GR_UseVulkan())
@@ -1727,6 +1791,9 @@ void GR_CopyRGBAFramebufferToVRAM(u_int* src, int x, int y, int w, int h, int up
 
 void GR_ReadFramebufferDataToVRAM()
 {
+	if (GR_WindowOnly())
+		return;
+
 	int x, y, w, h;
 	if (!framebuffer_need_update)
 		return;
@@ -1769,6 +1836,9 @@ void GR_ReadFramebufferDataToVRAM()
 // been waited.
 void GR_VkMirrorFrameToVRAM()
 {
+	if (GR_WindowOnly())
+		return;
+
 	const unsigned char* rgba = NULL;
 	int stride = 0, srcWidth = 0, srcHeight = 0, bgra = 0;
 	int x = 0, y = 0, w = 0, h = 0;
@@ -1823,6 +1893,9 @@ void GR_VkMirrorFrameToVRAM()
 
 void GR_SetScissorState(int enable)
 {
+	if (GR_WindowOnly())
+		return;
+
 	if (GR_UseVulkan())
 	{
 		PsyX_Vk_GameSetScissor(enable ? 1 : 0, 0, 0, g_windowWidth, g_windowHeight);
@@ -1843,6 +1916,9 @@ void GR_SetScissorState(int enable)
 
 void GR_SetOffscreenState(const RECT16* offscreenRect, int enable)
 {
+	if (GR_WindowOnly())
+		return;
+
 	if (enable)
 	{
 		// setup render target viewport
@@ -1959,6 +2035,9 @@ void GR_SetOffscreenState(const RECT16* offscreenRect, int enable)
 
 void GR_StoreFrameBuffer(int x, int y, int w, int h)
 {
+	if (GR_WindowOnly())
+		return;
+
 	if (GR_UseVulkan())
 	{
 		// Vulkan captures the frame from its presented swapchain instead of the
@@ -2040,7 +2119,7 @@ void GR_CopyVRAM(unsigned short* src, int x, int y, int w, int h, int dst_x, int
 	// The Vulkan renderer records its draws at frame end, so a write that lands
 	// between two flushes has to be replayed in order; the OpenGL renderer
 	// draws immediately and only needs the dirty flag.
-	if (GR_UseVulkan())
+	if (!GR_WindowOnly() && GR_UseVulkan())
 	{
 		PsyX_Vk_GameCopyVRAM(src, stride, x, y, w, h, dst_x, dst_y);
 	}
@@ -2073,6 +2152,9 @@ void GR_ReadVRAM(unsigned short* dst, int x, int y, int dst_w, int dst_h)
 
 void GR_UpdateVRAM()
 {
+	if (GR_WindowOnly())
+		return;
+
 	if (!vram_need_update)
 		return;
 
@@ -2102,6 +2184,9 @@ void GR_UpdateVRAM()
 
 void GR_SwapWindow()
 {
+	if (GR_WindowOnly())
+		return;
+
 	if (GR_UseVulkan())
 	{
 		PsyX_Vk_GameEndFrame();
@@ -2117,6 +2202,9 @@ void GR_SwapWindow()
 
 void GR_EnableDepth(int enable)
 {
+	if (GR_WindowOnly())
+		return;
+
 	if (GR_UseVulkan())
 	{
 		// Matches the GL branch: the PGXP Z-buffer config gates the test.
@@ -2139,6 +2227,9 @@ void GR_EnableDepth(int enable)
 
 void GR_SetStencilMode(int drawPrim)
 {
+	if (GR_WindowOnly())
+		return;
+
 	if (GR_UseVulkan())
 	{
 		PsyX_Vk_GameSetStencilMode(drawPrim);
@@ -2166,6 +2257,9 @@ void GR_SetStencilMode(int drawPrim)
 
 void GR_SetBlendMode(BlendMode blendMode)
 {
+	if (GR_WindowOnly())
+		return;
+
 	if (GR_UseVulkan())
 	{
 		// The GL branch also toggles depth: BM_NONE draws depth-tested, every
@@ -2223,6 +2317,9 @@ void GR_SetBlendMode(BlendMode blendMode)
 
 void GR_SetPolygonOffset(float ofs)
 {
+	if (GR_WindowOnly())
+		return;
+
 	if (GR_UseVulkan())
 		return;
 
@@ -2241,6 +2338,9 @@ void GR_SetPolygonOffset(float ofs)
 
 void GR_SetViewPort(int x, int y, int width, int height)
 {
+	if (GR_WindowOnly())
+		return;
+
 	if (GR_UseVulkan())
 	{
 		PsyX_Vk_GameSetViewPort(x, y, width, height);
@@ -2254,6 +2354,9 @@ void GR_SetViewPort(int x, int y, int width, int height)
 
 void GR_SetWireframe(int enable)
 {
+	if (GR_WindowOnly())
+		return;
+
 	if (GR_UseVulkan())
 		return;
 
@@ -2264,6 +2367,9 @@ void GR_SetWireframe(int enable)
 
 void GR_BindVertexBuffer()
 {
+	if (GR_WindowOnly())
+		return;
+
 	if (GR_UseVulkan())
 	{
 		// RecordPsxDraws binds the frame's vertex buffer once.
@@ -2299,6 +2405,9 @@ void GR_BindVertexBuffer()
 
 void GR_UpdateVertexBuffer(const GrVertex* vertices, int num_vertices)
 {
+	if (GR_WindowOnly())
+		return;
+
 	if (num_vertices >= MAX_VERTEX_BUFFER_SIZE)
 	{
 		eprinterr("MAX_VERTEX_BUFFER_SIZE reached, expect rendering errors\n");
@@ -2323,6 +2432,9 @@ void GR_UpdateVertexBuffer(const GrVertex* vertices, int num_vertices)
 
 void GR_DrawTriangles(int start_vertex, int triangles)
 {
+	if (GR_WindowOnly())
+		return;
+
 	if (GR_UseVulkan())
 	{
 		PsyX_Vk_GameDrawTriangles(start_vertex, triangles);
@@ -2338,6 +2450,9 @@ void GR_DrawTriangles(int start_vertex, int triangles)
 
 void GR_PushDebugLabel(const char* label)
 {
+	if (GR_WindowOnly())
+		return;
+
 #if USE_OPENGL && !defined(__EMSCRIPTEN__) && defined(GL_DEBUG_SOURCE_APPLICATION)
 	if (!glPushDebugGroup)
 		return;
@@ -2347,6 +2462,9 @@ void GR_PushDebugLabel(const char* label)
 
 void GR_PopDebugLabel()
 {
+	if (GR_WindowOnly())
+		return;
+
 #if USE_OPENGL && !defined(__EMSCRIPTEN__) && defined(GL_DEBUG_SOURCE_APPLICATION)
 	if (!glPopDebugGroup)
 		return;

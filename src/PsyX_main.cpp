@@ -61,9 +61,9 @@ int PsyX_GetRenderBackend(void)
 
 static int g_headless = 0;
 
-void PsyX_SetHeadless(int enable)
+void PsyX_SetHeadless(int mode)
 {
-	g_headless = enable != 0;
+	g_headless = mode == PSYX_HEADLESS_WINDOW_ONLY ? mode : (mode != 0);
 }
 
 int PsyX_GetHeadless(void)
@@ -663,7 +663,23 @@ void PsyX_Initialise(char* appName, int width, int height, int fullscreen)
 		return;
 	}
 	
-	if (g_renderBackend == PSYX_BACKEND_VULKAN)
+	if (g_headless == PSYX_HEADLESS_WINDOW_ONLY)
+	{
+		Uint32 flags = SDL_WINDOW_RESIZABLE;
+		if (fullscreen) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+		g_window = SDL_CreateWindow(windowNameStr, SDL_WINDOWPOS_CENTERED,
+			SDL_WINDOWPOS_CENTERED, width, height, flags);
+		if (!g_window)
+		{
+			eprinterr("Failed to create external-renderer window: %s\n", SDL_GetError());
+			SDL_Quit();
+			PsyX_Log_Finalise();
+			return;
+		}
+		SDL_GetWindowSize(g_window, &g_windowWidth, &g_windowHeight);
+		eprintinfo("External presentation: SDL window and CPU VRAM only; no PsyCross GPU\n");
+	}
+	else if (g_renderBackend == PSYX_BACKEND_VULKAN)
 	{
 		// The Vulkan backend owns the window, the swapchain and the ImGui
 		// context. The GL renderer is not initialised at all, so the GR_*
@@ -698,7 +714,7 @@ void PsyX_Initialise(char* appName, int width, int height, int fullscreen)
 		}
 	}
 
-	if (g_renderBackend != PSYX_BACKEND_VULKAN && !GR_InitialiseRender(windowNameStr, width, height, fullscreen))
+	if (g_headless != PSYX_HEADLESS_WINDOW_ONLY && g_renderBackend != PSYX_BACKEND_VULKAN && !GR_InitialiseRender(windowNameStr, width, height, fullscreen))
 	{
 		eprinterr("Failed to Intialise Window\n");
 		PsyX_Shutdown();
@@ -712,7 +728,7 @@ void PsyX_Initialise(char* appName, int width, int height, int fullscreen)
 		return;
 	}
 
-	if (g_renderBackend != PSYX_BACKEND_VULKAN && !GR_InitialisePSX())
+	if ((g_headless == PSYX_HEADLESS_WINDOW_ONLY || g_renderBackend != PSYX_BACKEND_VULKAN) && !GR_InitialisePSX())
 	{
 		eprinterr("Failed to Intialise PSX.\n");
 		PsyX_Shutdown();
@@ -997,7 +1013,7 @@ void PsyX_EndScene()
 	}
 	else
 	{
-		if (g_cfg_renderOverlayHandler)
+		if (g_headless != PSYX_HEADLESS_WINDOW_ONLY && g_cfg_renderOverlayHandler)
 			g_cfg_renderOverlayHandler();
 
 		GR_SwapWindow();
@@ -1075,6 +1091,11 @@ void PsyX_EndScene()
 #if !defined(__EMSCRIPTEN__) && !defined(__ANDROID__)
 void PsyX_TakeScreenshot()
 {
+	if (g_headless == PSYX_HEADLESS_WINDOW_ONLY)
+	{
+		eprintwarn("Screenshot requires the external presentation renderer\n");
+		return;
+	}
 	const int width = g_windowWidth;
 	const int height = g_windowHeight;
 	const int stride = width * 4;
@@ -1307,7 +1328,12 @@ void PsyX_Shutdown()
 		SDL_DestroyMutex(g_intrMutex);
 	}
 
-	if (g_renderBackend == PSYX_BACKEND_VULKAN)
+	if (g_headless == PSYX_HEADLESS_WINDOW_ONLY)
+	{
+		SDL_DestroyWindow(g_window);
+		g_window = NULL;
+	}
+	else if (g_renderBackend == PSYX_BACKEND_VULKAN)
 	{
 		// The Vulkan backend destroys the window it created.
 		PsyX_Vk_Shutdown();
