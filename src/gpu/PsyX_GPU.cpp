@@ -2029,24 +2029,27 @@ static void ObserveParsedPrimitive(P_TAG* polyTag, int firstVertex, int singlePr
 	}
 
 	const GPUDrawSplit& split = g_splits[g_splitIndex];
-	event.state.clipX = split.drawenv.clip.x;
-	event.state.clipY = split.drawenv.clip.y;
-	event.state.clipWidth = split.drawenv.clip.w;
-	event.state.clipHeight = split.drawenv.clip.h;
-	event.state.offsetX = split.drawenv.ofs[0];
-	event.state.offsetY = split.drawenv.ofs[1];
-	event.state.textureWindowX = split.drawenv.tw.x;
-	event.state.textureWindowY = split.drawenv.tw.y;
-	event.state.textureWindowWidth = split.drawenv.tw.w;
-	event.state.textureWindowHeight = split.drawenv.tw.h;
-	event.state.displayX = split.dispenv.disp.x;
-	event.state.displayY = split.dispenv.disp.y;
-	event.state.displayWidth = split.dispenv.disp.w;
-	event.state.displayHeight = split.dispenv.disp.h;
-	event.state.screenX = split.dispenv.screen.x;
-	event.state.screenY = split.dispenv.screen.y;
-	event.state.screenWidth = split.dispenv.screen.w;
-	event.state.screenHeight = split.dispenv.screen.h;
+	// A split is reused when state that does not affect its batch key changes.
+	// Capture the live environments here so 2D consumers do not inherit stale
+	// texture-window, offset, display, or screen values from that reused split.
+	event.state.clipX = activeDrawEnv.clip.x;
+	event.state.clipY = activeDrawEnv.clip.y;
+	event.state.clipWidth = activeDrawEnv.clip.w;
+	event.state.clipHeight = activeDrawEnv.clip.h;
+	event.state.offsetX = activeDrawEnv.ofs[0];
+	event.state.offsetY = activeDrawEnv.ofs[1];
+	event.state.textureWindowX = activeDrawEnv.tw.x;
+	event.state.textureWindowY = activeDrawEnv.tw.y;
+	event.state.textureWindowWidth = activeDrawEnv.tw.w;
+	event.state.textureWindowHeight = activeDrawEnv.tw.h;
+	event.state.displayX = activeDispEnv.disp.x;
+	event.state.displayY = activeDispEnv.disp.y;
+	event.state.displayWidth = activeDispEnv.disp.w;
+	event.state.displayHeight = activeDispEnv.disp.h;
+	event.state.screenX = activeDispEnv.screen.x;
+	event.state.screenY = activeDispEnv.screen.y;
+	event.state.screenWidth = activeDispEnv.screen.w;
+	event.state.screenHeight = activeDispEnv.screen.h;
 	event.state.blendMode = split.blendMode;
 	event.state.textureFormat = split.texFormat;
 	event.state.drawPrimMode = split.drawPrimMode;
@@ -2056,9 +2059,9 @@ static void ObserveParsedPrimitive(P_TAG* polyTag, int firstVertex, int singlePr
 	event.state.overrideSourceV = split.inspectorSourceV;
 	event.state.overrideSourceWidth = split.inspectorSourceWidth;
 	event.state.overrideSourceHeight = split.inspectorSourceHeight;
-	event.state.tpage = split.drawenv.tpage;
-	event.state.dtd = split.drawenv.dtd;
-	event.state.dfe = split.drawenv.dfe;
+	event.state.tpage = activeDrawEnv.tpage;
+	event.state.dtd = activeDrawEnv.dtd;
+	event.state.dfe = activeDrawEnv.dfe;
 
 	for (int i = 0; i < vertexCount; ++i)
 	{
