@@ -2,6 +2,7 @@
 #define EMULATOR_H
 
 #include "PsyX/PsyX_config.h"
+#include <stdint.h>
 
 /*
  * Platform specific emulator setup
@@ -184,6 +185,10 @@ extern void			GR_ComposeModernScene();
 extern void			GR_SaveVRAM(const char* outputFileName, int x, int y, int width, int height, int bReadFromFrameBuffer);
 extern void			GR_CopyVRAM(unsigned short* src, int x, int y, int w, int h, int dst_x, int dst_y);
 extern void			GR_ReadVRAM(unsigned short* dst, int x, int y, int dst_w, int dst_h);
+/* Returns a conservative generation for a VRAM rectangle. Writes within a
+   16x16 tile advance that tile's generation; out-of-rectangle writes do not. */
+extern uint64_t		GR_GetVRAMRectVersion(int x, int y, int w, int h);
+extern void			GR_MarkVRAMRectChanged(int x, int y, int w, int h);
 
 extern void			GR_StoreFrameBuffer(int x, int y, int w, int h);
 extern void			GR_UpdateVRAM();

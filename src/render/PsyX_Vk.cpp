@@ -4396,6 +4396,7 @@ static void ResolveOffscreenGroup(const VkPsxOffscreenGroup* group, unsigned sho
 			s += 4;
 		}
 	}
+	GR_MarkVRAMRectChanged(group->rect[0], group->rect[1], w, h);
 }
 
 int PsyX_Vk_GameResolveOffscreen(unsigned short* vram)

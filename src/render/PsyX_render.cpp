@@ -599,6 +599,89 @@ void GR_EndScene()
 //----------------------------------------------------------------------------------------
 
 unsigned short vram[VRAM_WIDTH * VRAM_HEIGHT];
+
+namespace
+{
+	enum
+	{
+		VramVersionTileSize = 16,
+		VramVersionTileColumns = VRAM_WIDTH / VramVersionTileSize,
+		VramVersionTileRows = VRAM_HEIGHT / VramVersionTileSize
+	};
+
+	uint64_t g_vramVersion = 0;
+	uint64_t g_vramTileVersions[VramVersionTileColumns * VramVersionTileRows] = {};
+
+	uint64_t GetVRAMRectVersionSegment(int x, int y, int w, int h)
+	{
+		const int x0 = x < 0 ? 0 : x;
+		const int y0 = y < 0 ? 0 : y;
+		const int x1 = x + w > VRAM_WIDTH ? VRAM_WIDTH : x + w;
+		const int y1 = y + h > VRAM_HEIGHT ? VRAM_HEIGHT : y + h;
+		if (x0 >= x1 || y0 >= y1)
+			return 0;
+
+		uint64_t version = 0;
+		for (int tileY = y0 / VramVersionTileSize;
+			tileY <= (y1 - 1) / VramVersionTileSize; ++tileY)
+		{
+			for (int tileX = x0 / VramVersionTileSize;
+				tileX <= (x1 - 1) / VramVersionTileSize; ++tileX)
+			{
+				const uint64_t tileVersion = g_vramTileVersions[
+					tileY * VramVersionTileColumns + tileX];
+				if (tileVersion > version)
+					version = tileVersion;
+			}
+		}
+		return version;
+	}
+}
+
+void GR_MarkVRAMRectChanged(int x, int y, int w, int h)
+{
+	if (w <= 0 || h <= 0)
+		return;
+
+	const int x0 = x < 0 ? 0 : x;
+	const int y0 = y < 0 ? 0 : y;
+	const int x1 = x + w > VRAM_WIDTH ? VRAM_WIDTH : x + w;
+	const int y1 = y + h > VRAM_HEIGHT ? VRAM_HEIGHT : y + h;
+	if (x0 >= x1 || y0 >= y1)
+		return;
+
+	const uint64_t version = ++g_vramVersion;
+	for (int tileY = y0 / VramVersionTileSize;
+		tileY <= (y1 - 1) / VramVersionTileSize; ++tileY)
+	{
+		for (int tileX = x0 / VramVersionTileSize;
+			tileX <= (x1 - 1) / VramVersionTileSize; ++tileX)
+		{
+			g_vramTileVersions[tileY * VramVersionTileColumns + tileX] = version;
+		}
+	}
+}
+
+uint64_t GR_GetVRAMRectVersion(int x, int y, int w, int h)
+{
+	if (w <= 0 || h <= 0 || y >= VRAM_HEIGHT || y + h <= 0)
+		return 0;
+
+	const int normalizedX = ((x % VRAM_WIDTH) + VRAM_WIDTH) % VRAM_WIDTH;
+	if (w >= VRAM_WIDTH)
+		return GetVRAMRectVersionSegment(0, y, VRAM_WIDTH, h);
+
+	const int firstWidth = w < VRAM_WIDTH - normalizedX ? w : VRAM_WIDTH - normalizedX;
+	uint64_t version = GetVRAMRectVersionSegment(normalizedX, y, firstWidth, h);
+	if (firstWidth < w)
+	{
+		const uint64_t wrappedVersion = GetVRAMRectVersionSegment(0, y, w - firstWidth, h);
+		if (wrappedVersion > version)
+			version = wrappedVersion;
+	}
+	return version;
+}
+
 static u_char rgLUT[LUT_WIDTH * LUT_HEIGHT * sizeof(u_int)];
 
 void GR_ResetDevice()
@@ -1184,6 +1267,7 @@ void GR_InitRG8LUT()
 int GR_InitialisePSX()
 {
 	SDL_memset(vram, 0, VRAM_WIDTH * VRAM_HEIGHT * sizeof(unsigned short));
+	GR_MarkVRAMRectChanged(0, 0, VRAM_WIDTH, VRAM_HEIGHT);
 	if (GR_WindowOnly())
 		return 1;
 	GR_InitRG8LUT();
@@ -1682,6 +1766,7 @@ void GR_ClearVRAM(int x, int y, int w, int h, unsigned char r, unsigned char g, 
 
 		dst += VRAM_WIDTH;
 	}
+	GR_MarkVRAMRectChanged(x, y, w, h);
 }
 
 void GR_Clear(int x, int y, int w, int h, unsigned char r, unsigned char g, unsigned char b)
@@ -1784,6 +1869,7 @@ void GR_CopyRGBAFramebufferToVRAM(u_int* src, int x, int y, int w, int h, int up
 	}
 
 	free(fb);
+	GR_MarkVRAMRectChanged(x, y, w, h);
 
 	if (update_vram)
 		vram_need_update = 1;
@@ -1889,6 +1975,7 @@ void GR_VkMirrorFrameToVRAM()
 	}
 
 	vram_need_update = 1;
+	GR_MarkVRAMRectChanged(x, y, w, h);
 }
 
 void GR_SetScissorState(int enable)
@@ -2137,6 +2224,7 @@ void GR_CopyVRAM(unsigned short* src, int x, int y, int w, int h, int dst_x, int
 		dst += VRAM_WIDTH;
 		src += stride;
 	}
+	GR_MarkVRAMRectChanged(dst_x, dst_y, w, h);
 }
 
 void GR_ReadVRAM(unsigned short* dst, int x, int y, int dst_w, int dst_h)
