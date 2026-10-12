@@ -78,6 +78,7 @@ GameOnTextInputHandler		g_cfg_gameOnTextInput = NULL;
 PsyXSDLEventHandlerFunc		g_cfg_sdlEventHandler = NULL;
 PsyXRenderOverlayHandlerFunc	g_cfg_renderOverlayHandler = NULL;
 PsyXPostFrameHandlerFunc	g_cfg_postFrameHandler = NULL;
+PsyXLegacyDrawEventHandlerFunc g_cfg_legacyDrawEventHandler = NULL;
 int							g_cfg_inputCapture = 0;
 int							g_cfg_overrideProportionalAlpha = 0;
 
@@ -814,6 +815,22 @@ void PsyX_SetPostFrameHandler(PsyXPostFrameHandlerFunc handler)
 	g_cfg_postFrameHandler = handler;
 }
 
+void PsyX_SetLegacyDrawEventHandler(PsyXLegacyDrawEventHandlerFunc handler)
+{
+	g_cfg_legacyDrawEventHandler = handler;
+}
+
+void PsyX_InvokeLegacyDrawEventHandler(const PsyXLegacyDrawEvent* event)
+{
+	if (g_cfg_legacyDrawEventHandler && event)
+		g_cfg_legacyDrawEventHandler(event);
+}
+
+int PsyX_HasLegacyDrawEventHandler(void)
+{
+	return g_cfg_legacyDrawEventHandler != NULL;
+}
+
 void PsyX_SetRenderOverlayHandler(PsyXRenderOverlayHandlerFunc handler)
 {
 	g_cfg_renderOverlayHandler = handler;
@@ -974,6 +991,8 @@ char PsyX_BeginScene()
 	}
 
 	begin_scene_flag = 1;
+	const PsyXLegacyDrawEvent frameBegin = { PSYX_LEGACY_DRAW_FRAME_BEGIN };
+	PsyX_InvokeLegacyDrawEventHandler(&frameBegin);
 
 	PsyX_Log_Flush();
 
@@ -1018,6 +1037,9 @@ void PsyX_EndScene()
 
 		GR_SwapWindow();
 	}
+
+	const PsyXLegacyDrawEvent frameEnd = { PSYX_LEGACY_DRAW_FRAME_END };
+	PsyX_InvokeLegacyDrawEventHandler(&frameEnd);
 
 	// A second renderer that owns the window's presentation (headless backend)
 	// draws its frame here, after the backend has finished with the window.

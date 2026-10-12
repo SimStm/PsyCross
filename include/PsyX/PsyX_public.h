@@ -56,6 +56,52 @@ typedef struct
 	int drawSplitCount;
 } PsyXRenderStats;
 
+/* Ordered legacy 2D draw observation. The event and its vertex array are
+   borrowed for the duration of the callback; consumers that retain them must
+   copy both immediately. Events are emitted on the render thread. */
+#define PSYX_LEGACY_DRAW_FRAME_BEGIN 1
+#define PSYX_LEGACY_DRAW_MODERN_BOUNDARY 2
+#define PSYX_LEGACY_DRAW_PRIMITIVE 3
+#define PSYX_LEGACY_DRAW_FRAME_END 4
+#define PSYX_LEGACY_DRAW_CAPTURE_OVERFLOW 5
+#define PSYX_LEGACY_DRAW_MAX_VERTICES_PER_EVENT 16
+
+typedef struct
+{
+	float x, y, page, clut;
+	float z, screenHeight, offsetX, offsetY;
+	unsigned char u, v, brightness, dither;
+	unsigned char r, g, b, a;
+	signed char textureX, textureY;
+} PsyXLegacyDrawVertex;
+
+typedef struct
+{
+	int clipX, clipY, clipWidth, clipHeight;
+	int offsetX, offsetY;
+	int textureWindowX, textureWindowY, textureWindowWidth, textureWindowHeight;
+	int displayX, displayY, displayWidth, displayHeight;
+	int screenX, screenY, screenWidth, screenHeight;
+	int blendMode, textureFormat, drawPrimMode;
+	unsigned int textureId;
+	int textureOverridden;
+	int overrideSourceU, overrideSourceV, overrideSourceWidth, overrideSourceHeight;
+	unsigned short tpage;
+	unsigned char dtd, dfe;
+} PsyXLegacyDrawState;
+
+typedef struct PsyXLegacyDrawEvent
+{
+	int type;
+	int primitiveCode;
+	int singlePrimitive;
+	int vertexCount;
+	const PsyXLegacyDrawVertex* vertices;
+	PsyXLegacyDrawState state;
+} PsyXLegacyDrawEvent;
+
+typedef void(*PsyXLegacyDrawEventHandlerFunc)(const PsyXLegacyDrawEvent* event);
+
 /* A replacement for one rectangular, CLUT-qualified PSX texture region.
    Texture coordinates are remapped to the complete RGBA image at draw time;
    the original VRAM contents remain present for the normal fallback path. */
@@ -181,6 +227,7 @@ extern int PsyX_ApplyWindowMode(int fullscreen, int width, int height, int* outW
 extern void PsyX_SetSDLEventHandler(PsyXSDLEventHandlerFunc handler);
 extern void PsyX_SetRenderOverlayHandler(PsyXRenderOverlayHandlerFunc handler);
 extern void PsyX_SetPostFrameHandler(PsyXPostFrameHandlerFunc handler);
+extern void PsyX_SetLegacyDrawEventHandler(PsyXLegacyDrawEventHandlerFunc handler);
 extern void PsyX_SetInputCapture(int captureFlags);
 
 /* Returns aggregate primitive data for the current rendered frame. */

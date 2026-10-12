@@ -2003,10 +2003,107 @@ void DrawAllSplits()
 // forward declarations
 int ParsePrimitive(P_TAG* polyTag);
 
+static void ObserveParsedPrimitive(P_TAG* polyTag, int firstVertex, int singlePrimitive,
+	bool observerEnabled)
+{
+	if (!observerEnabled)
+		return;
+
+	const int vertexCount = g_vertexIndex - firstVertex;
+	if (vertexCount <= 0)
+		return;
+
+	PsyXLegacyDrawEvent event = {};
+	event.type = PSYX_LEGACY_DRAW_PRIMITIVE;
+	event.primitiveCode = polyTag->code;
+	event.singlePrimitive = singlePrimitive;
+	event.vertexCount = vertexCount;
+
+	PsyXLegacyDrawVertex vertices[PSYX_LEGACY_DRAW_MAX_VERTICES_PER_EVENT];
+	if (vertexCount > PSYX_LEGACY_DRAW_MAX_VERTICES_PER_EVENT)
+	{
+		event.type = PSYX_LEGACY_DRAW_CAPTURE_OVERFLOW;
+		event.vertexCount = 0;
+		PsyX_InvokeLegacyDrawEventHandler(&event);
+		return;
+	}
+
+	const GPUDrawSplit& split = g_splits[g_splitIndex];
+	event.state.clipX = split.drawenv.clip.x;
+	event.state.clipY = split.drawenv.clip.y;
+	event.state.clipWidth = split.drawenv.clip.w;
+	event.state.clipHeight = split.drawenv.clip.h;
+	event.state.offsetX = split.drawenv.ofs[0];
+	event.state.offsetY = split.drawenv.ofs[1];
+	event.state.textureWindowX = split.drawenv.tw.x;
+	event.state.textureWindowY = split.drawenv.tw.y;
+	event.state.textureWindowWidth = split.drawenv.tw.w;
+	event.state.textureWindowHeight = split.drawenv.tw.h;
+	event.state.displayX = split.dispenv.disp.x;
+	event.state.displayY = split.dispenv.disp.y;
+	event.state.displayWidth = split.dispenv.disp.w;
+	event.state.displayHeight = split.dispenv.disp.h;
+	event.state.screenX = split.dispenv.screen.x;
+	event.state.screenY = split.dispenv.screen.y;
+	event.state.screenWidth = split.dispenv.screen.w;
+	event.state.screenHeight = split.dispenv.screen.h;
+	event.state.blendMode = split.blendMode;
+	event.state.textureFormat = split.texFormat;
+	event.state.drawPrimMode = split.drawPrimMode;
+	event.state.textureId = split.textureId;
+	event.state.textureOverridden = split.textureOverridden;
+	event.state.overrideSourceU = split.inspectorSourceU;
+	event.state.overrideSourceV = split.inspectorSourceV;
+	event.state.overrideSourceWidth = split.inspectorSourceWidth;
+	event.state.overrideSourceHeight = split.inspectorSourceHeight;
+	event.state.tpage = split.drawenv.tpage;
+	event.state.dtd = split.drawenv.dtd;
+	event.state.dfe = split.drawenv.dfe;
+
+	for (int i = 0; i < vertexCount; ++i)
+	{
+		const GrVertex& source = g_vertexBuffer[firstVertex + i];
+		PsyXLegacyDrawVertex& target = vertices[i];
+#if USE_PGXP
+		target.x = source.x;
+		target.y = source.y;
+		target.page = source.page;
+		target.clut = source.clut;
+		target.z = source.z;
+		target.screenHeight = source.scr_h;
+		target.offsetX = source.ofsX;
+		target.offsetY = source.ofsY;
+#else
+		target.x = (float)source.x;
+		target.y = (float)source.y;
+		target.page = (float)source.page;
+		target.clut = (float)source.clut;
+		target.z = 0.0f;
+		target.screenHeight = 0.0f;
+		target.offsetX = 0.0f;
+		target.offsetY = 0.0f;
+#endif
+		target.u = source.u;
+		target.v = source.v;
+		target.brightness = source.bright;
+		target.dither = source.dither;
+		target.r = source.r;
+		target.g = source.g;
+		target.b = source.b;
+		target.a = source.a;
+		target.textureX = source.tcx;
+		target.textureY = source.tcy;
+	}
+
+	event.vertices = vertices;
+	PsyX_InvokeLegacyDrawEventHandler(&event);
+}
+
 void ParsePrimitivesLinkedList(u_long* p, int singlePrimitive)
 {
 	if (!p)
 		return;
+	const bool observerEnabled = PsyX_HasLegacyDrawEventHandler() != 0;
 
 	// setup single primitive flag (needed for AddSplits)
 	g_DrawPrimMode = singlePrimitive;
@@ -2018,7 +2115,9 @@ void ParsePrimitivesLinkedList(u_long* p, int singlePrimitive)
 		// force PGXP off
 		polyTag->pgxp_index = 0xFFFF;
 #endif
+		const int firstVertex = g_vertexIndex;
 		ParsePrimitive(polyTag);
+		ObserveParsedPrimitive(polyTag, firstVertex, 1, observerEnabled);
 
 		GPUDrawSplit& lastSplit = g_splits[g_splitIndex];
 		lastSplit.numVerts = g_vertexIndex - lastSplit.startVertex;
@@ -2032,6 +2131,9 @@ void ParsePrimitivesLinkedList(u_long* p, int singlePrimitive)
 			{
 				g_modernSceneBoundaryVertex = g_vertexIndex;
 				g_modernSceneBoundaryTag = NULL;
+				PsyXLegacyDrawEvent boundary = {};
+				boundary.type = PSYX_LEGACY_DRAW_MODERN_BOUNDARY;
+				PsyX_InvokeLegacyDrawEventHandler(&boundary);
 			}
 			const int tagLength = getlen(basePacket);
 			if (tagLength > 0)
@@ -2046,7 +2148,10 @@ void ParsePrimitivesLinkedList(u_long* p, int singlePrimitive)
 				int primLength = 0;
 				while (currentPacket < endPacket)
 				{
-					primLength = ParsePrimitive(reinterpret_cast<P_TAG*>(currentPacket));
+					P_TAG* primitive = reinterpret_cast<P_TAG*>(currentPacket);
+					const int firstVertex = g_vertexIndex;
+					primLength = ParsePrimitive(primitive);
+					ObserveParsedPrimitive(primitive, firstVertex, 0, observerEnabled);
 					currentPacket += (primLength + P_LEN) * sizeof(u_int);
 				}
 

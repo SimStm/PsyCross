@@ -16,6 +16,9 @@ extern int g_activeKeyboardControllers;
 
 extern int PsyX_Sys_GetVBlankCount();
 extern int PsyX_Sys_SetVMode(int mode);
+struct PsyXLegacyDrawEvent;
+extern void PsyX_InvokeLegacyDrawEventHandler(const struct PsyXLegacyDrawEvent* event);
+extern int PsyX_HasLegacyDrawEventHandler(void);
 
 #if defined(_LANGUAGE_C_PLUS_PLUS)||defined(__cplusplus)||defined(c_plusplus)
 }
